@@ -1,0 +1,36 @@
+# Fly.io configuration for Alexandria relay node
+app = "alexandria-relay"
+primary_region = "bom"  # Mumbai — closest to India
+
+[build]
+  # Standalone crate — Dockerfile is in repo root
+  dockerfile = "Dockerfile"
+
+[env]
+  RUST_LOG = "info"
+
+# TCP port for libp2p
+[[services]]
+  internal_port = 4001
+  protocol = "tcp"
+  auto_stop_machines = false
+  auto_start_machines = true
+
+  [[services.ports]]
+    port = 4001
+    handlers = []
+
+# UDP port for QUIC
+[[services]]
+  internal_port = 4001
+  protocol = "udp"
+  auto_stop_machines = false
+  auto_start_machines = true
+
+  [[services.ports]]
+    port = 4001
+    handlers = []
+
+[[vm]]
+  memory = "256mb"
+  cpus = 1
