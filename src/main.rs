@@ -135,6 +135,7 @@ struct Args {
 /// and relay traffic for NATted peers.
 #[derive(NetworkBehaviour)]
 struct RelayBehaviour {
+    connection_limits: libp2p_connection_limits::Behaviour,
     relay: relay::Behaviour,
     kademlia: kad::Behaviour<MemoryStore>,
     identify: identify::Behaviour,
@@ -298,54 +299,32 @@ async fn main() {
                     }
 
                     // ── Connection Management ────────────────────────
-                    SwarmEvent::IncomingConnection { local_addr, send_back_addr, connection_id } => {
-                        if connections >= MAX_CONNECTIONS {
-                            log::warn!(
-                                "Rejecting incoming connection from {send_back_addr} \
-                                 (at max {MAX_CONNECTIONS} connections)"
-                            );
-                            // Close the connection by not proceeding
-                            // Note: libp2p doesn't have a direct reject API here,
-                            // but the connection limit on the swarm config handles this.
-                            let _ = (local_addr, connection_id);
-                        }
-                    }
+                    // Note: libp2p_connection_limits::Behaviour enforces MAX_CONNECTIONS
+                    // and MAX_CONNECTIONS_PER_PEER at the transport layer, so we
+                    // only track counters and add to Kademlia here.
                     SwarmEvent::ConnectionEstablished {
                         peer_id: pid,
                         endpoint,
-                        num_established,
-                        connection_id,
                         ..
                     } => {
-                        // Enforce per-peer connection limit
-                        if num_established.get() > MAX_CONNECTIONS_PER_PEER {
-                            log::warn!(
-                                "Peer {pid} has {num_established} connections \
-                                 (limit: {MAX_CONNECTIONS_PER_PEER}), closing excess"
-                            );
-                            let _ = swarm.close_connection(connection_id);
-                        } else {
-                            connections += 1;
-                            total_connections_served += 1;
-                            log::info!(
-                                "CONNECT peer:{pid} endpoint:{} total:{connections}",
-                                endpoint.get_remote_address()
-                            );
-                            // Add to Kademlia routing table
-                            swarm
-                                .behaviour_mut()
-                                .kademlia
-                                .add_address(&pid, endpoint.get_remote_address().clone());
-                        }
+                        connections += 1;
+                        total_connections_served += 1;
+                        log::info!(
+                            "CONNECT peer:{pid} endpoint:{} total:{connections}",
+                            endpoint.get_remote_address()
+                        );
+                        // Add to Kademlia routing table
+                        swarm
+                            .behaviour_mut()
+                            .kademlia
+                            .add_address(&pid, endpoint.get_remote_address().clone());
                     }
                     SwarmEvent::ConnectionClosed {
                         peer_id: pid,
                         num_established,
                         ..
                     } => {
-                        if num_established == 0 {
-                            connections = connections.saturating_sub(1);
-                        }
+                        connections = connections.saturating_sub(1);
                         log::info!(
                             "DISCONNECT peer:{pid} remaining_for_peer:{num_established} total:{connections}"
                         );
@@ -465,6 +444,12 @@ fn build_behaviour(
 ) -> Result<RelayBehaviour, Box<dyn std::error::Error + Send + Sync>> {
     let local_peer_id = key.public().to_peer_id();
 
+    // ── Connection Limits (enforced at transport layer) ──────────────
+    let limits = libp2p_connection_limits::ConnectionLimits::default()
+        .with_max_established(Some(MAX_CONNECTIONS as u32))
+        .with_max_established_per_peer(Some(MAX_CONNECTIONS_PER_PEER));
+    let connection_limits = libp2p_connection_limits::Behaviour::new(limits);
+
     // ── Circuit Relay v2 (server) ────────────────────────────────────
     // Rate-limited and resource-capped to prevent abuse.
     let relay_config = relay::Config {
@@ -510,6 +495,7 @@ fn build_behaviour(
     );
 
     Ok(RelayBehaviour {
+        connection_limits,
         relay,
         kademlia,
         identify,

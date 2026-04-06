@@ -55,6 +55,7 @@ dependencies = [
  "futures",
  "hex",
  "libp2p",
+ "libp2p-connection-limits",
  "log",
  "rand 0.8.5",
  "sha2",
