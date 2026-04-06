@@ -156,7 +156,10 @@ fn keypair_from_seed(seed_hex: &str) -> Keypair {
     );
     let mut key = [0u8; 32];
     key.copy_from_slice(&seed_bytes[..32]);
-    Keypair::ed25519_from_bytes(&mut key).expect("valid ed25519 seed")
+    let keypair = Keypair::ed25519_from_bytes(&mut key).expect("valid ed25519 seed");
+    // Zero seed material from memory
+    key.fill(0);
+    keypair
 }
 
 fn generate_seed() -> String {
@@ -193,6 +196,8 @@ async fn main() {
     // ── Keypair ──────────────────────────────────────────────────────
     let keypair = match std::env::var("RELAY_SEED") {
         Ok(seed) => {
+            // Clear seed from process environment to prevent leaking via /proc/PID/environ
+            unsafe { std::env::remove_var("RELAY_SEED") };
             log::info!("Using deterministic keypair from RELAY_SEED");
             keypair_from_seed(&seed)
         }
