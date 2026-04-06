@@ -47,6 +47,7 @@
 //! alexandria-relay --port 4001
 //! ```
 
+use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
@@ -54,6 +55,7 @@ use clap::Parser;
 use futures::StreamExt;
 use libp2p::identity::Keypair;
 use libp2p::kad::store::MemoryStore;
+use libp2p::multiaddr::Protocol;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{identify, kad, noise, relay, yamux, Multiaddr, SwarmBuilder};
 
@@ -100,6 +102,9 @@ const RELAY_MAX_CIRCUIT_DURATION: Duration = Duration::from_secs(120); // 2 min
 
 /// Relay: how long a reservation is valid.
 const RELAY_RESERVATION_DURATION: Duration = Duration::from_secs(3600); // 1 hour
+
+/// Maximum number of addresses to accept per peer via Identify.
+const MAX_ADDRS_PER_PEER: usize = 16;
 
 /// How often to log health status.
 const HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(300); // 5 min
@@ -339,12 +344,20 @@ async fn main() {
                             info.protocol_version,
                             info.agent_version
                         );
-                        // Add all reported listen addresses to Kademlia
+                        // Add reported listen addresses to Kademlia, filtering
+                        // out unroutable addresses and capping per-peer count.
+                        let mut added = 0usize;
                         for addr in &info.listen_addrs {
-                            swarm
-                                .behaviour_mut()
-                                .kademlia
-                                .add_address(&pid, addr.clone());
+                            if added >= MAX_ADDRS_PER_PEER {
+                                break;
+                            }
+                            if is_globally_routable(addr) {
+                                swarm
+                                    .behaviour_mut()
+                                    .kademlia
+                                    .add_address(&pid, addr.clone());
+                                added += 1;
+                            }
                         }
                     }
 
@@ -435,6 +448,49 @@ async fn main() {
     }
 
     log::info!("Relay shutdown complete. Served {total_connections_served} total connections.");
+}
+
+// ── Address Validation ───────────────────────────────────────────────
+
+/// Returns `true` if the multiaddr starts with a globally routable IP.
+/// Rejects loopback, private (RFC 1918 / RFC 4193), link-local, and
+/// unspecified addresses to prevent Kademlia routing table pollution.
+fn is_globally_routable(addr: &Multiaddr) -> bool {
+    match addr.iter().next() {
+        Some(Protocol::Ip4(ip)) => {
+            let ip = IpAddr::V4(ip);
+            !(ip.is_loopback() || ip.is_unspecified() || is_private_v4(ip))
+        }
+        Some(Protocol::Ip6(ip)) => {
+            let ip = IpAddr::V6(ip);
+            !(ip.is_loopback() || ip.is_unspecified())
+        }
+        // DNS addresses are allowed (e.g. /dns4/example.com/tcp/4001)
+        Some(Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_)) => true,
+        _ => false,
+    }
+}
+
+/// Check if an IP is in a private/reserved range.
+/// Covers RFC 1918 (10/8, 172.16/12, 192.168/16), link-local (169.254/16),
+/// and CGNAT (100.64/10).
+fn is_private_v4(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            // 10.0.0.0/8
+            octets[0] == 10
+            // 172.16.0.0/12
+            || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+            // 192.168.0.0/16
+            || (octets[0] == 192 && octets[1] == 168)
+            // 169.254.0.0/16 (link-local)
+            || (octets[0] == 169 && octets[1] == 254)
+            // 100.64.0.0/10 (CGNAT)
+            || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        }
+        _ => false,
+    }
 }
 
 // ── Behaviour Builder ────────────────────────────────────────────────
