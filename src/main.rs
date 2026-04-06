@@ -1,6 +1,6 @@
 //! Alexandria Relay + Bootstrap Node
 //!
-//! A production-grade libp2p relay designed to run on a public VPS.
+//! A libp2p relay designed to run on a public VPS.
 //! Provides three critical services for the Alexandria P2P network:
 //!
 //! 1. **Circuit Relay v2** — NATted peers (phones, laptops behind routers)
@@ -25,7 +25,7 @@
 //! new peers cannot discover existing peers. Existing peers that already
 //! know each other (via the known_peers DB) continue to function.
 //!
-//! ## Production Hardening
+//! ## Hardening
 //!
 //! - Connection limits (per-peer and total) prevent resource exhaustion
 //! - Relay circuit limits (bandwidth, duration, reservations) prevent abuse

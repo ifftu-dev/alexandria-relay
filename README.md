@@ -1,6 +1,6 @@
 # Alexandria Relay
 
-**Production relay server for the Alexandria P2P network.**
+**Relay server for the Alexandria P2P network.**
 
 > Circuit Relay v2 + Kademlia DHT bootstrap + Identify — a single Rust binary that helps nodes find each other and traverse NAT.
 
@@ -14,7 +14,7 @@ The relay has no special authority. It cannot read, modify, or censor content fl
 
 Any node can run a relay. The network does not depend on a single instance.
 
-## Production Hardening
+## Limits
 
 | Limit | Value |
 |-------|-------|
@@ -49,7 +49,7 @@ The relay listens on both TCP and QUIC (UDP) on the same port.
 | `RELAY_SEED` | Env var | — | 32-byte hex seed for deterministic PeerId. If unset, generates a random keypair on each start. |
 | `RUST_LOG` | Env var | `info` | Log level (`debug`, `info`, `warn`, `error`) |
 
-For production, always set `RELAY_SEED` so the PeerId is stable across restarts and redeployments.
+Always set `RELAY_SEED` so the PeerId is stable across restarts and redeployments.
 
 ## Deployment
 
