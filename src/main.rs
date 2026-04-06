@@ -319,7 +319,7 @@ async fn main() {
                     } => {
                         connections += 1;
                         total_connections_served += 1;
-                        log::info!(
+                        log::debug!(
                             "CONNECT peer:{pid} endpoint:{} total:{connections}",
                             endpoint.get_remote_address()
                         );
@@ -335,7 +335,7 @@ async fn main() {
                         ..
                     } => {
                         connections = connections.saturating_sub(1);
-                        log::info!(
+                        log::debug!(
                             "DISCONNECT peer:{pid} remaining_for_peer:{num_established} total:{connections}"
                         );
                     }
@@ -537,9 +537,11 @@ fn build_behaviour(
     // Cap the in-memory store to prevent unbounded growth
     kademlia_config.set_max_packet_size(KAD_MAX_RECORD_SIZE);
 
-    let mut store_config = kad::store::MemoryStoreConfig::default();
-    store_config.max_records = KAD_MAX_RECORDS;
-    store_config.max_value_bytes = KAD_MAX_RECORD_SIZE;
+    let store_config = kad::store::MemoryStoreConfig {
+        max_records: KAD_MAX_RECORDS,
+        max_value_bytes: KAD_MAX_RECORD_SIZE,
+        ..Default::default()
+    };
 
     let store = MemoryStore::with_config(local_peer_id, store_config);
     let mut kademlia = kad::Behaviour::with_config(local_peer_id, store, kademlia_config);
