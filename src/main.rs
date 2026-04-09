@@ -357,9 +357,8 @@ async fn async_main(args: Args, seed: Option<String>) {
     let mut ip_rate_windows: HashMap<IpAddr, (usize, Instant)> = HashMap::new();
 
     // Graceful shutdown on SIGTERM/SIGINT
-    let mut sigterm =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("SIGTERM handler");
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("SIGTERM handler");
     let sigint = tokio::signal::ctrl_c();
     tokio::pin!(sigint);
     let mut shutdown = false;
@@ -734,12 +733,9 @@ fn build_behaviour(
     // ── Kademlia DHT ─────────────────────────────────────────────────
     // Private Alexandria DHT (`/alexandria/kad/1.0`).
     // The relay always runs in server mode — it's the bootstrap node.
-    let mut kademlia_config =
-        kad::Config::new(libp2p::StreamProtocol::new("/alexandria/kad/1.0"));
+    let mut kademlia_config = kad::Config::new(libp2p::StreamProtocol::new("/alexandria/kad/1.0"));
     kademlia_config.set_query_timeout(KAD_QUERY_TIMEOUT);
-    kademlia_config.set_replication_factor(
-        NonZeroUsize::new(KAD_REPLICATION_FACTOR).unwrap(),
-    );
+    kademlia_config.set_replication_factor(NonZeroUsize::new(KAD_REPLICATION_FACTOR).unwrap());
     // Cap the in-memory store to prevent unbounded growth
     kademlia_config.set_max_packet_size(KAD_MAX_RECORD_SIZE);
 
@@ -757,10 +753,7 @@ fn build_behaviour(
     let identify = identify::Behaviour::new(
         identify::Config::new("/alexandria/id/1.0".to_string(), key.public())
             .with_push_listen_addr_updates(true)
-            .with_agent_version(format!(
-                "alexandria-relay/{}",
-                env!("CARGO_PKG_VERSION")
-            )),
+            .with_agent_version(format!("alexandria-relay/{}", env!("CARGO_PKG_VERSION"))),
     );
 
     Ok(RelayBehaviour {
