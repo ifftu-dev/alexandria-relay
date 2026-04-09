@@ -1,5 +1,7 @@
 # Alexandria Relay
 
+[![CI](https://github.com/ifftu-dev/alexandria-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/ifftu-dev/alexandria-relay/actions/workflows/ci.yml)
+
 **Relay server for the Alexandria P2P network.**
 
 > Circuit Relay v2 + Kademlia DHT bootstrap + Identify + metrics HTTP server — a single Rust binary that helps nodes find each other and traverse NAT.
@@ -187,17 +189,29 @@ Multiaddrs for client configuration:
 /ip4/168.220.86.30/udp/4001/quic-v1/p2p/12D3KooWENHQjSydcHUXVTuq4wVNvCP4VGXzxueBtdKi1D3mS6wR
 ```
 
-## CI
+## CI/CD
 
 GitHub Actions runs on every push and PR to `main`:
 
-1. **Check** — `cargo check` for compilation errors
-2. **Clippy** — `cargo clippy` for lints (warnings are errors)
-3. **Format** — `cargo fmt --check` for style
-4. **Test** — `cargo test` for unit tests
-5. **Docker** — Validates the Dockerfile builds successfully
+| Job | What it does |
+|-----|-------------|
+| **Check** | `cargo check --locked` — compilation errors |
+| **Clippy** | `cargo clippy -- -D warnings` — lint (warnings are errors) |
+| **Format** | `cargo fmt --check` — style enforcement |
+| **Test** | `cargo test --locked` — unit tests |
+| **Docker** | Validates the Dockerfile builds (BuildKit + GHA cache) |
 
-Deploy is triggered manually or on tags via `fly deploy` (requires `FLY_API_TOKEN` secret).
+**Deploy** runs only on version tags or manual dispatch:
+
+```bash
+# Tag and push to trigger deploy
+git tag v0.1.0
+git push --tags
+
+# Or trigger manually from GitHub Actions UI
+```
+
+Requires `FLY_API_TOKEN` in GitHub repository secrets.
 
 ## License
 
