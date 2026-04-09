@@ -1,9 +1,8 @@
-# Fly.io configuration for Alexandria relay node
-app = "alexandria-relay"
-primary_region = "bom"  # Mumbai — closest to India
+# Fly.io configuration for Alexandria relay node (EU)
+app = "alexandria-relay-eu"
+primary_region = "fra"  # Frankfurt — Europe
 
 [build]
-  # Standalone crate — Dockerfile is in repo root
   dockerfile = "Dockerfile"
 
 [env]

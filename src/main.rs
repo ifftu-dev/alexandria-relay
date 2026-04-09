@@ -27,12 +27,14 @@
 //!
 //! ## Hardening
 //!
-//! - Connection limits (per-peer and total) prevent resource exhaustion
+//! - Connection limits (per-peer, per-IP, and total) prevent resource exhaustion
+//! - IP-level rate limiting prevents PeerId rotation attacks
 //! - Relay circuit limits (bandwidth, duration, reservations) prevent abuse
 //! - Kademlia memory store size is capped
 //! - Idle connection timeout prevents connection leaks
 //! - Graceful shutdown on SIGTERM/SIGINT
 //! - Periodic health logging (connection count, uptime)
+//! - HTTP health check + metrics endpoint for monitoring
 //!
 //! ## Usage
 //!
@@ -47,10 +49,14 @@
 //! alexandria-relay --port 4001
 //! ```
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::routing::get;
+use axum::{Json, Router};
 use clap::Parser;
 use futures::StreamExt;
 use libp2p::identity::Keypair;
@@ -58,6 +64,8 @@ use libp2p::kad::store::MemoryStore;
 use libp2p::multiaddr::Protocol;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{identify, kad, noise, relay, yamux, Multiaddr, SwarmBuilder};
+use serde::Serialize;
+use tokio::sync::RwLock;
 
 // ── Configuration Constants ──────────────────────────────────────────
 
@@ -66,6 +74,15 @@ const MAX_CONNECTIONS: usize = 512;
 
 /// Maximum concurrent connections from a single peer.
 const MAX_CONNECTIONS_PER_PEER: u32 = 4;
+
+/// Maximum concurrent connections from a single IP address.
+const MAX_CONNECTIONS_PER_IP: usize = 16;
+
+/// Maximum new connections from a single IP per rate window.
+const MAX_NEW_CONNS_PER_IP_PER_WINDOW: usize = 32;
+
+/// Rate window duration for IP-level connection rate limiting.
+const IP_RATE_WINDOW: Duration = Duration::from_secs(60);
 
 /// How long an idle connection stays open before being reaped.
 const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(600); // 10 min
@@ -126,6 +143,10 @@ struct Args {
     #[arg(long, default_value = "4001")]
     quic_port: u16,
 
+    /// HTTP metrics/health port
+    #[arg(long, default_value = "9090")]
+    metrics_port: u16,
+
     /// Generate a new keypair seed and exit
     #[arg(long)]
     generate_key: bool,
@@ -146,6 +167,25 @@ struct RelayBehaviour {
     identify: identify::Behaviour,
 }
 
+// ── Metrics ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+struct RelayMetrics {
+    peer_id: String,
+    uptime_seconds: u64,
+    connections: usize,
+    total_connections_served: u64,
+    reservations_accepted: u64,
+    reservations_denied: u64,
+    circuits_accepted: u64,
+    circuits_denied: u64,
+    circuits_closed: u64,
+    kad_routing_updated: u64,
+    identify_received: u64,
+    listener_errors: u64,
+    ip_rate_limited: u64,
+}
+
 // ── Keypair Utilities ────────────────────────────────────────────────
 
 fn keypair_from_seed(seed_hex: &str) -> Keypair {
@@ -163,16 +203,23 @@ fn keypair_from_seed(seed_hex: &str) -> Keypair {
 }
 
 fn generate_seed() -> String {
-    use sha2::{Digest, Sha256};
     let random_bytes: [u8; 32] = rand::random();
-    let hash = Sha256::digest(random_bytes);
-    hex::encode(hash)
+    hex::encode(random_bytes)
+}
+
+// ── IP Extraction ───────────────────────────────────────────────────
+
+fn extract_ip(addr: &Multiaddr) -> Option<IpAddr> {
+    addr.iter().find_map(|proto| match proto {
+        Protocol::Ip4(ip) => Some(IpAddr::V4(ip)),
+        Protocol::Ip6(ip) => Some(IpAddr::V6(ip)),
+        _ => None,
+    })
 }
 
 // ── Main ─────────────────────────────────────────────────────────────
 
-#[tokio::main]
-async fn main() {
+fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args = Args::parse();
@@ -193,15 +240,27 @@ async fn main() {
         return;
     }
 
+    // Read and clear RELAY_SEED while single-threaded (safe — no tokio runtime yet)
+    let seed = std::env::var("RELAY_SEED").ok();
+    if seed.is_some() {
+        std::env::remove_var("RELAY_SEED");
+    }
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(async_main(args, seed));
+}
+
+async fn async_main(args: Args, seed: Option<String>) {
     // ── Keypair ──────────────────────────────────────────────────────
-    let keypair = match std::env::var("RELAY_SEED") {
-        Ok(seed) => {
-            // Clear seed from process environment to prevent leaking via /proc/PID/environ
-            unsafe { std::env::remove_var("RELAY_SEED") };
+    let keypair = match seed {
+        Some(ref s) => {
             log::info!("Using deterministic keypair from RELAY_SEED");
-            keypair_from_seed(&seed)
+            keypair_from_seed(s)
         }
-        Err(_) => {
+        None => {
             log::warn!(
                 "No RELAY_SEED set — using ephemeral keypair (PeerId will change on restart)"
             );
@@ -212,8 +271,28 @@ async fn main() {
     let local_peer_id = keypair.public().to_peer_id();
     log::info!("Relay PeerId: {local_peer_id}");
 
+    // ── Shared Metrics ───────────────────────────────────────────────
+    let metrics = Arc::new(RwLock::new(RelayMetrics {
+        peer_id: local_peer_id.to_string(),
+        uptime_seconds: 0,
+        connections: 0,
+        total_connections_served: 0,
+        reservations_accepted: 0,
+        reservations_denied: 0,
+        circuits_accepted: 0,
+        circuits_denied: 0,
+        circuits_closed: 0,
+        kad_routing_updated: 0,
+        identify_received: 0,
+        listener_errors: 0,
+        ip_rate_limited: 0,
+    }));
+
+    // ── Start Metrics HTTP Server ────────────────────────────────────
+    tokio::spawn(run_metrics_server(metrics.clone(), args.metrics_port));
+
     // ── Build Swarm ──────────────────────────────────────────────────
-    let mut swarm = SwarmBuilder::with_existing_identity(keypair.clone())
+    let mut swarm = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
             libp2p::tcp::Config::default(),
@@ -255,22 +334,27 @@ async fn main() {
     }
 
     log::info!(
-        "Relay starting — TCP:{} QUIC/UDP:{}",
+        "Relay starting — TCP:{} QUIC/UDP:{} Metrics HTTP:{}",
         args.port,
-        args.quic_port
+        args.quic_port,
+        args.metrics_port,
     );
     log::info!(
         "Limits — max_conn:{MAX_CONNECTIONS} max_conn/peer:{MAX_CONNECTIONS_PER_PEER} \
+         max_conn/ip:{MAX_CONNECTIONS_PER_IP} \
          relay_reservations:{RELAY_MAX_RESERVATIONS} relay_circuits:{RELAY_MAX_CIRCUITS}"
     );
 
     // ── Event Loop ───────────────────────────────────────────────────
 
     let start_time = Instant::now();
-    let mut connections: usize = 0;
     let mut total_connections_served: u64 = 0;
     let mut health_interval = tokio::time::interval(HEALTH_LOG_INTERVAL);
     health_interval.tick().await; // consume immediate tick
+
+    // IP-level rate limiting state
+    let mut ip_active_connections: HashMap<IpAddr, usize> = HashMap::new();
+    let mut ip_rate_windows: HashMap<IpAddr, (usize, Instant)> = HashMap::new();
 
     // Graceful shutdown on SIGTERM/SIGINT
     let mut sigterm =
@@ -287,10 +371,23 @@ async fn main() {
                 let uptime = start_time.elapsed();
                 let hours = uptime.as_secs() / 3600;
                 let minutes = (uptime.as_secs() % 3600) / 60;
+                let connections = swarm.connected_peers().count();
                 log::info!(
                     "HEALTH — uptime:{hours}h{minutes}m connections:{connections} \
                      total_served:{total_connections_served} peer_id:{local_peer_id}"
                 );
+
+                // Update metrics
+                {
+                    let mut m = metrics.write().await;
+                    m.uptime_seconds = uptime.as_secs();
+                    m.connections = connections;
+                    m.total_connections_served = total_connections_served;
+                }
+
+                // Prune stale IP rate window entries
+                let now = Instant::now();
+                ip_rate_windows.retain(|_, (_, started)| now.duration_since(*started) < IP_RATE_WINDOW * 2);
             }
             // Graceful shutdown
             _ = sigterm.recv() => {
@@ -309,34 +406,67 @@ async fn main() {
                     }
 
                     // ── Connection Management ────────────────────────
-                    // Note: libp2p_connection_limits::Behaviour enforces MAX_CONNECTIONS
-                    // and MAX_CONNECTIONS_PER_PEER at the transport layer, so we
-                    // only track counters and add to Kademlia here.
                     SwarmEvent::ConnectionEstablished {
                         peer_id: pid,
                         endpoint,
                         ..
                     } => {
-                        connections += 1;
                         total_connections_served += 1;
+                        let remote_addr = endpoint.get_remote_address();
                         log::debug!(
-                            "CONNECT peer:{pid} endpoint:{} total:{connections}",
-                            endpoint.get_remote_address()
+                            "CONNECT peer:{pid} endpoint:{remote_addr} total_served:{total_connections_served}"
                         );
+
+                        // IP-level rate limiting
+                        if let Some(ip) = extract_ip(remote_addr) {
+                            let active = ip_active_connections.entry(ip).or_insert(0);
+                            *active += 1;
+
+                            let (attempts, window_start) =
+                                ip_rate_windows.entry(ip).or_insert((0, Instant::now()));
+                            if window_start.elapsed() > IP_RATE_WINDOW {
+                                *attempts = 0;
+                                *window_start = Instant::now();
+                            }
+                            *attempts += 1;
+
+                            if *active > MAX_CONNECTIONS_PER_IP
+                                || *attempts > MAX_NEW_CONNS_PER_IP_PER_WINDOW
+                            {
+                                log::warn!(
+                                    "IP rate limit exceeded for {ip} (active:{active}, attempts:{attempts}), \
+                                     disconnecting {pid}"
+                                );
+                                let _ = swarm.disconnect_peer_id(pid);
+                                let mut m = metrics.write().await;
+                                m.ip_rate_limited += 1;
+                            }
+                        }
+
                         // Add to Kademlia routing table
                         swarm
                             .behaviour_mut()
                             .kademlia
-                            .add_address(&pid, endpoint.get_remote_address().clone());
+                            .add_address(&pid, remote_addr.clone());
                     }
                     SwarmEvent::ConnectionClosed {
                         peer_id: pid,
                         num_established,
+                        endpoint,
                         ..
                     } => {
-                        connections = connections.saturating_sub(1);
+                        // Decrement IP active connection count
+                        if let Some(ip) = extract_ip(endpoint.get_remote_address()) {
+                            if let Some(active) = ip_active_connections.get_mut(&ip) {
+                                *active = active.saturating_sub(1);
+                                if *active == 0 {
+                                    ip_active_connections.remove(&ip);
+                                }
+                            }
+                        }
+
                         log::debug!(
-                            "DISCONNECT peer:{pid} remaining_for_peer:{num_established} total:{connections}"
+                            "DISCONNECT peer:{pid} remaining_for_peer:{num_established}"
                         );
                     }
 
@@ -349,6 +479,10 @@ async fn main() {
                             info.protocol_version,
                             info.agent_version
                         );
+                        {
+                            let mut m = metrics.write().await;
+                            m.identify_received += 1;
+                        }
                         // Add reported listen addresses to Kademlia, filtering
                         // out unroutable addresses and capping per-peer count.
                         let mut added = 0usize;
@@ -374,6 +508,8 @@ async fn main() {
                                 ..
                             } => {
                                 log::info!("RELAY reservation accepted for {src_peer_id}");
+                                let mut m = metrics.write().await;
+                                m.reservations_accepted += 1;
                             }
                             relay::Event::CircuitReqAccepted {
                                 src_peer_id,
@@ -383,6 +519,8 @@ async fn main() {
                                 log::info!(
                                     "RELAY circuit {src_peer_id} → {dst_peer_id}"
                                 );
+                                let mut m = metrics.write().await;
+                                m.circuits_accepted += 1;
                             }
                             relay::Event::CircuitClosed {
                                 src_peer_id,
@@ -392,9 +530,13 @@ async fn main() {
                                 log::debug!(
                                     "RELAY circuit closed {src_peer_id} → {dst_peer_id}"
                                 );
+                                let mut m = metrics.write().await;
+                                m.circuits_closed += 1;
                             }
                             relay::Event::ReservationReqDenied { src_peer_id, .. } => {
                                 log::warn!("RELAY reservation denied for {src_peer_id}");
+                                let mut m = metrics.write().await;
+                                m.reservations_denied += 1;
                             }
                             relay::Event::CircuitReqDenied {
                                 src_peer_id,
@@ -404,6 +546,8 @@ async fn main() {
                                 log::warn!(
                                     "RELAY circuit denied {src_peer_id} → {dst_peer_id}"
                                 );
+                                let mut m = metrics.write().await;
+                                m.circuits_denied += 1;
                             }
                             _ => {
                                 log::debug!("RELAY event: {event:?}");
@@ -421,6 +565,8 @@ async fn main() {
                                     "KAD routing updated peer:{peer} addrs:{}",
                                     addresses.len()
                                 );
+                                let mut m = metrics.write().await;
+                                m.kad_routing_updated += 1;
                             }
                             kad::Event::InboundRequest { request } => {
                                 log::debug!("KAD inbound request: {request:?}");
@@ -436,6 +582,8 @@ async fn main() {
                         log::error!(
                             "Listener {listener_id:?} error: {error}"
                         );
+                        let mut m = metrics.write().await;
+                        m.listener_errors += 1;
                     }
                     SwarmEvent::ListenerClosed {
                         listener_id,
@@ -455,6 +603,48 @@ async fn main() {
     log::info!("Relay shutdown complete. Served {total_connections_served} total connections.");
 }
 
+// ── Metrics HTTP Server ─────────────────────────────────────────────
+
+async fn run_metrics_server(metrics: Arc<RwLock<RelayMetrics>>, port: u16) {
+    let health_metrics = metrics.clone();
+    let full_metrics = metrics;
+
+    let app = Router::new()
+        .route(
+            "/health",
+            get(move || {
+                let m = health_metrics.clone();
+                async move {
+                    let lock = m.read().await;
+                    Json(serde_json::json!({
+                        "status": "ok",
+                        "peer_id": lock.peer_id,
+                        "uptime_seconds": lock.uptime_seconds,
+                        "connections": lock.connections,
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/metrics",
+            get(move || {
+                let m = full_metrics.clone();
+                async move {
+                    let lock = m.read().await;
+                    Json(lock.clone())
+                }
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
+        .await
+        .expect("bind metrics server");
+    log::info!("Metrics server listening on 0.0.0.0:{port}");
+    if let Err(e) = axum::serve(listener, app).await {
+        log::error!("Metrics server error: {e}");
+    }
+}
+
 // ── Address Validation ───────────────────────────────────────────────
 
 /// Returns `true` if the multiaddr starts with a globally routable IP.
@@ -467,8 +657,24 @@ fn is_globally_routable(addr: &Multiaddr) -> bool {
             !(ip.is_loopback() || ip.is_unspecified() || is_private_v4(ip))
         }
         Some(Protocol::Ip6(ip)) => {
-            let ip = IpAddr::V6(ip);
-            !(ip.is_loopback() || ip.is_unspecified())
+            let segments = ip.segments();
+            !(IpAddr::V6(ip).is_loopback()
+                || IpAddr::V6(ip).is_unspecified()
+                // ULA: fc00::/7
+                || (segments[0] & 0xfe00) == 0xfc00
+                // Link-local: fe80::/10
+                || (segments[0] & 0xffc0) == 0xfe80
+                // IPv4-mapped: ::ffff:0:0/96
+                || (segments[0] == 0
+                    && segments[1] == 0
+                    && segments[2] == 0
+                    && segments[3] == 0
+                    && segments[4] == 0
+                    && segments[5] == 0xffff)
+                // Multicast: ff00::/8
+                || (segments[0] & 0xff00) == 0xff00
+                // Deprecated site-local: fec0::/10
+                || (segments[0] & 0xffc0) == 0xfec0)
         }
         // DNS addresses are allowed (e.g. /dns4/example.com/tcp/4001)
         Some(Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_)) => true,

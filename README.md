@@ -2,7 +2,7 @@
 
 **Relay server for the Alexandria P2P network.**
 
-> Circuit Relay v2 + Kademlia DHT bootstrap + Identify — a single Rust binary that helps nodes find each other and traverse NAT.
+> Circuit Relay v2 + Kademlia DHT bootstrap + Identify + metrics HTTP server — a single Rust binary that helps nodes find each other and traverse NAT.
 
 ## Security Model
 
@@ -14,42 +14,69 @@ The relay has no special authority. It cannot read, modify, or censor content fl
 
 Any node can run a relay. The network does not depend on a single instance.
 
+### Hardening
+
+- **Per-peer limits** — Max 4 connections per PeerId, 512 total
+- **Per-IP rate limiting** — Max 16 concurrent connections per IP, max 32 new connections per IP per minute. Prevents PeerId rotation attacks.
+- **Relay circuit caps** — 2 MB / 2 min per circuit, 256 reservations, 512 circuits
+- **Kademlia store cap** — 64K records, 64 KB max per record
+- **Address filtering** — Rejects private (RFC 1918), CGNAT, link-local, ULA, IPv4-mapped, multicast, and site-local addresses from the DHT routing table
+- **Idle timeout** — Connections reaped after 10 minutes of inactivity
+- **Seed hygiene** — `RELAY_SEED` is read and cleared from the process environment before the async runtime starts; key material is zeroed on the stack
+
 ## Limits
 
 | Limit | Value |
 |-------|-------|
 | Max connections (total) | 512 |
 | Max connections per peer | 4 |
-| Max relay reservations | 256 |
-| Max relay circuits | 512 |
+| Max connections per IP | 16 |
+| Max new connections per IP / min | 32 |
+| Max relay reservations | 256 (8 per peer, 1h duration) |
+| Max relay circuits | 512 (16 per peer) |
 | Max data per circuit | 2 MB |
 | Max circuit duration | 2 minutes |
+| DHT records | 65,536 max (64 KB each) |
+| Idle connection timeout | 10 minutes |
 | Health log interval | 5 minutes |
-
-Graceful shutdown on SIGTERM and SIGINT — closes the listener, drains active connections, and exits cleanly.
 
 ## Quick Start
 
 ```bash
-# Run with default settings (port 4001)
+# Run with default settings (libp2p on 4001, metrics HTTP on 9090)
 cargo run -- --port 4001
 
 # Generate a new keypair seed (prints hex seed + derived PeerId)
 cargo run -- --generate-key
 ```
 
-The relay listens on both TCP and QUIC (UDP) on the same port.
+The relay listens on both TCP and QUIC (UDP) on the same port, plus an HTTP metrics server on a separate port.
 
 ## Configuration
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `--port` | CLI flag | `4001` | Listen port (TCP + QUIC/UDP) |
-| `--generate-key` | CLI flag | — | Generate a keypair seed and exit |
-| `RELAY_SEED` | Env var | — | 32-byte hex seed for deterministic PeerId. If unset, generates a random keypair on each start. |
-| `RUST_LOG` | Env var | `info` | Log level (`debug`, `info`, `warn`, `error`) |
+| `--port` | CLI | `4001` | TCP listen port |
+| `--quic-port` | CLI | `4001` | QUIC (UDP) listen port |
+| `--metrics-port` | CLI | `9090` | HTTP metrics/health port |
+| `--generate-key` | CLI | — | Generate a keypair seed and exit |
+| `RELAY_SEED` | Env | — | 32-byte hex seed for deterministic PeerId. If unset, generates a random keypair on each start. |
+| `RUST_LOG` | Env | `info` | Log level (`debug`, `info`, `warn`, `error`) |
 
-Always set `RELAY_SEED` so the PeerId is stable across restarts and redeployments.
+Always set `RELAY_SEED` in production so the PeerId is stable across restarts and redeployments.
+
+## Monitoring
+
+The relay exposes an HTTP server on the metrics port (default `9090`):
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /health` | Lightweight health check — returns `{"status":"ok","peer_id":"...","uptime_seconds":N,"connections":N}` |
+| `GET /metrics` | Full relay metrics JSON — connections, circuits, reservations, DHT updates, identify events, listener errors, IP rate limits |
+
+The `alexandria-monitoring` observer scrapes `/metrics` every 30 seconds and persists the data to SQLite. The dashboard displays a "Relay Node Health" panel with real-time metrics.
+
+Set `RELAY_METRICS_URL` on the observer to point to your relay's metrics endpoint (comma-separated for multiple relays).
 
 ## Deployment
 
@@ -58,7 +85,7 @@ The relay is deployed on [Fly.io](https://fly.io) using the included `Dockerfile
 ```bash
 # First-time launch
 fly launch --no-deploy
-fly secrets set RELAY_SEED="<32-byte-hex-seed>"
+fly secrets set RELAY_SEED="<64-char-hex-seed>"
 fly deploy
 
 # Subsequent deploys
@@ -69,38 +96,77 @@ fly status
 fly logs
 ```
 
-The `fly.toml` allocates a dedicated IPv4 address and exposes port 4001 for both TCP and UDP (QUIC). The Dockerfile uses a multi-stage build with `rust:1.88-slim` to produce a minimal final image.
+The `fly.toml` exposes three services:
+- Port `4001` TCP — libp2p (relay, Kademlia, identify)
+- Port `4001` UDP — QUIC transport
+- Port `9090` HTTP — health checks and metrics (with Fly.io health check configured)
+
+The Dockerfile uses a multi-stage build with `rust:1.88-slim` to produce a minimal final image.
+
+### Multi-Region Deployment
+
+Deploy additional relays in other regions for redundancy and lower latency:
+
+```bash
+# 1. Generate a new keypair for the EU relay
+cargo run -- --generate-key
+# Save the seed and PeerId from the output
+
+# 2. Create the Fly.io app (uses fly-eu.toml)
+fly apps create alexandria-relay-eu
+fly secrets set RELAY_SEED="<new-64-char-hex-seed>" -a alexandria-relay-eu
+
+# 3. Deploy
+fly deploy -c fly-eu.toml
+
+# 4. Get the allocated IPv4 address
+fly ips list -a alexandria-relay-eu
+
+# 5. Update the main app's discovery.rs:
+#    - Uncomment the EU relay entry in the RELAYS array
+#    - Fill in the PeerId, hostname, and IPv4 from steps 1 and 4
+
+# 6. Update the monitoring observer:
+#    RELAY_METRICS_URL=http://<bom-ip>:9090/metrics,http://<fra-ip>:9090/metrics
+```
+
+Each relay operates independently with its own Kademlia routing table. Peers connected to different relays discover each other through DHT propagation.
+
+Included configs: `fly.toml` (Mumbai/bom), `fly-eu.toml` (Frankfurt/fra).
 
 ## Architecture
 
-A single Rust binary (`src/main.rs`, ~340 lines) built on libp2p 0.56:
+A single Rust binary (`src/main.rs`, ~770 lines) built on libp2p 0.56:
 
 ```
-┌─────────────────────────────────┐
-│         Alexandria Relay        │
-├─────────────────────────────────┤
-│  Circuit Relay v2               │  NAT traversal for mobile nodes
-│  Kademlia DHT                   │  /alexandria/kad/1.0 — peer discovery
-│  Identify                       │  Protocol negotiation + agent version
-├─────────────────────────────────┤
-│  TCP + Noise + Yamux            │  Encrypted multiplexed transport
-│  QUIC                           │  UDP transport (0-RTT)
-├─────────────────────────────────┤
-│  Connection Limits              │  512 total, 4 per peer
-│  Relay Limits                   │  256 reservations, 512 circuits
-│  Health Logger                  │  Peer/reservation counts every 5 min
-│  Graceful Shutdown              │  SIGTERM / SIGINT
-└─────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│                 Alexandria Relay                  │
+├──────────────────────────────────────────────────┤
+│  Circuit Relay v2          NAT traversal         │
+│  Kademlia DHT              /alexandria/kad/1.0   │
+│  Identify                  Protocol negotiation  │
+├──────────────────────────────────────────────────┤
+│  TCP + Noise + Yamux       Encrypted mux         │
+│  QUIC                      UDP transport (0-RTT) │
+├──────────────────────────────────────────────────┤
+│  Connection Limits         512 total, 4/peer     │
+│  IP Rate Limiting          16/IP, 32 new/IP/min  │
+│  Relay Limits              256 res, 512 circuits │
+│  Metrics HTTP Server       /health + /metrics    │
+│  Health Logger             5-min interval        │
+│  Graceful Shutdown         SIGTERM / SIGINT      │
+└──────────────────────────────────────────────────┘
 ```
 
 | Component | Technology |
 |-----------|------------|
 | Language | Rust (2021 edition, MSRV 1.88) |
 | Networking | libp2p 0.56 (relay, kad, identify, tcp, quic, noise, yamux) |
+| HTTP | Axum 0.7 (health checks + metrics) |
 | Async runtime | tokio |
 | CLI | clap 4 |
-| Container | Multi-stage Docker (rust:1.88-slim → debian:bookworm-slim) |
-| Hosting | Fly.io (Mumbai region) |
+| Container | Multi-stage Docker (rust:1.88-slim -> debian:bookworm-slim) |
+| Hosting | Fly.io |
 
 ## Current Deployment
 
@@ -109,7 +175,7 @@ A single Rust binary (`src/main.rs`, ~340 lines) built on libp2p 0.56:
 | PeerId | `12D3KooWENHQjSydcHUXVTuq4wVNvCP4VGXzxueBtdKi1D3mS6wR` |
 | Hostname | `alexandria-relay.fly.dev` |
 | IPv4 | `168.220.86.30` |
-| Port | `4001` (TCP + QUIC/UDP) |
+| Ports | `4001` (TCP + QUIC/UDP), `9090` (HTTP metrics) |
 | Region | `bom` (Mumbai) |
 
 Multiaddrs for client configuration:
@@ -120,6 +186,18 @@ Multiaddrs for client configuration:
 /ip4/168.220.86.30/tcp/4001/p2p/12D3KooWENHQjSydcHUXVTuq4wVNvCP4VGXzxueBtdKi1D3mS6wR
 /ip4/168.220.86.30/udp/4001/quic-v1/p2p/12D3KooWENHQjSydcHUXVTuq4wVNvCP4VGXzxueBtdKi1D3mS6wR
 ```
+
+## CI
+
+GitHub Actions runs on every push and PR to `main`:
+
+1. **Check** — `cargo check` for compilation errors
+2. **Clippy** — `cargo clippy` for lints (warnings are errors)
+3. **Format** — `cargo fmt --check` for style
+4. **Test** — `cargo test` for unit tests
+5. **Docker** — Validates the Dockerfile builds successfully
+
+Deploy is triggered manually or on tags via `fly deploy` (requires `FLY_API_TOKEN` secret).
 
 ## License
 
