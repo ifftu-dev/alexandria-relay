@@ -170,7 +170,9 @@ A single Rust binary (`src/main.rs`, ~770 lines) built on libp2p 0.56:
 | Container | Multi-stage Docker (rust:1.88-slim -> debian:bookworm-slim) |
 | Hosting | Fly.io |
 
-## Current Deployment
+## Current Deployments
+
+### Mumbai (primary)
 
 | Item | Value |
 |------|-------|
@@ -180,13 +182,28 @@ A single Rust binary (`src/main.rs`, ~770 lines) built on libp2p 0.56:
 | Ports | `4001` (TCP + QUIC/UDP), `9090` (HTTP metrics) |
 | Region | `bom` (Mumbai) |
 
-Multiaddrs for client configuration:
+### Frankfurt (EU)
 
+| Item | Value |
+|------|-------|
+| PeerId | `12D3KooWFDVfPBwa6EVEp8v8cqXpgmiksV7qMarHCYLF174XV9xj` |
+| Hostname | `alexandria-relay-eu.fly.dev` |
+| IPv4 | `66.51.123.68` |
+| Ports | `4001` (TCP + QUIC/UDP), `9090` (HTTP metrics) |
+| Region | `fra` (Frankfurt) |
+
+### Multiaddrs
+
+Mumbai:
 ```
 /dns4/alexandria-relay.fly.dev/tcp/4001/p2p/12D3KooWENHQjSydcHUXVTuq4wVNvCP4VGXzxueBtdKi1D3mS6wR
 /dns4/alexandria-relay.fly.dev/udp/4001/quic-v1/p2p/12D3KooWENHQjSydcHUXVTuq4wVNvCP4VGXzxueBtdKi1D3mS6wR
-/ip4/168.220.86.30/tcp/4001/p2p/12D3KooWENHQjSydcHUXVTuq4wVNvCP4VGXzxueBtdKi1D3mS6wR
-/ip4/168.220.86.30/udp/4001/quic-v1/p2p/12D3KooWENHQjSydcHUXVTuq4wVNvCP4VGXzxueBtdKi1D3mS6wR
+```
+
+Frankfurt:
+```
+/dns4/alexandria-relay-eu.fly.dev/tcp/4001/p2p/12D3KooWFDVfPBwa6EVEp8v8cqXpgmiksV7qMarHCYLF174XV9xj
+/dns4/alexandria-relay-eu.fly.dev/udp/4001/quic-v1/p2p/12D3KooWFDVfPBwa6EVEp8v8cqXpgmiksV7qMarHCYLF174XV9xj
 ```
 
 ## CI/CD
