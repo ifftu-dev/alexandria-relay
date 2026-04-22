@@ -147,6 +147,17 @@ struct Args {
     #[arg(long, default_value = "9090")]
     metrics_port: u16,
 
+    /// Publicly resolvable hostname this relay is reachable at (e.g.
+    /// `alexandria-relay.fly.dev`). Registered as the relay's external
+    /// address so reservation responses include a dialable multiaddr.
+    /// The hostname is also resolved at startup and the current IPs are
+    /// registered, so DNS-blocked clients can reach us by IP without us
+    /// hardcoding addresses that go stale on re-provisioning.
+    /// Without this, clients receive an empty address list and reject
+    /// the reservation with `NoAddressesInReservation`.
+    #[arg(long, env = "RELAY_PUBLIC_HOST")]
+    public_host: Option<String>,
+
     /// Generate a new keypair seed and exit
     #[arg(long)]
     generate_key: bool,
@@ -331,6 +342,66 @@ async fn async_main(args: Args, seed: Option<String>) {
     // IPv6 QUIC (best-effort)
     if let Ok(addr) = format!("/ip6/::/udp/{}/quic-v1", args.quic_port).parse::<Multiaddr>() {
         let _ = swarm.listen_on(addr);
+    }
+
+    // Register external addresses so reservation responses include
+    // dialable multiaddrs. libp2p-relay sends `self.external_addresses`
+    // to the client in the reservation accept; an empty list causes the
+    // client to reject with `NoAddressesInReservation` and the circuit
+    // listener to close — meaning no one can be circuit-dialed via us.
+    let mut external_registered: Vec<String> = Vec::new();
+    if let Some(host) = &args.public_host {
+        // DNS forms. These survive Fly.io re-provisioning since Fly DNS
+        // tracks the current IP.
+        for tmpl in [
+            format!("/dns4/{host}/tcp/{}", args.port),
+            format!("/dns4/{host}/udp/{}/quic-v1", args.quic_port),
+        ] {
+            if let Ok(addr) = tmpl.parse::<Multiaddr>() {
+                external_registered.push(addr.to_string());
+                swarm.add_external_address(addr);
+            }
+        }
+
+        // IP literal forms for clients whose DNS is blocked. Resolve at
+        // startup rather than hardcoding so the addresses stay current
+        // across Fly.io re-provisioning — each relay restart picks up
+        // whatever IP the DNS name currently points at.
+        match tokio::net::lookup_host(format!("{host}:{}", args.port)).await {
+            Ok(addrs) => {
+                for sa in addrs {
+                    let ip = sa.ip();
+                    let forms = match ip {
+                        IpAddr::V4(v4) => vec![
+                            format!("/ip4/{v4}/tcp/{}", args.port),
+                            format!("/ip4/{v4}/udp/{}/quic-v1", args.quic_port),
+                        ],
+                        IpAddr::V6(v6) => vec![
+                            format!("/ip6/{v6}/tcp/{}", args.port),
+                            format!("/ip6/{v6}/udp/{}/quic-v1", args.quic_port),
+                        ],
+                    };
+                    for tmpl in forms {
+                        if let Ok(addr) = tmpl.parse::<Multiaddr>() {
+                            external_registered.push(addr.to_string());
+                            swarm.add_external_address(addr);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("Failed to resolve public_host {host}: {e}. DNS-only addrs will still be advertised.");
+            }
+        }
+    }
+    if external_registered.is_empty() {
+        log::warn!(
+            "No --public-host set; reservation responses will contain no addresses and \
+             circuit clients will reject with NoAddressesInReservation. Set \
+             RELAY_PUBLIC_HOST for production."
+        );
+    } else {
+        log::info!("External addresses registered: {external_registered:?}");
     }
 
     log::info!(
