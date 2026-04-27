@@ -70,13 +70,15 @@ use tokio::sync::RwLock;
 // ── Configuration Constants ──────────────────────────────────────────
 
 /// Maximum total concurrent connections the relay will accept.
-const MAX_CONNECTIONS: usize = 512;
+const MAX_CONNECTIONS: usize = 1024;
 
 /// Maximum concurrent connections from a single peer.
-const MAX_CONNECTIONS_PER_PEER: u32 = 4;
+/// Allows TCP+QUIC × inbound/outbound × small reconnect overlap.
+const MAX_CONNECTIONS_PER_PEER: u32 = 8;
 
 /// Maximum concurrent connections from a single IP address.
-const MAX_CONNECTIONS_PER_IP: usize = 16;
+/// Households / shared NATs commonly carry 5-10 simultaneous peers.
+const MAX_CONNECTIONS_PER_IP: usize = 32;
 
 /// Maximum new connections from a single IP per rate window.
 const MAX_NEW_CONNS_PER_IP_PER_WINDOW: usize = 32;
@@ -94,28 +96,38 @@ const KAD_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 const KAD_REPLICATION_FACTOR: usize = 20;
 
 /// Maximum number of records in the Kademlia memory store.
-const KAD_MAX_RECORDS: usize = 65_536;
+/// 16k × 64 KB ≈ 1 GB worst case — fits a 1 GB Fly machine with headroom.
+const KAD_MAX_RECORDS: usize = 16_384;
 
 /// Maximum size of a single Kademlia record value.
 const KAD_MAX_RECORD_SIZE: usize = 65_536; // 64 KB
 
 /// Relay: max number of active circuit reservations.
-const RELAY_MAX_RESERVATIONS: usize = 256;
+const RELAY_MAX_RESERVATIONS: usize = 1024;
 
 /// Relay: max number of active circuits (relayed connections).
-const RELAY_MAX_CIRCUITS: usize = 512;
+const RELAY_MAX_CIRCUITS: usize = 2048;
 
 /// Relay: max number of reservation requests per peer.
-const RELAY_MAX_RESERVATIONS_PER_PEER: usize = 8;
+const RELAY_MAX_RESERVATIONS_PER_PEER: usize = 16;
 
 /// Relay: max number of circuits per peer.
-const RELAY_MAX_CIRCUITS_PER_PEER: usize = 16;
+/// Was 16 — observer + crawlers fan-out enough simultaneous circuit dials
+/// to saturate that limit, causing cascade `circuits_denied` (saw 7910:47
+/// denied:accepted ratio in production). 128 leaves headroom for active
+/// observers without exposing the relay to a single peer monopolising it.
+const RELAY_MAX_CIRCUITS_PER_PEER: usize = 128;
 
 /// Relay: per-circuit bandwidth limit (bytes).
-const RELAY_MAX_CIRCUIT_BYTES: u64 = 2 * 1024 * 1024; // 2 MB
+/// 2 MB was too tight for VC bundles + content sync. 128 MB still caps
+/// abuse but won't truncate normal payloads.
+const RELAY_MAX_CIRCUIT_BYTES: u64 = 128 * 1024 * 1024; // 128 MB
 
 /// Relay: per-circuit duration limit.
-const RELAY_MAX_CIRCUIT_DURATION: Duration = Duration::from_secs(120); // 2 min
+/// 120 s caused gossipsub mesh churn — every 2 min all circuits closed
+/// and re-dialed. 15 min lets meshes stabilise; DCUtR (client-side) should
+/// upgrade most circuits to direct connections well within this window.
+const RELAY_MAX_CIRCUIT_DURATION: Duration = Duration::from_secs(900); // 15 min
 
 /// Relay: how long a reservation is valid.
 const RELAY_RESERVATION_DURATION: Duration = Duration::from_secs(3600); // 1 hour
@@ -195,6 +207,21 @@ struct RelayMetrics {
     identify_received: u64,
     listener_errors: u64,
     ip_rate_limited: u64,
+
+    // Rolling 60-second window snapshots — populated by a background
+    // sampling task in `run_metrics_server`. Drives /health/alerts.
+    #[serde(skip)]
+    prev_minute_circuits_denied: u64,
+    #[serde(skip)]
+    prev_minute_circuits_accepted: u64,
+    #[serde(skip)]
+    prev_minute_reservations_denied: u64,
+    /// Circuits denied in the most recent completed 60s window. Surfaced
+    /// at /health/alerts so external healthcheckers can flag spikes
+    /// without doing their own delta math.
+    circuits_denied_per_min: u64,
+    circuits_accepted_per_min: u64,
+    reservations_denied_per_min: u64,
 }
 
 // ── Keypair Utilities ────────────────────────────────────────────────
@@ -297,6 +324,12 @@ async fn async_main(args: Args, seed: Option<String>) {
         identify_received: 0,
         listener_errors: 0,
         ip_rate_limited: 0,
+        prev_minute_circuits_denied: 0,
+        prev_minute_circuits_accepted: 0,
+        prev_minute_reservations_denied: 0,
+        circuits_denied_per_min: 0,
+        circuits_accepted_per_min: 0,
+        reservations_denied_per_min: 0,
     }));
 
     // ── Start Metrics HTTP Server ────────────────────────────────────
@@ -676,7 +709,34 @@ async fn async_main(args: Args, seed: Option<String>) {
 // ── Metrics HTTP Server ─────────────────────────────────────────────
 
 async fn run_metrics_server(metrics: Arc<RwLock<RelayMetrics>>, port: u16) {
+    // Sample rolling-minute deltas in the background. Lets /health/alerts
+    // serve a denial-rate without external alerters doing delta math.
+    {
+        let metrics = metrics.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            tick.tick().await; // consume immediate tick
+            loop {
+                tick.tick().await;
+                let mut m = metrics.write().await;
+                m.circuits_denied_per_min = m
+                    .circuits_denied
+                    .saturating_sub(m.prev_minute_circuits_denied);
+                m.circuits_accepted_per_min = m
+                    .circuits_accepted
+                    .saturating_sub(m.prev_minute_circuits_accepted);
+                m.reservations_denied_per_min = m
+                    .reservations_denied
+                    .saturating_sub(m.prev_minute_reservations_denied);
+                m.prev_minute_circuits_denied = m.circuits_denied;
+                m.prev_minute_circuits_accepted = m.circuits_accepted;
+                m.prev_minute_reservations_denied = m.reservations_denied;
+            }
+        });
+    }
+
     let health_metrics = metrics.clone();
+    let alerts_metrics = metrics.clone();
     let full_metrics = metrics;
 
     let app = Router::new()
@@ -692,6 +752,65 @@ async fn run_metrics_server(metrics: Arc<RwLock<RelayMetrics>>, port: u16) {
                         "uptime_seconds": lock.uptime_seconds,
                         "connections": lock.connections,
                     }))
+                }
+            }),
+        )
+        .route(
+            "/health/alerts",
+            get(move || {
+                let m = alerts_metrics.clone();
+                async move {
+                    let lock = m.read().await;
+                    // Thresholds chosen so a healthy relay sits at "ok"
+                    // and a saturated one trips before clients notice.
+                    let connections_ratio = lock.connections as f64 / MAX_CONNECTIONS as f64;
+                    let denial_rate = lock.circuits_denied_per_min;
+                    let accept_rate = lock.circuits_accepted_per_min;
+                    let denial_share = if accept_rate + denial_rate == 0 {
+                        0.0
+                    } else {
+                        denial_rate as f64 / (accept_rate + denial_rate) as f64
+                    };
+
+                    let mut alerts: Vec<&str> = Vec::new();
+                    if connections_ratio > 0.8 {
+                        alerts.push("connections_near_cap");
+                    }
+                    if denial_rate > 100 {
+                        alerts.push("circuits_denied_per_min_high");
+                    }
+                    if denial_share > 0.5 && (denial_rate + accept_rate) > 20 {
+                        alerts.push("circuit_denial_majority");
+                    }
+                    if lock.reservations_denied_per_min > 10 {
+                        alerts.push("reservations_denied_per_min_high");
+                    }
+                    if lock.listener_errors > 0 {
+                        alerts.push("listener_errors_observed");
+                    }
+
+                    let level = if alerts.is_empty() { "ok" } else { "warn" };
+                    let status_code = if alerts.is_empty() {
+                        axum::http::StatusCode::OK
+                    } else {
+                        // 503 makes most healthcheckers (UptimeRobot,
+                        // healthchecks.io, Fly's own checks) flag the
+                        // relay without manually parsing JSON.
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    };
+                    (
+                        status_code,
+                        Json(serde_json::json!({
+                            "level": level,
+                            "alerts": alerts,
+                            "circuits_denied_per_min": denial_rate,
+                            "circuits_accepted_per_min": accept_rate,
+                            "circuit_denial_share": denial_share,
+                            "reservations_denied_per_min": lock.reservations_denied_per_min,
+                            "connections_ratio": connections_ratio,
+                            "max_connections": MAX_CONNECTIONS,
+                        })),
+                    )
                 }
             }),
         )

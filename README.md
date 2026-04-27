@@ -30,17 +30,21 @@ Any node can run a relay. The network does not depend on a single instance.
 
 | Limit | Value |
 |-------|-------|
-| Max connections (total) | 512 |
-| Max connections per peer | 4 |
-| Max connections per IP | 16 |
+| Max connections (total) | 1024 |
+| Max connections per peer | 8 |
+| Max connections per IP | 32 |
 | Max new connections per IP / min | 32 |
-| Max relay reservations | 256 (8 per peer, 1h duration) |
-| Max relay circuits | 512 (16 per peer) |
-| Max data per circuit | 2 MB |
-| Max circuit duration | 2 minutes |
-| DHT records | 65,536 max (64 KB each) |
+| Max relay reservations | 1024 (16 per peer, 1h duration) |
+| Max relay circuits | 2048 (128 per peer) |
+| Max data per circuit | 128 MB |
+| Max circuit duration | 15 minutes |
+| DHT records | 16,384 max (64 KB each) |
 | Idle connection timeout | 10 minutes |
 | Health log interval | 5 minutes |
+
+**IP rate limits** are tuned for normal residential / mobile NATs (a household typically carries 5-10 simultaneous peers). If you run synthetic load tests from a single IP (CI runners, dev clusters), `MAX_CONNECTIONS_PER_IP` and `MAX_NEW_CONNS_PER_IP_PER_WINDOW` will reject connections — bump them or whitelist the source for the duration of the test.
+
+**Per-peer circuit cap (128)** is the knob most likely to need tuning if you grow the active-observer count. Each crawler/observer that fan-dials peers via circuits contributes against this limit *as the source peer*. A network with multiple high-frequency observers should push this higher (256-512) before the global `RELAY_MAX_CIRCUITS` becomes the bottleneck.
 
 ## Quick Start
 
@@ -74,11 +78,24 @@ The relay exposes an HTTP server on the metrics port (default `9090`):
 | Endpoint | Description |
 |----------|-------------|
 | `GET /health` | Lightweight health check — returns `{"status":"ok","peer_id":"...","uptime_seconds":N,"connections":N}` |
-| `GET /metrics` | Full relay metrics JSON — connections, circuits, reservations, DHT updates, identify events, listener errors, IP rate limits |
+| `GET /health/alerts` | Alert-friendly health check — `200` when healthy, `503` when any threshold trips. JSON body lists which alerts are firing (e.g., `circuit_denial_majority`, `connections_near_cap`) and the rolling 60s denial rates. Suitable for UptimeRobot / healthchecks.io / Fly's own checks without external delta math. |
+| `GET /metrics` | Full relay metrics JSON — connections, circuits, reservations, DHT updates, identify events, listener errors, IP rate limits, plus rolling-minute denial counters |
 
 The `alexandria-monitoring` observer scrapes `/metrics` every 30 seconds and persists the data to SQLite. The dashboard displays a "Relay Node Health" panel with real-time metrics.
 
 Set `RELAY_METRICS_URL` on the observer to point to your relay's metrics endpoint (comma-separated for multiple relays).
+
+### External alerting
+
+Wire `https://alexandria-relay.fly.dev/health/alerts` into UptimeRobot or healthchecks.io as an HTTP GET monitor. Any `5xx` response indicates one or more thresholds tripped — current triggers:
+
+- `connections_near_cap` — connections > 80% of `MAX_CONNECTIONS`
+- `circuits_denied_per_min_high` — > 100 denials / min
+- `circuit_denial_majority` — denials > accepts in last minute (with > 20 total)
+- `reservations_denied_per_min_high` — > 10 reservation denials / min
+- `listener_errors_observed` — any cumulative listener errors
+
+You'll want to alert on `5xx` and inspect the JSON body for which signal fired.
 
 ## Deployment
 
@@ -136,6 +153,17 @@ Each relay operates independently with its own Kademlia routing table. Peers con
 
 Included configs: `fly.toml` (Mumbai/bom), `fly-eu.toml` (Frankfurt/fra).
 
+### High availability inside one region
+
+Each region currently runs **one Fly machine**. A restart drops every reservation through that relay; clients reconnect within ~30s but the user-visible blip is real. To run two machines per region:
+
+```bash
+fly scale count 2 --region bom -a alexandria-relay
+fly scale count 2 --region fra -a alexandria-relay-eu
+```
+
+Both machines share the same `RELAY_SEED` (so PeerId is stable) and Fly load-balances incoming connections. The cost is ~one extra `shared-1x-cpu@1024MB` instance per region. Recommended once active users exceed a few hundred — until then, the single-machine blast radius is small enough that the spend isn't justified. (Auto-scaling on circuit-pressure is a future enhancement; today it's a manual switch.)
+
 ## Architecture
 
 A single Rust binary (`src/main.rs`, ~770 lines) built on libp2p 0.56:
@@ -151,9 +179,9 @@ A single Rust binary (`src/main.rs`, ~770 lines) built on libp2p 0.56:
 │  TCP + Noise + Yamux       Encrypted mux         │
 │  QUIC                      UDP transport (0-RTT) │
 ├──────────────────────────────────────────────────┤
-│  Connection Limits         512 total, 4/peer     │
-│  IP Rate Limiting          16/IP, 32 new/IP/min  │
-│  Relay Limits              256 res, 512 circuits │
+│  Connection Limits         1024 total, 8/peer    │
+│  IP Rate Limiting          32/IP, 32 new/IP/min  │
+│  Relay Limits              1024 res, 2048 circs  │
 │  Metrics HTTP Server       /health + /metrics    │
 │  Health Logger             5-min interval        │
 │  Graceful Shutdown         SIGTERM / SIGINT      │

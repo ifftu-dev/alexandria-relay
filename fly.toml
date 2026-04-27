@@ -53,5 +53,8 @@ primary_region = "bom"  # Mumbai — closest to India
     path = "/health"
 
 [[vm]]
-  memory = "256mb"
+  # 1 GB headroom for the bumped circuit/reservation limits + Kademlia
+  # store + libp2p connection state. 256mb was hitting OOM territory
+  # under load (see RelayBehaviour limits in src/main.rs).
+  memory = "1024mb"
   cpus = 1

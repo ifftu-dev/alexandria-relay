@@ -52,5 +52,6 @@ primary_region = "fra"  # Frankfurt — Europe
     path = "/health"
 
 [[vm]]
-  memory = "256mb"
+  # 1 GB — same headroom rationale as fly.toml.
+  memory = "1024mb"
   cpus = 1
