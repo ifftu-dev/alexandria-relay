@@ -49,7 +49,7 @@
 //! alexandria-relay --port 4001
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -63,7 +63,7 @@ use libp2p::identity::Keypair;
 use libp2p::kad::store::MemoryStore;
 use libp2p::multiaddr::Protocol;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{identify, kad, noise, relay, yamux, Multiaddr, SwarmBuilder};
+use libp2p::{identify, kad, noise, relay, yamux, Multiaddr, PeerId, SwarmBuilder};
 use serde::Serialize;
 use tokio::sync::RwLock;
 
@@ -222,6 +222,32 @@ struct RelayMetrics {
     circuits_denied_per_min: u64,
     circuits_accepted_per_min: u64,
     reservations_denied_per_min: u64,
+
+    /// Source IPs of currently-connected peers, captured from the
+    /// connection's remote address at ConnectionEstablished. Surfaced
+    /// via /peers so the observer can attribute geo to NATted peers
+    /// (whose own listen_addrs only include private LAN + circuit
+    /// addrs and so never reveal their WAN IP through libp2p Identify).
+    /// Skipped from /metrics to avoid leaking IPs into general telemetry.
+    #[serde(skip)]
+    peer_source_ips: HashMap<PeerId, IpAddr>,
+    /// Subset of `peer_source_ips` keys that hold an active circuit
+    /// reservation with this relay — i.e. they're using us as a
+    /// rendezvous point. This is the more interesting set for the
+    /// observer (ad-hoc dialers come and go).
+    #[serde(skip)]
+    peers_with_reservation: HashSet<PeerId>,
+}
+
+/// Wire format for /peers — one entry per connected peer with the WAN
+/// IP we saw them dial in from. `has_reservation` distinguishes peers
+/// using us as a relay rendezvous from peers that just opened a one-off
+/// connection (e.g. observer crawlers).
+#[derive(Debug, Clone, Serialize)]
+struct PeerSourceEntry {
+    peer_id: String,
+    source_ip: String,
+    has_reservation: bool,
 }
 
 // ── Keypair Utilities ────────────────────────────────────────────────
@@ -330,6 +356,8 @@ async fn async_main(args: Args, seed: Option<String>) {
         circuits_denied_per_min: 0,
         circuits_accepted_per_min: 0,
         reservations_denied_per_min: 0,
+        peer_source_ips: HashMap::new(),
+        peers_with_reservation: HashSet::new(),
     }));
 
     // ── Start Metrics HTTP Server ────────────────────────────────────
@@ -520,6 +548,13 @@ async fn async_main(args: Args, seed: Option<String>) {
                             "CONNECT peer:{pid} endpoint:{remote_addr} total_served:{total_connections_served}"
                         );
 
+                        // Record peer's WAN IP so /peers can publish it.
+                        // We capture on every Established and overwrite on
+                        // reconnect — last-known address wins.
+                        if let Some(ip) = extract_ip(remote_addr) {
+                            metrics.write().await.peer_source_ips.insert(pid, ip);
+                        }
+
                         // IP-level rate limiting
                         if let Some(ip) = extract_ip(remote_addr) {
                             let active = ip_active_connections.entry(ip).or_insert(0);
@@ -568,6 +603,15 @@ async fn async_main(args: Args, seed: Option<String>) {
                             }
                         }
 
+                        // When the peer has zero remaining connections,
+                        // forget the peer's WAN IP and reservation flag.
+                        // (libp2p delivers `num_established` post-decrement.)
+                        if num_established == 0 {
+                            let mut m = metrics.write().await;
+                            m.peer_source_ips.remove(&pid);
+                            m.peers_with_reservation.remove(&pid);
+                        }
+
                         log::debug!(
                             "DISCONNECT peer:{pid} remaining_for_peer:{num_established}"
                         );
@@ -613,6 +657,7 @@ async fn async_main(args: Args, seed: Option<String>) {
                                 log::info!("RELAY reservation accepted for {src_peer_id}");
                                 let mut m = metrics.write().await;
                                 m.reservations_accepted += 1;
+                                m.peers_with_reservation.insert(*src_peer_id);
                             }
                             relay::Event::CircuitReqAccepted {
                                 src_peer_id,
@@ -737,6 +782,7 @@ async fn run_metrics_server(metrics: Arc<RwLock<RelayMetrics>>, port: u16) {
 
     let health_metrics = metrics.clone();
     let alerts_metrics = metrics.clone();
+    let peers_metrics = metrics.clone();
     let full_metrics = metrics;
 
     let app = Router::new()
@@ -811,6 +857,25 @@ async fn run_metrics_server(metrics: Arc<RwLock<RelayMetrics>>, port: u16) {
                             "max_connections": MAX_CONNECTIONS,
                         })),
                     )
+                }
+            }),
+        )
+        .route(
+            "/peers",
+            get(move || {
+                let m = peers_metrics.clone();
+                async move {
+                    let lock = m.read().await;
+                    let entries: Vec<PeerSourceEntry> = lock
+                        .peer_source_ips
+                        .iter()
+                        .map(|(pid, ip)| PeerSourceEntry {
+                            peer_id: pid.to_string(),
+                            source_ip: ip.to_string(),
+                            has_reservation: lock.peers_with_reservation.contains(pid),
+                        })
+                        .collect();
+                    Json(entries)
                 }
             }),
         )
