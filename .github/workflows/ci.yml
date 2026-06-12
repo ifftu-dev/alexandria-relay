@@ -94,13 +94,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
-      # The registry store mounts a volume; create it once per region.
-      # `volumes list` is the idempotency guard — volume names are not
-      # unique on Fly, so blind create would stack duplicates.
+      # The registry store mounts a volume; ensure one exists per region.
+      # Best-effort: volume creation races registration and bom has had
+      # zone-saturation quirks — log state, attempt create, and let the
+      # deploy step be the real arbiter (it fails loudly if unmounted).
       - run: |
+          echo "--- volumes before:"
+          flyctl volumes list --config ${{ matrix.config }} || true
           if ! flyctl volumes list --config ${{ matrix.config }} --json | grep -q '"name": *"relay_data"'; then
-            flyctl volumes create relay_data --region ${{ matrix.fly_region }} --size 1 --yes --config ${{ matrix.config }}
+            flyctl volumes create relay_data --region ${{ matrix.fly_region }} --size 1 --yes --config ${{ matrix.config }} || \
+              echo "::warning::volume create failed — proceeding, deploy will verify"
+            sleep 10  # registration race: give the API a beat before deploy
           fi
+          echo "--- volumes after:"
+          flyctl volumes list --config ${{ matrix.config }} || true
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
       - run: flyctl deploy --remote-only --config ${{ matrix.config }}
