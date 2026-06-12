@@ -15,7 +15,7 @@ The relay cannot read, modify, or censor content flowing through the network (tr
 3. **Protocol handshake** — Identify announces the relay's supported protocols and agent version to connecting peers.
 4. **Username receipts** — countersigns first-seen username claims over `/alexandria/username-reg/1.0` (persisted in sqlite under `RELAY_DATA_DIR`) and serves `GET /username/:name` for signup-time availability checks.
 
-One honest caveat to "no special authority": for username receipts the relay *is* a trusted first-seen timestamp oracle (tier 1). That trust is bounded — claims gather receipts from every relay and order by the median time, and Cardano-anchored claims (tier 2) beat any receipt. See the main repo's `docs/username-registry.md`.
+One honest caveat to "no special authority": for username receipts the relay *is* a trusted first-seen timestamp oracle (tier 1). That trust is bounded — claims gather receipts from every relay and order by the upper median of receipt times, and Cardano-anchored claims (tier 2) beat any receipt. See the main repo's `docs/username-registry.md`.
 
 Any node can run a relay. The network does not depend on a single instance.
 
@@ -69,6 +69,7 @@ The relay listens on both TCP and QUIC (UDP) on the same port, plus an HTTP metr
 | `--quic-port` | CLI | `4001` | QUIC (UDP) listen port |
 | `--metrics-port` | CLI | `9090` | HTTP metrics/health port |
 | `--generate-key` | CLI | — | Generate a keypair seed and exit |
+| `RELAY_DATA_DIR` | env | Persistent state dir (receipts + DHT record mirror); `/data` on the Fly volume | `./relay-data` |
 | `RELAY_SEED` | Env | — | 32-byte hex seed for deterministic PeerId. If unset, generates a random keypair on each start. |
 | `RUST_LOG` | Env | `info` | Log level (`debug`, `info`, `warn`, `error`) |
 
