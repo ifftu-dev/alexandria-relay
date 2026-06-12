@@ -62,10 +62,14 @@ use futures::StreamExt;
 use libp2p::identity::Keypair;
 use libp2p::kad::store::MemoryStore;
 use libp2p::multiaddr::Protocol;
+use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{identify, kad, noise, relay, yamux, Multiaddr, PeerId, SwarmBuilder};
+use libp2p::{identify, kad, noise, relay, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder};
+
+mod username_reg;
 use serde::Serialize;
 use tokio::sync::RwLock;
+use username_reg::{ReceiptRequest, ReceiptResponse, RegistryStore};
 
 // ── Configuration Constants ──────────────────────────────────────────
 
@@ -173,6 +177,11 @@ struct Args {
     /// Generate a new keypair seed and exit
     #[arg(long)]
     generate_key: bool,
+
+    /// Directory for persistent state (username receipts + mirrored
+    /// DHT records). On Fly, point this at a mounted volume.
+    #[arg(long, env = "RELAY_DATA_DIR", default_value = "./relay-data")]
+    data_dir: std::path::PathBuf,
 }
 
 // ── Network Behaviour ────────────────────────────────────────────────
@@ -188,6 +197,9 @@ struct RelayBehaviour {
     relay: relay::Behaviour,
     kademlia: kad::Behaviour<MemoryStore>,
     identify: identify::Behaviour,
+    /// Username-claim receipts — `/alexandria/username-reg/1.0`.
+    /// Inbound only: clients request, the relay countersigns.
+    username_reg: request_response::cbor::Behaviour<ReceiptRequest, ReceiptResponse>,
 }
 
 // ── Metrics ──────────────────────────────────────────────────────────
@@ -335,6 +347,25 @@ async fn async_main(args: Args, seed: Option<String>) {
     let local_peer_id = keypair.public().to_peer_id();
     log::info!("Relay PeerId: {local_peer_id}");
 
+    // ── Persistent registry store ────────────────────────────────────
+    // Username receipts + mirrored DHT records. Countersigning needs
+    // the keypair after the swarm takes ownership, so keep a clone.
+    let signing_keypair = keypair.clone();
+    let mut registry_store = match RegistryStore::open(&args.data_dir) {
+        Ok(s) => {
+            log::info!(
+                "Registry store at {:?} ({} receipts)",
+                args.data_dir,
+                s.receipt_count()
+            );
+            Some(s)
+        }
+        Err(e) => {
+            log::error!("Registry store unavailable ({e}) — receipts disabled this run");
+            None
+        }
+    };
+
     // ── Shared Metrics ───────────────────────────────────────────────
     let metrics = Arc::new(RwLock::new(RelayMetrics {
         peer_id: local_peer_id.to_string(),
@@ -380,6 +411,25 @@ async fn async_main(args: Args, seed: Option<String>) {
                 .with_max_negotiating_inbound_streams(128)
         })
         .build();
+
+    // Warm-load mirrored DHT records so the registry survives restarts.
+    if let Some(ref store) = registry_store {
+        let records = store.load_kad_records();
+        let n = records.len();
+        for (key, value) in records {
+            let record = kad::Record {
+                key: kad::RecordKey::new(&key),
+                value,
+                publisher: None,
+                expires: None,
+            };
+            use libp2p::kad::store::RecordStore;
+            let _ = swarm.behaviour_mut().kademlia.store_mut().put(record);
+        }
+        if n > 0 {
+            log::info!("Warm-loaded {n} DHT records from disk");
+        }
+    }
 
     // ── Listen Addresses ─────────────────────────────────────────────
 
@@ -716,6 +766,27 @@ async fn async_main(args: Args, seed: Option<String>) {
                                 let mut m = metrics.write().await;
                                 m.kad_routing_updated += 1;
                             }
+                            kad::Event::InboundRequest {
+                                request:
+                                    kad::InboundRequest::PutRecord {
+                                        record: Some(record),
+                                        ..
+                                    },
+                            } => {
+                                // FilterBoth mode: store explicitly + mirror to
+                                // disk so records survive relay restarts.
+                                if record.value.len() <= KAD_MAX_RECORD_SIZE {
+                                    if let Some(ref store) = registry_store {
+                                        store.save_kad_record(record.key.as_ref(), &record.value);
+                                    }
+                                    use libp2p::kad::store::RecordStore;
+                                    let _ = swarm
+                                        .behaviour_mut()
+                                        .kademlia
+                                        .store_mut()
+                                        .put(record.clone());
+                                }
+                            }
                             kad::Event::InboundRequest { request } => {
                                 log::debug!("KAD inbound request: {request:?}");
                             }
@@ -723,6 +794,42 @@ async fn async_main(args: Args, seed: Option<String>) {
                                 log::trace!("KAD event: {event:?}");
                             }
                         }
+                    }
+
+                    // ── Username receipt requests ────────────────────
+                    SwarmEvent::Behaviour(RelayBehaviourEvent::UsernameReg(
+                        request_response::Event::Message {
+                            peer,
+                            message:
+                                request_response::Message::Request {
+                                    request, channel, ..
+                                },
+                            ..
+                        },
+                    )) => {
+                        log::info!(
+                            "username-reg: receipt request from {peer} for @{}",
+                            request.claim.username
+                        );
+                        let response = match registry_store.as_mut() {
+                            Some(store) => store.handle_receipt(
+                                &signing_keypair,
+                                &local_peer_id.to_string(),
+                                &request.claim,
+                            ),
+                            None => ReceiptResponse::Refused {
+                                reason: "registry store unavailable".to_string(),
+                                existing_did: None,
+                                existing_received_at: None,
+                            },
+                        };
+                        let _ = swarm
+                            .behaviour_mut()
+                            .username_reg
+                            .send_response(channel, response);
+                    }
+                    SwarmEvent::Behaviour(RelayBehaviourEvent::UsernameReg(event)) => {
+                        log::debug!("username-reg event: {event:?}");
                     }
 
                     // ── Other Events ─────────────────────────────────
@@ -993,6 +1100,10 @@ fn build_behaviour(
     kademlia_config.set_replication_factor(NonZeroUsize::new(KAD_REPLICATION_FACTOR).unwrap());
     // Cap the in-memory store to prevent unbounded growth
     kademlia_config.set_max_packet_size(KAD_MAX_RECORD_SIZE);
+    // Surface inbound PutRecord requests so the event loop can store
+    // them explicitly and mirror them to disk (MemoryStore alone loses
+    // everything on restart).
+    kademlia_config.set_record_filtering(kad::StoreInserts::FilterBoth);
 
     let store_config = kad::store::MemoryStoreConfig {
         max_records: KAD_MAX_RECORDS,
@@ -1003,6 +1114,15 @@ fn build_behaviour(
     let store = MemoryStore::with_config(local_peer_id, store_config);
     let mut kademlia = kad::Behaviour::with_config(local_peer_id, store, kademlia_config);
     kademlia.set_mode(Some(kad::Mode::Server));
+
+    // ── Username receipt protocol ────────────────────────────────────
+    let username_reg = request_response::cbor::Behaviour::<ReceiptRequest, ReceiptResponse>::new(
+        [(
+            StreamProtocol::new(username_reg::PROTOCOL),
+            ProtocolSupport::Inbound,
+        )],
+        request_response::Config::default(),
+    );
 
     // ── Identify ─────────────────────────────────────────────────────
     let identify = identify::Behaviour::new(
@@ -1016,5 +1136,6 @@ fn build_behaviour(
         relay,
         kademlia,
         identify,
+        username_reg,
     })
 }

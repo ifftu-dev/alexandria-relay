@@ -8,6 +8,11 @@ primary_region = "bom"  # Mumbai — closest to India
 
 [env]
   RUST_LOG = "info"
+  RELAY_DATA_DIR = "/data"
+
+[mounts]
+  source = "relay_data"
+  destination = "/data"
 
 # TCP port for libp2p
 [[services]]
