@@ -10,10 +10,11 @@ primary_region = "bom"  # Mumbai — closest to India
   RUST_LOG = "info"
   RELAY_DATA_DIR = "/data"
 
-[mounts]
-  source = "relay_data"
-  destination = "/data"
-
+# NOTE: no [mounts] — bom currently refuses volume creation ("all
+# available zones in use"). Mumbai runs with an ephemeral store until
+# capacity frees; Frankfurt (fly-eu.toml) is the persistent region.
+# Issued receipts stay valid regardless (signature-based) — only the
+# local refusal history resets on restart.
 # TCP port for libp2p
 [[services]]
   internal_port = 4001
