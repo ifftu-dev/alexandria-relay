@@ -351,14 +351,17 @@ async fn async_main(args: Args, seed: Option<String>) {
     // Username receipts + mirrored DHT records. Countersigning needs
     // the keypair after the swarm takes ownership, so keep a clone.
     let signing_keypair = keypair.clone();
-    let mut registry_store = match RegistryStore::open(&args.data_dir) {
+    let registry_store = match RegistryStore::open(&args.data_dir) {
         Ok(s) => {
             log::info!(
                 "Registry store at {:?} ({} receipts)",
                 args.data_dir,
                 s.receipt_count()
             );
-            Some(s)
+            // Shared with the HTTP server: /username/:name lets clients
+            // check availability over plain HTTPS before they have a
+            // P2P identity (signup-time check).
+            Some(std::sync::Arc::new(std::sync::Mutex::new(s)))
         }
         Err(e) => {
             log::error!("Registry store unavailable ({e}) — receipts disabled this run");
@@ -392,7 +395,11 @@ async fn async_main(args: Args, seed: Option<String>) {
     }));
 
     // ── Start Metrics HTTP Server ────────────────────────────────────
-    tokio::spawn(run_metrics_server(metrics.clone(), args.metrics_port));
+    tokio::spawn(run_metrics_server(
+        metrics.clone(),
+        registry_store.clone(),
+        args.metrics_port,
+    ));
 
     // ── Build Swarm ──────────────────────────────────────────────────
     let mut swarm = SwarmBuilder::with_existing_identity(keypair)
@@ -413,7 +420,7 @@ async fn async_main(args: Args, seed: Option<String>) {
         .build();
 
     // Warm-load mirrored DHT records so the registry survives restarts.
-    if let Some(ref store) = registry_store {
+    if let Some(store) = registry_store.as_ref().and_then(|s| s.lock().ok()) {
         let records = store.load_kad_records();
         let n = records.len();
         for (key, value) in records {
@@ -776,7 +783,9 @@ async fn async_main(args: Args, seed: Option<String>) {
                                 // FilterBoth mode: store explicitly + mirror to
                                 // disk so records survive relay restarts.
                                 if record.value.len() <= KAD_MAX_RECORD_SIZE {
-                                    if let Some(ref store) = registry_store {
+                                    if let Some(store) =
+                                        registry_store.as_ref().and_then(|s| s.lock().ok())
+                                    {
                                         store.save_kad_record(record.key.as_ref(), &record.value);
                                     }
                                     use libp2p::kad::store::RecordStore;
@@ -811,8 +820,8 @@ async fn async_main(args: Args, seed: Option<String>) {
                             "username-reg: receipt request from {peer} for @{}",
                             request.claim.username
                         );
-                        let response = match registry_store.as_mut() {
-                            Some(store) => store.handle_receipt(
+                        let response = match registry_store.as_ref().and_then(|s| s.lock().ok()) {
+                            Some(mut store) => store.handle_receipt(
                                 &signing_keypair,
                                 &local_peer_id.to_string(),
                                 &request.claim,
@@ -860,7 +869,11 @@ async fn async_main(args: Args, seed: Option<String>) {
 
 // ── Metrics HTTP Server ─────────────────────────────────────────────
 
-async fn run_metrics_server(metrics: Arc<RwLock<RelayMetrics>>, port: u16) {
+async fn run_metrics_server(
+    metrics: Arc<RwLock<RelayMetrics>>,
+    registry: Option<std::sync::Arc<std::sync::Mutex<RegistryStore>>>,
+    port: u16,
+) {
     // Sample rolling-minute deltas in the background. Lets /health/alerts
     // serve a denial-rate without external alerters doing delta math.
     {
@@ -893,6 +906,32 @@ async fn run_metrics_server(metrics: Arc<RwLock<RelayMetrics>>, port: u16) {
     let full_metrics = metrics;
 
     let app = Router::new()
+        .route(
+            "/username/{name}",
+            get(
+                move |axum::extract::Path(name): axum::extract::Path<String>| {
+                    let registry = registry.clone();
+                    async move {
+                        let name = name.trim().trim_start_matches('@').to_lowercase();
+                        let holder = registry.as_ref().and_then(|r| {
+                            r.lock().ok().and_then(|store| store.lookup_username(&name))
+                        });
+                        match holder {
+                            Some((did, received_at)) => Json(serde_json::json!({
+                                "username": name,
+                                "available": false,
+                                "did": did,
+                                "received_at": received_at,
+                            })),
+                            None => Json(serde_json::json!({
+                                "username": name,
+                                "available": true,
+                            })),
+                        }
+                    }
+                },
+            ),
+        )
         .route(
             "/health",
             get(move || {

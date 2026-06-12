@@ -369,3 +369,17 @@ mod tests {
         );
     }
 }
+
+impl RegistryStore {
+    /// Current holder of a username (receipted claims only), for the
+    /// HTTP availability endpoint.
+    pub fn lookup_username(&self, username: &str) -> Option<(String, i64)> {
+        self.conn
+            .query_row(
+                "SELECT did, received_at FROM receipts WHERE username = ?1",
+                [username],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok()
+    }
+}
