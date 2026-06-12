@@ -25,12 +25,22 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL: &str = "/alexandria/username-reg/1.0";
 
+/// Grace window before a released username frees up (mirrors the main
+/// app's `RELEASE_GRACE_SECS`).
+pub const RELEASE_GRACE_SECS: i64 = 30 * 24 * 3600;
+
 // ── Wire types (mirror the main app's domain::username_claim) ──────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RelayReceipt {
     pub relay_peer_id: String,
     pub received_at: i64,
+    pub sig: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Release {
+    pub released_at: i64,
     pub sig: String,
 }
 
@@ -51,6 +61,9 @@ pub struct UsernameClaim {
     pub receipt: Option<RelayReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<CardanoAnchor>,
+    /// Owner-signed tombstone — frees the name after the grace window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<Release>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +97,32 @@ fn did_key_to_verifying_key(did: &str) -> Result<ed25519_dalek::VerifyingKey, St
     }
     let key: [u8; 32] = bytes[2..].try_into().map_err(|_| "bad key length")?;
     ed25519_dalek::VerifyingKey::from_bytes(&key).map_err(|e| format!("bad key: {e}"))
+}
+
+fn canonical_release_bytes(username: &str, did: &str, released_at: i64) -> Vec<u8> {
+    format!("alexandria-username-release-v1|{username}|{did}|{released_at}").into_bytes()
+}
+
+/// Verify a claim's release tombstone against the claim's own DID key.
+pub fn release_valid(claim: &UsernameClaim) -> bool {
+    let Some(ref rel) = claim.release else {
+        return false;
+    };
+    let Ok(vk) = did_key_to_verifying_key(&claim.did) else {
+        return false;
+    };
+    let Ok(bytes) = hex::decode(&rel.sig) else {
+        return false;
+    };
+    let Ok(sig_bytes) = <[u8; 64]>::try_from(bytes) else {
+        return false;
+    };
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    vk.verify_strict(
+        &canonical_release_bytes(&claim.username, &claim.did, rel.released_at),
+        &sig,
+    )
+    .is_ok()
 }
 
 fn canonical_claim_bytes(username: &str, did: &str, claimed_at: i64) -> Vec<u8> {
@@ -149,6 +188,8 @@ impl RegistryStore {
              );",
         )
         .map_err(|e| format!("init registry schema: {e}"))?;
+        // Older stores predate releases — guarded ALTER.
+        let _ = conn.execute("ALTER TABLE receipts ADD COLUMN released_at INTEGER", []);
         Ok(RegistryStore { conn })
     }
 
@@ -168,18 +209,47 @@ impl RegistryStore {
             };
         }
 
-        let existing: Option<(String, String, i64, String)> = self
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let existing: Option<(String, String, i64, String, Option<i64>)> = self
             .conn
             .query_row(
-                "SELECT did, claim_sig, received_at, receipt_sig
+                "SELECT did, claim_sig, received_at, receipt_sig, released_at
                  FROM receipts WHERE username = ?1",
                 [&claim.username],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .ok();
 
-        if let Some((did, claim_sig, received_at, receipt_sig)) = existing {
+        if let Some((did, claim_sig, received_at, receipt_sig, released_at)) = existing {
+            // A grace-elapsed release frees the row for new claimants.
+            if let Some(rel) = released_at {
+                if did != claim.did && now >= rel + RELEASE_GRACE_SECS {
+                    let _ = self.conn.execute(
+                        "DELETE FROM receipts WHERE username = ?1",
+                        [&claim.username],
+                    );
+                    return self.handle_receipt(keypair, relay_peer_id, claim);
+                }
+            }
             if did == claim.did {
+                // Owner submitting a tombstone: record the release.
+                if claim.release.is_some() && release_valid(claim) {
+                    let rel_at = claim.release.as_ref().map(|r| r.released_at).unwrap_or(now);
+                    let _ = self.conn.execute(
+                        "UPDATE receipts SET released_at = ?2 WHERE username = ?1",
+                        rusqlite::params![claim.username, rel_at],
+                    );
+                } else if released_at.is_some() && claim.release.is_none() {
+                    // Owner re-claiming within grace — undo the release.
+                    let _ = self.conn.execute(
+                        "UPDATE receipts SET released_at = NULL WHERE username = ?1",
+                        [&claim.username],
+                    );
+                }
                 // Same owner refreshing — re-issue the original receipt
                 // if the claim is byte-identical; otherwise countersign
                 // the new claim sig at the ORIGINAL first-seen time so
@@ -282,6 +352,7 @@ mod tests {
             sig: hex::encode(sig.to_bytes()),
             receipt: None,
             anchor: None,
+            release: None,
         }
     }
 
@@ -353,6 +424,87 @@ mod tests {
     }
 
     #[test]
+    fn release_frees_name_after_grace() {
+        let (mut s, kp, pid) = store();
+        let key1 = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+        let mut released = make_claim(1, "ada_99", 1000);
+        assert!(matches!(
+            s.handle_receipt(&kp, &pid, &released),
+            ReceiptResponse::Granted(_)
+        ));
+        // Owner tombstones the name (released_at far in the past so
+        // the grace window is already elapsed for the test).
+        let rel_at = 0i64;
+        let sig = key1.sign(&canonical_release_bytes(
+            &released.username,
+            &released.did,
+            rel_at,
+        ));
+        released.release = Some(Release {
+            released_at: rel_at,
+            sig: hex::encode(sig.to_bytes()),
+        });
+        assert!(release_valid(&released));
+        assert!(matches!(
+            s.handle_receipt(&kp, &pid, &released),
+            ReceiptResponse::Granted(_)
+        ));
+        // Grace elapsed (released_at=0) → lookup hides it, and a new
+        // DID can claim the name.
+        assert!(s.lookup_username("ada_99").is_none());
+        let newcomer = make_claim(2, "ada_99", 2000);
+        match s.handle_receipt(&kp, &pid, &newcomer) {
+            ReceiptResponse::Granted(_) => {}
+            other => panic!("expected Granted for newcomer, got {other:?}"),
+        }
+        assert_eq!(
+            s.lookup_username("ada_99").map(|(did, _)| did),
+            Some(newcomer.did)
+        );
+    }
+
+    #[test]
+    fn reclaim_within_grace_undoes_release() {
+        let (mut s, kp, pid) = store();
+        let key1 = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+        let mut claim = make_claim(1, "ada_99", 1000);
+        assert!(matches!(
+            s.handle_receipt(&kp, &pid, &claim),
+            ReceiptResponse::Granted(_)
+        ));
+        // Release now (within grace), then re-claim without release.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let sig = key1.sign(&canonical_release_bytes(&claim.username, &claim.did, now));
+        claim.release = Some(Release {
+            released_at: now,
+            sig: hex::encode(sig.to_bytes()),
+        });
+        let _ = s.handle_receipt(&kp, &pid, &claim);
+        // Still within grace: visible, and another DID is refused.
+        assert!(s.lookup_username("ada_99").is_some());
+        let other = make_claim(2, "ada_99", 2000);
+        assert!(matches!(
+            s.handle_receipt(&kp, &pid, &other),
+            ReceiptResponse::Refused { .. }
+        ));
+        // Owner re-claims (no release) → release cleared.
+        claim.release = None;
+        let _ = s.handle_receipt(&kp, &pid, &claim);
+        let rel: Option<i64> = s
+            .conn
+            .query_row(
+                "SELECT released_at FROM receipts WHERE username = 'ada_99'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(rel.is_none());
+    }
+
+    #[test]
     fn kad_record_mirror_round_trips() {
         let (s, _, _) = store();
         s.save_kad_record(b"k1", b"v1");
@@ -374,12 +526,27 @@ impl RegistryStore {
     /// Current holder of a username (receipted claims only), for the
     /// HTTP availability endpoint.
     pub fn lookup_username(&self, username: &str) -> Option<(String, i64)> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
         self.conn
             .query_row(
-                "SELECT did, received_at FROM receipts WHERE username = ?1",
+                "SELECT did, received_at, released_at FROM receipts WHERE username = ?1",
                 [username],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                    ))
+                },
             )
             .ok()
+            .filter(|(_, _, rel)| match rel {
+                Some(rel_at) => now < rel_at + RELEASE_GRACE_SECS,
+                None => true,
+            })
+            .map(|(did, received_at, _)| (did, received_at))
     }
 }
