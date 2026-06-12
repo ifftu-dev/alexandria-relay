@@ -94,6 +94,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
+      # The receipt store is a single-writer sqlite DB — exactly one
+      # machine per region (regions provide the redundancy). Fly's
+      # default of 2 machines also makes the volume mount unsatisfiable
+      # (mounts need one volume per machine).
+      - run: flyctl scale count 1 --yes --config ${{ matrix.config }} || true
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
       # The registry store mounts a volume; ensure one exists per region.
       # Best-effort: volume creation races registration and bom has had
       # zone-saturation quirks — log state, attempt create, and let the
