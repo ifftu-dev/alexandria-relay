@@ -82,8 +82,10 @@ jobs:
         include:
           - region: mumbai
             config: fly.toml
+            fly_region: bom
           - region: frankfurt
             config: fly-eu.toml
+            fly_region: fra
     concurrency:
       # Per-region lock so the two regions deploy in parallel but
       # never overlap with themselves.
@@ -92,6 +94,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
+      # The registry store mounts a volume; create it once per region.
+      # `volumes list` is the idempotency guard — volume names are not
+      # unique on Fly, so blind create would stack duplicates.
+      - run: |
+          if ! flyctl volumes list --config ${{ matrix.config }} --json | grep -q '"name": *"relay_data"'; then
+            flyctl volumes create relay_data --region ${{ matrix.fly_region }} --size 1 --yes --config ${{ matrix.config }}
+          fi
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
       - run: flyctl deploy --remote-only --config ${{ matrix.config }}
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

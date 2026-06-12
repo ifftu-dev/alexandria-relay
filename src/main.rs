@@ -907,7 +907,7 @@ async fn run_metrics_server(
 
     let app = Router::new()
         .route(
-            "/username/{name}",
+            "/username/:name",
             get(
                 move |axum::extract::Path(name): axum::extract::Path<String>| {
                     let registry = registry.clone();
