@@ -8,7 +8,7 @@
 
 ## Overview
 
-Standalone P2P relay + DHT bootstrap server. Single binary, Fly.io deployment.
+Standalone P2P relay + DHT bootstrap server + username-receipt registry (src/username_reg.rs: countersigned first-seen claims + DHT record mirror, persisted under RELAY_DATA_DIR). Single binary, Fly.io deployment.
 
 ## BUILD & RUN
 
@@ -22,7 +22,7 @@ docker build -t alexandria-relay .  # Docker
 
 **Fly.io** (see `fly.toml`):
 - Region: Mumbai (bom)
-- Resources: 256MB RAM, 1 CPU
+- Resources: 1GB RAM, `relay_data` volume (Frankfurt; Mumbai ephemeral), 1 CPU
 - Ports: TCP + UDP/QUIC on 4001
 - Deterministic PeerId via `RELAY_SEED` env var
 

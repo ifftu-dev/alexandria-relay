@@ -186,7 +186,7 @@ struct Args {
 
 // ── Network Behaviour ────────────────────────────────────────────────
 
-/// Composed behaviour: relay server + Kademlia + identify.
+/// Composed behaviour: relay server + Kademlia + identify + username-reg receipts.
 ///
 /// Intentionally minimal — the relay does NOT run GossipSub, AutoNAT,
 /// or DCUtR. It only needs enough to bootstrap peers into the DHT

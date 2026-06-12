@@ -8,11 +8,14 @@
 
 ## Security Model
 
-The relay has no special authority. It cannot read, modify, or censor content flowing through the network. It provides three functions:
+The relay cannot read, modify, or censor content flowing through the network (traffic is end-to-end encrypted). It provides four functions:
 
 1. **NAT traversal** — Circuit Relay v2 allows mobile and firewalled nodes to receive inbound connections through the relay.
-2. **Peer discovery** — A private Kademlia DHT (`/alexandria/kad/1.0`) lets nodes find each other by querying providers on a shared namespace key.
+2. **Peer discovery** — A private Kademlia DHT (`/alexandria/kad/1.0`) lets nodes find each other by querying providers on a shared namespace key. Inbound DHT records are mirrored to disk so the registry survives restarts.
 3. **Protocol handshake** — Identify announces the relay's supported protocols and agent version to connecting peers.
+4. **Username receipts** — countersigns first-seen username claims over `/alexandria/username-reg/1.0` (persisted in sqlite under `RELAY_DATA_DIR`) and serves `GET /username/:name` for signup-time availability checks.
+
+One honest caveat to "no special authority": for username receipts the relay *is* a trusted first-seen timestamp oracle (tier 1). That trust is bounded — claims gather receipts from every relay and order by the median time, and Cardano-anchored claims (tier 2) beat any receipt. See the main repo's `docs/username-registry.md`.
 
 Any node can run a relay. The network does not depend on a single instance.
 
@@ -105,6 +108,7 @@ The relay is deployed on [Fly.io](https://fly.io) using the included `Dockerfile
 # First-time launch
 fly launch --no-deploy
 fly secrets set RELAY_SEED="<64-char-hex-seed>"
+fly volumes create relay_data --region <region> --size 1  # once per persistent region
 fly deploy
 
 # Subsequent deploys
@@ -166,7 +170,7 @@ Both machines share the same `RELAY_SEED` (so PeerId is stable) and Fly load-bal
 
 ## Architecture
 
-A single Rust binary (`src/main.rs`, ~770 lines) built on libp2p 0.56:
+A single Rust binary (`src/main.rs`, ~1,150 lines) built on libp2p 0.56:
 
 ```
 ┌──────────────────────────────────────────────────┐
