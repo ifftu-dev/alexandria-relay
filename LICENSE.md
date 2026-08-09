@@ -1,8 +1,10 @@
+Alexandria by [IFFTU](https://www.ifftu.dev)
+
 Copyright (c) 2025-2026 IFFTU Pvt. Ltd.
 
 Portions of this software are licensed as follows:
 
-All content that resides under the "ee/" directory of this repository, if that directory exists, is licensed under the license defined in "ee/LICENSE".
+All content that resides under the "ee/" directory of this repository, if that directory exists, is licensed under the license defined in "ee/LICENSE.md".
 All third party components incorporated into the IFFTU Software are licensed under the original license provided by the owner of the applicable component.
 Content outside of the above mentioned directories or restrictions above is available under the "MIT Expat" license as defined below.
 
