@@ -1,11 +1,11 @@
 Alexandria by [IFFTU](https://www.ifftu.dev)
 
-Copyright (c) 2025-2026 IFFTU Pvt. Ltd.
+Copyright (c) 2025-2026 Alexandria Pvt. Ltd.
 
 Portions of this software are licensed as follows:
 
 All content that resides under the "ee/" directory of this repository, if that directory exists, is licensed under the license defined in "ee/LICENSE.md".
-All third party components incorporated into the IFFTU Software are licensed under the original license provided by the owner of the applicable component.
+All third party components incorporated into the Alexandria Software are licensed under the original license provided by the owner of the applicable component.
 Content outside of the above mentioned directories or restrictions above is available under the "MIT Expat" license as defined below.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
