@@ -37,12 +37,24 @@ primary_region = "bom"  # Mumbai — closest to India
     port = 4001
     handlers = []
 
-# HTTP port for health checks and metrics
+# HTTP port for health checks and metrics.
+#
+# `/health` is public so Fly's healthcheck (and any external uptime monitor)
+# keeps working. `/peers`, `/metrics` and `/health/alerts` require the
+# RELAY_ADMIN_TOKEN bearer token and answer 404 without it — this listener is
+# on the public internet, so operational data has to be asked for explicitly.
+#
+# Port 443 with the `tls` handler so nothing on this listener is plaintext.
+# Port 9090 is kept for the platform healthcheck only.
 [[services]]
   internal_port = 9090
   protocol = "tcp"
   auto_stop_machines = false
   auto_start_machines = true
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
 
   [[services.ports]]
     port = 9090

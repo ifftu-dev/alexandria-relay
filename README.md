@@ -71,23 +71,38 @@ The relay listens on both TCP and QUIC (UDP) on the same port, plus an HTTP metr
 | `--generate-key` | CLI | — | Generate a keypair seed and exit |
 | `RELAY_DATA_DIR` | env | Persistent state dir (receipts + DHT record mirror); `/data` on the Fly volume | `./relay-data` |
 | `RELAY_SEED` | Env | — | 32-byte hex seed for deterministic PeerId. If unset, generates a random keypair on each start. |
+| `RELAY_ADMIN_TOKEN` | Env | — | Bearer token for the operational endpoints (`/peers`, `/metrics`, `/health/alerts`). Minimum 16 characters; a shorter value is refused and the endpoints stay off. Unset means those endpoints answer `404`. |
 | `RUST_LOG` | Env | `info` | Log level (`debug`, `info`, `warn`, `error`) |
 
 Always set `RELAY_SEED` in production so the PeerId is stable across restarts and redeployments.
 
+Generate an admin token with `openssl rand -base64 32` and set it with
+`fly secrets set RELAY_ADMIN_TOKEN="..."`. The same value goes on the observer
+so it can keep scraping.
+
 ## Monitoring
 
-The relay exposes an HTTP server on the metrics port (default `9090`):
+The relay exposes an HTTP server on the metrics port (default `9090`, also
+served over TLS on `443`).
 
-| Endpoint | Description |
-|----------|-------------|
-| `GET /health` | Lightweight health check — returns `{"status":"ok","peer_id":"...","uptime_seconds":N,"connections":N}` |
-| `GET /health/alerts` | Alert-friendly health check — `200` when healthy, `503` when any threshold trips. JSON body lists which alerts are firing (e.g., `circuit_denial_majority`, `connections_near_cap`) and the rolling 60s denial rates. Suitable for UptimeRobot / healthchecks.io / Fly's own checks without external delta math. |
-| `GET /metrics` | Full relay metrics JSON — connections, circuits, reservations, DHT updates, identify events, listener errors, IP rate limits, plus rolling-minute denial counters |
+`/health` is public so Fly's healthcheck and external uptime monitors keep
+working with no configuration. Everything else requires
+`Authorization: Bearer $RELAY_ADMIN_TOKEN` and answers `404` — not `401` —
+when the token is absent, wrong, or unconfigured. A `401` confirms the endpoint
+exists; there is nothing to gain by telling a scanner that this relay has
+operational data worth asking for.
+
+| Endpoint | Auth | Description |
+|----------|------|-------------|
+| `GET /health` | public | Lightweight health check — returns `{"status":"ok","peer_id":"...","uptime_seconds":N,"connections":N}` |
+| `GET /username/:name` | public | Username availability lookup against the receipt registry. Public by design: this is the naming registry clients resolve against. |
+| `GET /health/alerts` | bearer | Alert-friendly health check — `200` when healthy, `503` when any threshold trips. JSON body lists which alerts are firing (e.g., `circuit_denial_majority`, `connections_near_cap`) and the rolling 60s denial rates. |
+| `GET /metrics` | bearer | Full relay metrics JSON — connections, circuits, reservations, DHT updates, identify events, listener errors, IP rate limits, plus rolling-minute denial counters |
+| `GET /peers` | bearer | Connected peers as `{peer_id, source_prefix, has_reservation}`. **`source_prefix` is a truncated network — `/24` for IPv4, `/48` for IPv6 — never a peer's full address.** The consumer is the observer's geo attribution for NATted peers, which a network prefix answers; a full address would be a PeerId → IP map for every connected user. |
 
 The `alexandria-monitoring` observer scrapes `/metrics` every 30 seconds and persists the data to SQLite. The dashboard displays a "Relay Node Health" panel with real-time metrics.
 
-Set `RELAY_METRICS_URL` on the observer to point to your relay's metrics endpoint (comma-separated for multiple relays).
+Set `RELAY_METRICS_URL` on the observer to point to your relay's metrics endpoint (comma-separated for multiple relays), and `RELAY_ADMIN_TOKEN` to the same value the relay holds.
 
 ### External alerting
 

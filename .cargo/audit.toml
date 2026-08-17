@@ -1,0 +1,25 @@
+# cargo-audit configuration.
+#
+# Every ignore below must name the advisory, why it is not reachable here, and
+# what would make it reachable again. An ignore without that is how a real
+# advisory gets buried in a list nobody reads.
+
+[advisories]
+ignore = [
+    # hickory-proto 0.25.2 — CPU exhaustion in message encoding (O(n²) name
+    # compression) and an unbounded NSEC3 validation loop.
+    #
+    # Not reachable: hickory arrives through libp2p's *optional* `dns` and
+    # `mdns` features, which this crate does not enable (see the feature list
+    # in Cargo.toml — kad, tcp, quic, noise, yamux, identify, relay, tokio,
+    # ed25519, macros, request-response, cbor). It is present in Cargo.lock,
+    # which is what cargo-audit reads, but never compiled into the binary:
+    #
+    #     cargo tree -e normal | grep -c hickory   # => 0
+    #
+    # Re-evaluate if `dns` or `mdns` is ever added to the libp2p features, or
+    # if a libp2p release moves to hickory >= 0.26.1 (which fixes -0119; -0118
+    # has no fixed version at all).
+    "RUSTSEC-2026-0119",
+    "RUSTSEC-2026-0118",
+]

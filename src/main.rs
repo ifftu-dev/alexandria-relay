@@ -90,6 +90,19 @@ const MAX_NEW_CONNS_PER_IP_PER_WINDOW: usize = 32;
 /// Rate window duration for IP-level connection rate limiting.
 const IP_RATE_WINDOW: Duration = Duration::from_secs(60);
 
+/// Maximum username-receipt requests one peer may make per
+/// [`USERNAME_RATE_WINDOW`].
+///
+/// Generating a fresh `did:key` and a valid claim signature is free and
+/// offline, so without this a single connection can receipt the entire viable
+/// `[a-z0-9_]{3,32}` namespace — and because only the owner can release a
+/// name, squatted names never free up. A real client claims a username once
+/// and refreshes it rarely, so this is far above legitimate use.
+const USERNAME_RATE_LIMIT: usize = 5;
+
+/// Rate window for username-receipt requests.
+const USERNAME_RATE_WINDOW: Duration = Duration::from_secs(60);
+
 /// How long an idle connection stays open before being reaped.
 const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(600); // 10 min
 
@@ -255,11 +268,97 @@ struct RelayMetrics {
 /// IP we saw them dial in from. `has_reservation` distinguishes peers
 /// using us as a relay rendezvous from peers that just opened a one-off
 /// connection (e.g. observer crawlers).
+///
+/// `source_prefix` is a **truncated** address, never the peer's full IP.
+/// The consumer of this endpoint is the monitoring observer, and its stated
+/// need is geo attribution for NATted peers — a /24 (v4) or /48 (v6) is
+/// city-accurate for that and is not an identifier for the person behind it.
+/// Serving the full address here would hand any caller a PeerId → IP map for
+/// every connected user, which is the one thing a relay in this architecture
+/// must never publish.
 #[derive(Debug, Clone, Serialize)]
 struct PeerSourceEntry {
     peer_id: String,
-    source_ip: String,
+    source_prefix: String,
     has_reservation: bool,
+}
+
+/// Drop the host bits of an address so it locates a network, not a person.
+///
+/// IPv4 keeps the /24; IPv6 keeps the /48 (the routing prefix — the low 80
+/// bits carry the subnet and interface identifier, and on SLAAC the interface
+/// identifier is stable per device).
+fn truncate_ip(ip: &IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            format!("{a}.{b}.{c}.0/24")
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            format!("{:x}:{:x}:{:x}::/48", s[0], s[1], s[2])
+        }
+    }
+}
+
+/// Constant-time comparison for the admin bearer token.
+///
+/// Length is not secret — the token is a fixed size — so returning early on a
+/// length mismatch leaks nothing. What must not leak is *where* two
+/// same-length values first differ.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Whether the request carries the configured admin bearer token.
+///
+/// `None` (no `RELAY_ADMIN_TOKEN` configured) means the operational routes are
+/// off entirely. Callers answer 404 rather than 401 in both the unconfigured
+/// and the wrong-token case: an endpoint that says "unauthorised" has
+/// confirmed it exists, and there is nothing to gain by telling a scanner that
+/// this relay has operational data worth asking for.
+fn admin_authorised(expected: Option<&str>, headers: &axum::http::HeaderMap) -> bool {
+    let Some(expected) = expected else {
+        return false;
+    };
+    let presented = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    constant_time_eq(presented.as_bytes(), expected.as_bytes())
+}
+
+/// The answer for an operational route that was not authorised.
+fn not_found() -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        Json(serde_json::json!({ "error": "not found" })),
+    )
+}
+
+/// Read `RELAY_ADMIN_TOKEN`, refusing one short enough to guess.
+///
+/// A token that reads as protection but is brute-forceable is worse than an
+/// endpoint that is simply switched off, so a short value is rejected at
+/// startup rather than accepted quietly.
+fn admin_token_from_env() -> Option<String> {
+    let token = std::env::var("RELAY_ADMIN_TOKEN").ok()?;
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        return None;
+    }
+    if token.len() < 16 {
+        log::error!(
+            "RELAY_ADMIN_TOKEN is shorter than 16 characters — refusing it. \
+             Operational routes stay disabled. Generate one with `openssl rand -base64 32`."
+        );
+        return None;
+    }
+    Some(token)
 }
 
 // ── Keypair Utilities ────────────────────────────────────────────────
@@ -544,6 +643,11 @@ async fn async_main(args: Args, seed: Option<String>) {
     // IP-level rate limiting state
     let mut ip_active_connections: HashMap<IpAddr, usize> = HashMap::new();
     let mut ip_rate_windows: HashMap<IpAddr, (usize, Instant)> = HashMap::new();
+    // Per-peer rate limiting for username-receipt requests. Keyed by PeerId
+    // rather than IP because the claim is bound to a DID, not to a network
+    // location, and the connection-level IP limiter already covers the
+    // network side.
+    let mut username_rate_windows: HashMap<PeerId, (usize, Instant)> = HashMap::new();
 
     // Graceful shutdown on SIGTERM/SIGINT
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -576,6 +680,8 @@ async fn async_main(args: Args, seed: Option<String>) {
                 // Prune stale IP rate window entries
                 let now = Instant::now();
                 ip_rate_windows.retain(|_, (_, started)| now.duration_since(*started) < IP_RATE_WINDOW * 2);
+                username_rate_windows
+                    .retain(|_, (_, started)| now.duration_since(*started) < USERNAME_RATE_WINDOW * 2);
             }
             // Graceful shutdown
             _ = sigterm.recv() => {
@@ -782,18 +888,32 @@ async fn async_main(args: Args, seed: Option<String>) {
                             } => {
                                 // FilterBoth mode: store explicitly + mirror to
                                 // disk so records survive relay restarts.
+                                //
+                                // Offer to the memory store FIRST and mirror only
+                                // what it accepted. The memory store enforces
+                                // KAD_MAX_RECORDS; mirroring before that check
+                                // meant records it rejected were still written to
+                                // disk, so the SQLite table had no ceiling at all
+                                // and an attacker could fill the volume with
+                                // unique keys at 64 KB apiece.
                                 if record.value.len() <= KAD_MAX_RECORD_SIZE {
-                                    if let Some(store) =
-                                        registry_store.as_ref().and_then(|s| s.lock().ok())
-                                    {
-                                        store.save_kad_record(record.key.as_ref(), &record.value);
-                                    }
                                     use libp2p::kad::store::RecordStore;
-                                    let _ = swarm
+                                    let accepted = swarm
                                         .behaviour_mut()
                                         .kademlia
                                         .store_mut()
-                                        .put(record.clone());
+                                        .put(record.clone())
+                                        .is_ok();
+                                    if accepted {
+                                        if let Some(store) =
+                                            registry_store.as_ref().and_then(|s| s.lock().ok())
+                                        {
+                                            store.save_kad_record(
+                                                record.key.as_ref(),
+                                                &record.value,
+                                            );
+                                        }
+                                    }
                                 }
                             }
                             kad::Event::InboundRequest { request } => {
@@ -820,17 +940,43 @@ async fn async_main(args: Args, seed: Option<String>) {
                             "username-reg: receipt request from {peer} for @{}",
                             request.claim.username
                         );
-                        let response = match registry_store.as_ref().and_then(|s| s.lock().ok()) {
-                            Some(mut store) => store.handle_receipt(
-                                &signing_keypair,
-                                &local_peer_id.to_string(),
-                                &request.claim,
-                            ),
-                            None => ReceiptResponse::Refused {
-                                reason: "registry store unavailable".to_string(),
+                        // Per-peer budget. Claim signatures are free to mint
+                        // offline, so without this one connection can receipt
+                        // the whole namespace.
+                        let (count, window_start) = username_rate_windows
+                            .entry(peer)
+                            .or_insert((0, Instant::now()));
+                        if window_start.elapsed() > USERNAME_RATE_WINDOW {
+                            *count = 0;
+                            *window_start = Instant::now();
+                        }
+                        *count += 1;
+                        let rate_limited = *count > USERNAME_RATE_LIMIT;
+                        if rate_limited {
+                            log::warn!(
+                                "username-reg: rate limiting {peer} ({count} requests in window)"
+                            );
+                        }
+
+                        let response = if rate_limited {
+                            ReceiptResponse::Refused {
+                                reason: "too many username claims — try again shortly".to_string(),
                                 existing_did: None,
                                 existing_received_at: None,
-                            },
+                            }
+                        } else {
+                            match registry_store.as_ref().and_then(|s| s.lock().ok()) {
+                                Some(mut store) => store.handle_receipt(
+                                    &signing_keypair,
+                                    &local_peer_id.to_string(),
+                                    &request.claim,
+                                ),
+                                None => ReceiptResponse::Refused {
+                                    reason: "registry store unavailable".to_string(),
+                                    existing_did: None,
+                                    existing_received_at: None,
+                                },
+                            }
                         };
                         let _ = swarm
                             .behaviour_mut()
@@ -905,6 +1051,21 @@ async fn run_metrics_server(
     let peers_metrics = metrics.clone();
     let full_metrics = metrics;
 
+    // Operational routes (`/peers`, `/metrics`, `/health/alerts`) require a
+    // bearer token. Unconfigured means off — this listener is published to the
+    // public internet by `fly.toml`, so anything on it that is not `/health` or
+    // the public username registry has to prove it was asked for.
+    let admin_token = admin_token_from_env();
+    if admin_token.is_none() {
+        log::warn!(
+            "RELAY_ADMIN_TOKEN is not set — /peers, /metrics and /health/alerts \
+             will answer 404. Set it to enable operational endpoints."
+        );
+    }
+    let peers_token = admin_token.clone();
+    let metrics_token = admin_token.clone();
+    let alerts_token = admin_token;
+
     let app = Router::new()
         .route(
             "/username/:name",
@@ -949,9 +1110,13 @@ async fn run_metrics_server(
         )
         .route(
             "/health/alerts",
-            get(move || {
+            get(move |headers: axum::http::HeaderMap| {
                 let m = alerts_metrics.clone();
+                let token = alerts_token.clone();
                 async move {
+                    if !admin_authorised(token.as_deref(), &headers) {
+                        return not_found();
+                    }
                     let lock = m.read().await;
                     // Thresholds chosen so a healthy relay sits at "ok"
                     // and a saturated one trips before clients notice.
@@ -1008,30 +1173,38 @@ async fn run_metrics_server(
         )
         .route(
             "/peers",
-            get(move || {
+            get(move |headers: axum::http::HeaderMap| {
                 let m = peers_metrics.clone();
+                let token = peers_token.clone();
                 async move {
+                    if !admin_authorised(token.as_deref(), &headers) {
+                        return not_found();
+                    }
                     let lock = m.read().await;
                     let entries: Vec<PeerSourceEntry> = lock
                         .peer_source_ips
                         .iter()
                         .map(|(pid, ip)| PeerSourceEntry {
                             peer_id: pid.to_string(),
-                            source_ip: ip.to_string(),
+                            source_prefix: truncate_ip(ip),
                             has_reservation: lock.peers_with_reservation.contains(pid),
                         })
                         .collect();
-                    Json(entries)
+                    (axum::http::StatusCode::OK, Json(serde_json::json!(entries)))
                 }
             }),
         )
         .route(
             "/metrics",
-            get(move || {
+            get(move |headers: axum::http::HeaderMap| {
                 let m = full_metrics.clone();
+                let token = metrics_token.clone();
                 async move {
+                    if !admin_authorised(token.as_deref(), &headers) {
+                        return not_found();
+                    }
                     let lock = m.read().await;
-                    Json(lock.clone())
+                    (axum::http::StatusCode::OK, Json(serde_json::json!(*lock)))
                 }
             }),
         );
@@ -1177,4 +1350,67 @@ fn build_behaviour(
         identify,
         username_reg,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue};
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn peer_addresses_are_truncated_to_a_network_not_a_host() {
+        // The /peers endpoint exists so the observer can attribute geography
+        // to NATted peers. A /24 answers that; a full address would hand any
+        // caller a PeerId → IP map for every connected user, which is the one
+        // thing this relay must never publish.
+        let v4 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 47));
+        assert_eq!(truncate_ip(&v4), "203.0.113.0/24");
+        assert!(!truncate_ip(&v4).contains("47"));
+
+        let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xabcd, 0x1234, 0, 0, 0, 0x1));
+        let out = truncate_ip(&v6);
+        assert_eq!(out, "2001:db8:abcd::/48");
+        // The interface identifier is stable per device under SLAAC, so it is
+        // the part that must not survive truncation.
+        assert!(!out.contains("1234"));
+    }
+
+    fn bearer(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        h
+    }
+
+    #[test]
+    fn operational_routes_are_closed_when_no_token_is_configured() {
+        // Unconfigured means off. This listener is on the public internet, so
+        // "no token set" must not read as "no protection needed".
+        assert!(!admin_authorised(None, &HeaderMap::new()));
+        assert!(!admin_authorised(None, &bearer("anything")));
+    }
+
+    #[test]
+    fn admin_authorisation_requires_the_exact_token() {
+        let token = "0123456789abcdef0123";
+        assert!(admin_authorised(Some(token), &bearer(token)));
+        assert!(!admin_authorised(Some(token), &bearer("wrong")));
+        assert!(!admin_authorised(Some(token), &HeaderMap::new()));
+        // A prefix must not pass — the comparison is over the whole value.
+        assert!(!admin_authorised(
+            Some(token),
+            &bearer("0123456789abcdef012")
+        ));
+    }
+
+    #[test]
+    fn constant_time_eq_matches_ordinary_equality() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(constant_time_eq(b"", b""));
+    }
 }

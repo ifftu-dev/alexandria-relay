@@ -29,6 +29,16 @@ pub const PROTOCOL: &str = "/alexandria/username-reg/1.0";
 /// app's `RELEASE_GRACE_SECS`).
 pub const RELEASE_GRACE_SECS: i64 = 30 * 24 * 3600;
 
+/// Ceiling on the on-disk Kademlia mirror. Matches `KAD_MAX_RECORDS` in
+/// `main.rs`; duplicated rather than shared because the store must be able to
+/// bound itself without reaching back into the swarm's configuration.
+const KAD_MIRROR_MAX_RECORDS: i64 = 16_384;
+
+/// Ceiling on a single mirrored value, matching `KAD_MAX_RECORD_SIZE`. The
+/// caller checks this too; checked again here so the storage layer cannot be
+/// made to write an unbounded blob by a future caller that forgets.
+const KAD_MIRROR_MAX_VALUE_BYTES: usize = 65_536;
+
 // ── Wire types (mirror the main app's domain::username_claim) ──────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -157,6 +167,28 @@ pub fn verify_claim(claim: &UsernameClaim) -> Result<(), String> {
     .map_err(|_| "signature verification failed".to_string())
 }
 
+/// Countersign `bytes` with the relay key, or `None` if signing failed.
+///
+/// Returning `None` rather than an empty signature is the point. The previous
+/// `keypair.sign(..).unwrap_or_default()` hex-encoded an empty `Vec` to `""`
+/// on failure and then stored and returned it inside a `Granted` response — a
+/// receipt that reads as granted and carries no signature at all. Any client
+/// that treats `Granted` as the trust signal, rather than verifying the
+/// countersignature, would have accepted it.
+fn countersign(keypair: &libp2p::identity::Keypair, bytes: &[u8]) -> Option<String> {
+    match keypair.sign(bytes) {
+        Ok(sig) if !sig.is_empty() => Some(hex::encode(sig)),
+        Ok(_) => {
+            log::error!("relay countersign produced an empty signature — refusing the receipt");
+            None
+        }
+        Err(e) => {
+            log::error!("relay countersign failed: {e}");
+            None
+        }
+    }
+}
+
 /// Bytes the relay countersigns. Covers the owner sig (binding the
 /// receipt to this exact claim), the first-seen time, and the relay id.
 pub fn canonical_receipt_bytes(claim_sig: &str, received_at: i64, relay_peer_id: &str) -> Vec<u8> {
@@ -258,7 +290,13 @@ impl RegistryStore {
                     receipt_sig
                 } else {
                     let bytes = canonical_receipt_bytes(&claim.sig, received_at, relay_peer_id);
-                    let sig = hex::encode(keypair.sign(&bytes).unwrap_or_default());
+                    let Some(sig) = countersign(keypair, &bytes) else {
+                        return ReceiptResponse::Refused {
+                            reason: "relay signing failed".to_string(),
+                            existing_did: None,
+                            existing_received_at: None,
+                        };
+                    };
                     let _ = self.conn.execute(
                         "UPDATE receipts SET claim_sig = ?2, receipt_sig = ?3 WHERE username = ?1",
                         rusqlite::params![claim.username, claim.sig, sig],
@@ -283,7 +321,13 @@ impl RegistryStore {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let bytes = canonical_receipt_bytes(&claim.sig, received_at, relay_peer_id);
-        let sig = hex::encode(keypair.sign(&bytes).unwrap_or_default());
+        let Some(sig) = countersign(keypair, &bytes) else {
+            return ReceiptResponse::Refused {
+                reason: "relay signing failed".to_string(),
+                existing_did: None,
+                existing_received_at: None,
+            };
+        };
 
         if let Err(e) = self.conn.execute(
             "INSERT INTO receipts (username, did, claim_sig, received_at, receipt_sig)
@@ -306,10 +350,39 @@ impl RegistryStore {
 
     /// Mirror a kad record for restart persistence.
     pub fn save_kad_record(&self, key: &[u8], value: &[u8]) {
+        if value.len() > KAD_MIRROR_MAX_VALUE_BYTES {
+            return;
+        }
         let _ = self.conn.execute(
             "INSERT INTO kad_records (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             rusqlite::params![key, value],
+        );
+        self.trim_kad_records();
+    }
+
+    /// Hold the mirror to `KAD_MIRROR_MAX_RECORDS`, evicting oldest-first.
+    ///
+    /// The in-memory Kademlia store has its own ceiling, but it is emptied on
+    /// every restart and refilled from here — so without a ceiling on the table
+    /// itself, records that were long ago evicted from memory stay on disk
+    /// forever and the volume grows without bound. `rowid` is insertion order
+    /// (an `ON CONFLICT` update keeps the original), so ascending rowid is
+    /// oldest-first.
+    fn trim_kad_records(&self) {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM kad_records", [], |r| r.get(0))
+            .unwrap_or(0);
+        let excess = count - KAD_MIRROR_MAX_RECORDS;
+        if excess <= 0 {
+            return;
+        }
+        let _ = self.conn.execute(
+            "DELETE FROM kad_records WHERE rowid IN (
+                 SELECT rowid FROM kad_records ORDER BY rowid ASC LIMIT ?1
+             )",
+            rusqlite::params![excess],
         );
     }
 
@@ -329,6 +402,33 @@ impl RegistryStore {
         self.conn
             .query_row("SELECT COUNT(*) FROM receipts", [], |r| r.get(0))
             .unwrap_or(0)
+    }
+
+    /// Current holder of a username (receipted claims only), for the
+    /// HTTP availability endpoint.
+    pub fn lookup_username(&self, username: &str) -> Option<(String, i64)> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.conn
+            .query_row(
+                "SELECT did, received_at, released_at FROM receipts WHERE username = ?1",
+                [username],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .ok()
+            .filter(|(_, _, rel)| match rel {
+                Some(rel_at) => now < rel_at + RELEASE_GRACE_SECS,
+                None => true,
+            })
+            .map(|(did, received_at, _)| (did, received_at))
     }
 }
 
@@ -519,34 +619,5 @@ mod tests {
                 (b"k2".to_vec(), b"v3".to_vec())
             ]
         );
-    }
-}
-
-impl RegistryStore {
-    /// Current holder of a username (receipted claims only), for the
-    /// HTTP availability endpoint.
-    pub fn lookup_username(&self, username: &str) -> Option<(String, i64)> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        self.conn
-            .query_row(
-                "SELECT did, received_at, released_at FROM receipts WHERE username = ?1",
-                [username],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, i64>(1)?,
-                        r.get::<_, Option<i64>>(2)?,
-                    ))
-                },
-            )
-            .ok()
-            .filter(|(_, _, rel)| match rel {
-                Some(rel_at) => now < rel_at + RELEASE_GRACE_SECS,
-                None => true,
-            })
-            .map(|(did, received_at, _)| (did, received_at))
     }
 }
