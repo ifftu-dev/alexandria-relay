@@ -41,5 +41,5 @@ docker build -t alexandria-relay .  # Docker
 ## KEY GOSSIPSUB TOPICS
 
 The relay is topic-agnostic — it relays whatever flows through
-gossipsub. For the canonical list of all 13 gossip topics carried
+gossipsub. For the canonical list of all 15 gossip topics carried
 by the network, see [`alexandria/docs/protocol-specification.md` §6.5](../alexandria/docs/protocol-specification.md).
