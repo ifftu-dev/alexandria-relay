@@ -103,6 +103,24 @@ const USERNAME_RATE_LIMIT: usize = 5;
 /// Rate window for username-receipt requests.
 const USERNAME_RATE_WINDOW: Duration = Duration::from_secs(60);
 
+/// Maximum `/username/:name` lookups one client IP may make per
+/// [`USERNAME_LOOKUP_WINDOW`].
+///
+/// The lookup is public by design — clients resolve names against it — but
+/// it was completely unthrottled, unlike the p2p receipt path. The namespace
+/// is `[a-z0-9_]{3,32}`, so with no limit the whole registry (username → DID →
+/// first-seen time, for every user) is enumerable for the cost of a loop, and
+/// every hit is a SQLite read on the same listener the relay's real work
+/// shares. A person checking a handful of names never comes near this.
+const USERNAME_LOOKUP_LIMIT: usize = 30;
+
+/// Rate window for `/username/:name` lookups.
+const USERNAME_LOOKUP_WINDOW: Duration = Duration::from_secs(60);
+
+/// Cap on tracked client IPs for the lookup limiter, so the map cannot
+/// itself become the memory leak.
+const USERNAME_LOOKUP_MAX_TRACKED: usize = 10_000;
+
 /// How long an idle connection stays open before being reaped.
 const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(600); // 10 min
 
@@ -330,6 +348,37 @@ fn admin_authorised(expected: Option<&str>, headers: &axum::http::HeaderMap) -> 
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or_default();
     constant_time_eq(presented.as_bytes(), expected.as_bytes())
+}
+
+/// Per-IP sliding window for the public username lookup.
+///
+/// `std::sync::Mutex` rather than tokio's: the critical section is a map
+/// lookup and an integer bump, never held across an await.
+type LookupLimiter = Arc<std::sync::Mutex<HashMap<IpAddr, (usize, Instant)>>>;
+
+/// True when `ip` is over its lookup budget. Prunes stale windows on the way
+/// through so the map stays bounded without a separate sweeper.
+fn lookup_rate_limited(limiter: &LookupLimiter, ip: IpAddr) -> bool {
+    let Ok(mut map) = limiter.lock() else {
+        // A poisoned lock means a panic mid-update. Refusing is the safe
+        // direction: a caller can retry, and allowing would silently disable
+        // the limiter for the process's life.
+        return true;
+    };
+    let now = Instant::now();
+    if map.len() >= USERNAME_LOOKUP_MAX_TRACKED {
+        map.retain(|_, (_, started)| now.duration_since(*started) < USERNAME_LOOKUP_WINDOW);
+        if map.len() >= USERNAME_LOOKUP_MAX_TRACKED {
+            map.clear();
+        }
+    }
+    let (count, started) = map.entry(ip).or_insert((0, now));
+    if now.duration_since(*started) >= USERNAME_LOOKUP_WINDOW {
+        *count = 0;
+        *started = now;
+    }
+    *count += 1;
+    *count > USERNAME_LOOKUP_LIMIT
 }
 
 /// The answer for an operational route that was not authorised.
@@ -1066,28 +1115,48 @@ async fn run_metrics_server(
     let metrics_token = admin_token.clone();
     let alerts_token = admin_token;
 
+    let lookup_limiter: LookupLimiter = Arc::new(std::sync::Mutex::new(HashMap::new()));
+
     let app = Router::new()
         .route(
             "/username/:name",
             get(
-                move |axum::extract::Path(name): axum::extract::Path<String>| {
+                move |axum::extract::Path(name): axum::extract::Path<String>,
+                      axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<
+                    std::net::SocketAddr,
+                >| {
                     let registry = registry.clone();
+                    let limiter = lookup_limiter.clone();
                     async move {
+                        if lookup_rate_limited(&limiter, addr.ip()) {
+                            return (
+                                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                                Json(serde_json::json!({
+                                    "error": "too many lookups — try again in a minute"
+                                })),
+                            );
+                        }
                         let name = name.trim().trim_start_matches('@').to_lowercase();
                         let holder = registry.as_ref().and_then(|r| {
                             r.lock().ok().and_then(|store| store.lookup_username(&name))
                         });
                         match holder {
-                            Some((did, received_at)) => Json(serde_json::json!({
-                                "username": name,
-                                "available": false,
-                                "did": did,
-                                "received_at": received_at,
-                            })),
-                            None => Json(serde_json::json!({
-                                "username": name,
-                                "available": true,
-                            })),
+                            Some((did, received_at)) => (
+                                axum::http::StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "username": name,
+                                    "available": false,
+                                    "did": did,
+                                    "received_at": received_at,
+                                })),
+                            ),
+                            None => (
+                                axum::http::StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "username": name,
+                                    "available": true,
+                                })),
+                            ),
                         }
                     }
                 },
@@ -1213,7 +1282,12 @@ async fn run_metrics_server(
         .await
         .expect("bind metrics server");
     log::info!("Metrics server listening on 0.0.0.0:{port}");
-    if let Err(e) = axum::serve(listener, app).await {
+    if let Err(e) = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    {
         log::error!("Metrics server error: {e}");
     }
 }
@@ -1412,5 +1486,58 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"abcd"));
         assert!(constant_time_eq(b"", b""));
+    }
+}
+
+#[cfg(test)]
+mod lookup_limiter_tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn fresh() -> LookupLimiter {
+        Arc::new(std::sync::Mutex::new(HashMap::new()))
+    }
+
+    /// The public username oracle used to be unthrottled: the whole registry
+    /// was enumerable for the cost of a loop. A client gets a budget per
+    /// window and is refused past it.
+    #[test]
+    fn a_client_is_refused_past_its_lookup_budget() {
+        let l = fresh();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        for _ in 0..USERNAME_LOOKUP_LIMIT {
+            assert!(
+                !lookup_rate_limited(&l, ip),
+                "within budget must be allowed"
+            );
+        }
+        assert!(
+            lookup_rate_limited(&l, ip),
+            "one past the budget must be refused"
+        );
+    }
+
+    /// One client exhausting its budget must not affect another.
+    #[test]
+    fn budgets_are_per_client() {
+        let l = fresh();
+        let a = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
+        let b = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2));
+        for _ in 0..=USERNAME_LOOKUP_LIMIT {
+            let _ = lookup_rate_limited(&l, a);
+        }
+        assert!(lookup_rate_limited(&l, a));
+        assert!(!lookup_rate_limited(&l, b));
+    }
+
+    /// The map cannot itself become the memory leak.
+    #[test]
+    fn the_tracked_set_stays_bounded() {
+        let l = fresh();
+        for i in 0..(USERNAME_LOOKUP_MAX_TRACKED + 500) {
+            let ip = IpAddr::V4(Ipv4Addr::from((i as u32).wrapping_add(0x0100_0000)));
+            let _ = lookup_rate_limited(&l, ip);
+        }
+        assert!(l.lock().unwrap().len() <= USERNAME_LOOKUP_MAX_TRACKED);
     }
 }
