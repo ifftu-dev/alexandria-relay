@@ -917,6 +917,7 @@ async fn async_main(args: Args, seed: Option<String>) {
 
                     // ── Kademlia Events ──────────────────────────────
                     SwarmEvent::Behaviour(RelayBehaviourEvent::Kademlia(event)) => {
+                        accept_provider_announcement(&mut swarm.behaviour_mut().kademlia, &event);
                         match &event {
                             kad::Event::RoutingUpdated {
                                 peer, addresses, ..
@@ -1353,6 +1354,20 @@ fn is_private_v4(ip: IpAddr) -> bool {
 
 // ── Behaviour Builder ────────────────────────────────────────────────
 
+fn accept_provider_announcement(kademlia: &mut kad::Behaviour<MemoryStore>, event: &kad::Event) {
+    if let kad::Event::InboundRequest {
+        request: kad::InboundRequest::AddProvider {
+            record: Some(record),
+        },
+    } = event
+    {
+        use libp2p::kad::store::RecordStore;
+        if let Err(error) = kademlia.store_mut().add_provider(record.clone()) {
+            log::warn!("DHT provider announcement rejected by bounded store: {error}");
+        }
+    }
+}
+
 fn build_behaviour(
     key: &libp2p::identity::Keypair,
 ) -> Result<RelayBehaviour, Box<dyn std::error::Error + Send + Sync>> {
@@ -1431,6 +1446,86 @@ mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue};
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn filtered_provider_announcements_are_retained_for_discovery() {
+        use libp2p::kad::store::RecordStore;
+        let identity = libp2p::identity::Keypair::generate_ed25519();
+        let mut behaviour = build_behaviour(&identity).unwrap();
+        let provider = PeerId::random();
+        let key = kad::RecordKey::new(&b"alexandria-discovery-test");
+        let address = "/ip4/203.0.113.1/tcp/4001".parse().unwrap();
+        let expires = Some(std::time::Instant::now() + Duration::from_secs(60));
+        let announcement = kad::ProviderRecord {
+            key: key.clone(),
+            provider,
+            expires,
+            addresses: vec![address],
+        };
+        assert!(behaviour.kademlia.store_mut().providers(&key).is_empty());
+        accept_provider_announcement(
+            &mut behaviour.kademlia,
+            &kad::Event::InboundRequest {
+                request: kad::InboundRequest::AddProvider {
+                    record: Some(announcement.clone()),
+                },
+            },
+        );
+        let stored = behaviour.kademlia.store_mut().providers(&key);
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].provider, provider);
+        assert_eq!(stored[0].addresses, announcement.addresses);
+        assert_eq!(stored[0].expires, expires);
+        accept_provider_announcement(
+            &mut behaviour.kademlia,
+            &kad::Event::InboundRequest {
+                request: kad::InboundRequest::AddProvider {
+                    record: Some(announcement),
+                },
+            },
+        );
+        assert_eq!(behaviour.kademlia.store_mut().providers(&key).len(), 1);
+    }
+
+    #[test]
+    fn provider_announcements_still_respect_store_capacity() {
+        use libp2p::kad::store::{MemoryStoreConfig, RecordStore};
+        let local = PeerId::random();
+        let store = MemoryStore::with_config(
+            local,
+            MemoryStoreConfig {
+                max_provided_keys: 1,
+                ..Default::default()
+            },
+        );
+        let mut kademlia = kad::Behaviour::new(local, store);
+        for value in [b"first", b"other"] {
+            accept_provider_announcement(
+                &mut kademlia,
+                &kad::Event::InboundRequest {
+                    request: kad::InboundRequest::AddProvider {
+                        record: Some(kad::ProviderRecord {
+                            key: kad::RecordKey::new(value),
+                            provider: PeerId::random(),
+                            expires: None,
+                            addresses: vec![],
+                        }),
+                    },
+                },
+            );
+        }
+        assert_eq!(
+            kademlia
+                .store_mut()
+                .providers(&kad::RecordKey::new(&b"first"))
+                .len(),
+            1
+        );
+        assert!(kademlia
+            .store_mut()
+            .providers(&kad::RecordKey::new(&b"other"))
+            .is_empty());
+    }
 
     #[test]
     fn peer_addresses_are_truncated_to_a_network_not_a_host() {
