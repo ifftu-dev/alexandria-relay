@@ -82,6 +82,7 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: .
+          pull: true
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max

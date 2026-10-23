@@ -140,7 +140,7 @@ The `fly.toml` exposes three services:
 - Port `4001` UDP — QUIC transport
 - Port `9090` HTTP — health checks and metrics (with Fly.io health check configured)
 
-The Dockerfile uses a multi-stage build with `rust:1.88-slim` to produce a minimal final image.
+The Dockerfile uses `rust:1.88-slim-bookworm` and a Debian Bookworm runtime. Both stages require `ca-certificates` version `20250419~deb12u2` or newer; the build fails if the installed trust store predates the eMudhra compromise fix. Cargo builds use the committed lockfile, including the patched TLS verifier. CI pulls fresh base images. Rebuild and redeploy existing containers to apply these changes; updating the repository does not update running machines.
 
 ### Multi-Region Deployment
 
