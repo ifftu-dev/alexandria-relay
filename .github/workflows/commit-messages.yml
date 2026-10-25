@@ -1,0 +1,30 @@
+name: Commit messages
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  subjects:
+    name: Commit messages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Test the checker
+        run: scripts/check-commit-messages.test.sh
+      # Walks the pull request's own commits. HEAD here is the merge commit
+      # GitHub makes to test the PR against its base, which nobody wrote.
+      - name: "Every commit subject reads type(scope): message"
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: scripts/check-commit-messages.sh "$BASE_SHA" "$HEAD_SHA"
