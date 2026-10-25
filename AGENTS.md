@@ -6,6 +6,8 @@
 
 - **Documentation review after code changes**: After completing any code changes, always assess whether README and other docs need updating. Ask the user for permission before modifying any documentation files.
 
+- **Commit messages**: Every commit subject reads `type: message` or `type(scope): message` (`feat`, `fix`, `docs`, `refactor`, `perf`, `test`, `build`, `ci`, `security`, `i18n`, `release`, `revert`, `style`, `chore`). CI checks every pull-request commit with `scripts/check-commit-messages.sh`; see CONTRIBUTING.md.
+
 ## Overview
 
 Standalone P2P relay + DHT bootstrap server + username-receipt registry (src/username_reg.rs: countersigned first-seen claims + DHT record mirror, persisted under RELAY_DATA_DIR). Single binary, Fly.io deployment.
