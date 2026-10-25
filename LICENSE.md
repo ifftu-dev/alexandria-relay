@@ -1,6 +1,6 @@
 Alexandria by [IFFTU](https://www.ifftu.dev)
 
-Copyright (c) 2025-2026 Alexandria Pvt. Ltd.
+Copyright (c) 2025-2026 Pratyush Pundir <pratyush@alexandria.ifftu.dev>
 
 Portions of this software are licensed as follows:
 
