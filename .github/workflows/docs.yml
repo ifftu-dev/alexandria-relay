@@ -1,0 +1,25 @@
+name: Docs
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ['**/*.md', 'scripts/check-docs.sh', '.github/workflows/docs.yml']
+  push:
+    branches: [main]
+    paths: ['**/*.md', 'scripts/check-docs.sh', '.github/workflows/docs.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: README size, Status lines, portable paths, relative links
+        run: scripts/check-docs.sh
