@@ -46,3 +46,55 @@ hook="$(git rev-parse --git-path hooks)/commit-msg"
 printf '#!/bin/sh\nexec scripts/check-commit-messages.sh --file "$1"\n' > "$hook"
 chmod +x "$hook"
 ```
+
+## Local checks
+
+Run what CI runs before you push:
+
+```sh
+cargo fmt --check
+cargo clippy --locked -- -D warnings
+cargo test --locked
+cargo audit            # cargo install cargo-audit --locked
+docker build .
+```
+
+## CI and releases
+
+`.github/workflows/ci.yml` runs on every push and pull request to `main`:
+
+| Job | Runs |
+| --- | --- |
+| Check | `cargo check --locked` |
+| Clippy | `cargo clippy --locked -- -D warnings` |
+| Format | `cargo fmt --check` |
+| Test | `cargo test --locked` |
+| Dependency audit | `cargo audit` (ignores in `.cargo/audit.toml`) |
+| Docker Build | builds the `Dockerfile` with fresh base images |
+
+The **Deploy** job runs only on `v*` tags or manual dispatch, after every
+other job passes. It deploys `fly.toml` (Mumbai) and `fly-eu.toml`
+(Frankfurt) in parallel, scales each to one machine and makes sure the
+`relay_data` volume exists. It needs the `FLY_API_TOKEN` repository secret.
+
+```sh
+git tag vX.Y.Z && git push --tags
+```
+
+Operating the deployed relays is covered in
+[docs/operations.md](docs/operations.md).
+
+## Docs
+
+`scripts/check-docs.sh` runs in CI on every pull request that touches Markdown. It keeps `README.md` under 200 lines, requires a `Status:` line under the title of every file in `docs/`, rejects absolute home-directory paths, and checks relative links. Run it locally before pushing doc changes.
+
+| Status | Meaning |
+|---|---|
+| `draft` | Proposed, not started |
+| `active` | Being implemented |
+| `live` | Maintained guide, reference or runbook |
+| `implemented` | Finished spec or audit. Frozen: later changes start a new doc |
+| `superseded` | Replaced; add `Superseded-by: <path>` |
+| `retired` | Describes something that was removed |
+
+Put `Updated: YYYY-MM-DD` on the line after `Status:`.

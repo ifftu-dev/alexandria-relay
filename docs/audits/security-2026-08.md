@@ -1,5 +1,8 @@
 # Alexandria Relay — Security Audit
 
+Status: implemented
+Updated: 2026-10-27
+
 **Date**: 2026-08-18 (first pass)
 **Scope**: `src/main.rs` (libp2p relay/DHT node, HTTP metrics server),
 `src/username_reg.rs` (username claim receipts + DHT record mirror),
@@ -7,7 +10,7 @@
 
 **Summary**: 1 critical, 1 high, 3 medium, 3 low, 2 informational.
 
-### Remediation status (2026-08-18, branch `fix/security-audit-2026-08`)
+### Remediation status (2026-08-18)
 
 | Finding | Status | Notes |
 |---------|--------|-------|
@@ -95,7 +98,7 @@ to source IP address for every peer currently connected. In a P2P system whose
 value proposition is that learners hold their own credentials and their own
 data, this is the single worst thing to publish. Combine it with the
 monitoring dashboard's geo-IP enrichment (see
-`alexandria-monitoring/docs/security-audit.md`, `AM-H1`) and a PeerId observed
+`alexandria-monitoring/docs/audits/security-2026-08.md`, `AM-H1`) and a PeerId observed
 in gossip resolves to a city.
 
 The relay is also the point of centralisation the

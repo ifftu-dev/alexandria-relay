@@ -1,47 +1,8 @@
-# alexandria-relay/
+# alexandria-relay
 
-**Generated:** 2026-03-20
+Single-binary libp2p relay, DHT bootstrap server and username-receipt registry, deployed on Fly.io. Workspace rules (checks, commits, docs) are in the workspace `AGENTS.md`; commit details in `CONTRIBUTING.md`.
 
-## Standing Instructions
-
-- **Documentation review after code changes**: After completing any code changes, always assess whether README and other docs need updating. Ask the user for permission before modifying any documentation files.
-
-- **Commit messages**: Every commit subject reads `type: message` or `type(scope): message` (`feat`, `fix`, `docs`, `refactor`, `perf`, `test`, `build`, `ci`, `security`, `i18n`, `release`, `revert`, `style`, `chore`). CI checks every pull-request commit with `scripts/check-commit-messages.sh`; see CONTRIBUTING.md.
-
-## Overview
-
-Standalone P2P relay + DHT bootstrap server + username-receipt registry (src/username_reg.rs: countersigned first-seen claims + DHT record mirror, persisted under RELAY_DATA_DIR). Single binary, Fly.io deployment.
-
-## BUILD & RUN
-
-```bash
-cargo run -- --port 4001        # Dev
-cargo build --release           # Release
-docker build -t alexandria-relay .  # Docker
-```
-
-## DEPLOYMENT
-
-**Fly.io** (see `fly.toml`):
-- Region: Mumbai (bom)
-- Resources: 1GB RAM, `relay_data` volume (Frankfurt; Mumbai ephemeral), 1 CPU
-- Ports: TCP + UDP/QUIC on 4001
-- Deterministic PeerId via `RELAY_SEED` env var
-
-**Docker** (`Dockerfile`):
-- Builder: `rust:1.88-slim`
-- Runtime: `debian:bookworm-slim`
-- Multi-platform capable (Docker buildx)
-
-## ARCHITECTURE
-
-- Entry: `src/main.rs` — libp2p relay + DHT bootstrap
-- Same libp2p 0.56 as main app
-- MSRV: 1.88.0
-- Release profile: codegen-units=1, lto=true, opt-level="s", panic=abort, strip=true
-
-## KEY GOSSIPSUB TOPICS
-
-The relay is topic-agnostic — it relays whatever flows through
-gossipsub. For the canonical list of all 15 gossip topics carried
-by the network, see [`alexandria/docs/protocol-specification.md` §6.5](../alexandria/docs/protocol-specification.md).
+- **PeerId is deterministic**: it derives from `RELAY_SEED`. Changing the seed changes the relay's identity, and the app's network profile (`alexandria/src-tauri/resources/networks/preprod.json`) pins it, so a seed change needs a coordinated profile update.
+- **Username registry** (`src/username_reg.rs`): countersigned first-seen claims plus a DHT record mirror, persisted under `RELAY_DATA_DIR`. The Fly volume is in Frankfurt; the Mumbai machine is ephemeral.
+- **Topic-agnostic**: the relay forwards whatever gossipsub carries. Wire protocol IDs change only in a coordinated app + relay + monitoring deployment.
+- **libp2p version** tracks the app's; bump them together.
