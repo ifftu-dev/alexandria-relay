@@ -1,6 +1,6 @@
 # Multi-stage build for minimal relay image
 # Build context is the alexandria-relay/ directory itself (standalone crate)
-FROM rust:1.88-slim-bookworm AS builder
+FROM rust:1.89-slim-bookworm AS builder
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
