@@ -1,7 +1,7 @@
 # Relay operations
 
 Status: live
-Updated: 2026-10-27
+Updated: 2026-11-12
 
 How to run, watch and deploy the relay. Configuration flags and env vars are
 in the [README](../README.md#configuration).
@@ -51,11 +51,12 @@ Values are constants in `src/main.rs` and `src/username_reg.rs`.
 | Limit | Value |
 |---|---|
 | Connections | 1,024 total, 8 per PeerId |
+| Connections still in the handshake | 256 incoming |
 | Connections per IP | 32 concurrent, 32 new per minute |
 | Relay reservations | 1,024 total, 16 per peer, 1 h each |
 | Relay circuits | 2,048 total, 128 per peer, 128 MB and 15 min each |
 | DHT records | 16,384 (memory store and disk mirror), 64 KB each |
-| Username receipt requests | 5 per PeerId per minute |
+| Username receipt requests | 5 per PeerId per minute, 8 KiB each, DID at most 64 characters |
 | Username lookups (`/username/:name`) | 30 per minute per client IP |
 | Idle connection timeout | 10 min |
 | Health log interval | 5 min |
@@ -77,7 +78,7 @@ Tuning notes:
 
 ## Deployment (Fly.io)
 
-The `Dockerfile` builds with `rust:1.88-slim-bookworm` and runs on
+The `Dockerfile` builds with `rust:1.89-slim-bookworm` and runs on
 `debian:bookworm-slim`. Both stages refuse to build if `ca-certificates` is
 older than `20250419~deb12u2` (the eMudhra trust-store fix). Cargo uses the
 committed lockfile. Updating the repository does not update running machines:
