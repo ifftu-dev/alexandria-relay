@@ -1,6 +1,7 @@
 # Unblock releases and bound receipt-request inputs
 
 Status: implemented
+Updated: 2026-11-13
 Triage: done
 Repos: alexandria-relay
 Part of: alexandria-relay/docs/relay-hardening-spec.md
@@ -54,3 +55,13 @@ implement-spec workflow.
   `an_oversized_did_is_refused_before_decoding`). Receipt requests are capped
   at 8 KiB, pending incoming handshakes at 256, and seed buffers are zeroized.
   `docker build .` passed in CI on Rust 1.89.
+
+- 2026-11-13, review fixes: an owner-signed release dated near the end of
+  time no longer overflows the grace sum. It saturates, so the name stays
+  held; before, it panicked the store thread in a debug build and freed
+  the name at once in a release build. Two cases gained wire-level tests:
+  twenty receipt requests with a DID just under the request cap are
+  refused in well under a second (`tests/relay.rs`; 1.7 s with the length
+  guard removed), and a dial is refused while a socket that never
+  negotiates holds the only pending-incoming slot (`tests/limits.rs`;
+  accepted with the cap removed).

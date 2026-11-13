@@ -1,6 +1,7 @@
 # Prometheus output, doctor subcommand and the self-hosting guide
 
 Status: implemented
+Updated: 2026-11-13
 Triage: done
 Repos: alexandria-relay
 Part of: alexandria-relay/docs/relay-hardening-spec.md
@@ -184,3 +185,25 @@ implement-spec workflow.
   `/health/alerts` carry them. Doctor fails the run only on reachability,
   as specified; an unwritable data directory or a rejected token is
   reported as a `FAIL` line without changing the exit code.
+
+- 2026-11-13, review fixes: every per-event line goes through one macro
+  at one level constant (debug), on a per-kind target under
+  `alexandria_relay::event` (`connection`, `identify`, `reservation`,
+  `circuit`, `receipt`, `kad`). `tests/logging.rs` records target and
+  level: nothing at info while serving, and at least one reservation and
+  three receipt lines at debug. It fails if a line moves to info or is
+  removed (both checked by mutation). The doctor tests gain an address
+  that resolves and does not answer (`--public-host ::1`, nothing
+  listening on IPv6), which fails a doctor that stops at resolution. The
+  admin routes share one auth layer and the doctor shares the token
+  minimum; no output changed.
+
+### Pending maintainer verification
+
+- 2026-11-13: one acceptance item needs published artifacts. "Every
+  command in the self-hosting guide has been run" holds except for the
+  commands that fetch what a tag publishes: the release download and its
+  `sha256sum -c` against the published `SHA256SUMS`, and pulling the
+  published image (`docker compose pull`, and `docker run` of the registry
+  image). Both ran only against local substitutes. They need the first
+  `v*` tag's release assets and the image set to public.

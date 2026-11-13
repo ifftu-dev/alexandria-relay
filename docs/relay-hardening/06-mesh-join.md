@@ -1,6 +1,7 @@
 # Join the mesh: bootstrap from the network profile and announce
 
 Status: implemented
+Updated: 2026-11-13
 Triage: done
 Repos: alexandria-relay
 Part of: alexandria-relay/docs/relay-hardening-spec.md
@@ -85,3 +86,11 @@ implement-spec workflow.
   libp2p's `dns` feature and hickory stay out of the build). The test
   profiles name the relays `localhost` and `127.0.0.1`, which the app's
   DNS-name rule accepts, so no case needs a network lookup.
+
+- 2026-11-13, review fixes: `--announce` now publishes as the event loop
+  starts instead of only when the first profile relay connects, so a
+  relay alone in its profile, or whose peers are all down, still holds
+  and serves its own provider record. Joining the mesh announces again,
+  and Kademlia republishes on its provider-record interval. New loopback
+  test: a relay whose profile names only itself is found as a provider
+  under the discovery key; it timed out before the fix.
