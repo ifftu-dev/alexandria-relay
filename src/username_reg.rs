@@ -85,6 +85,17 @@ pub enum ReceiptResponse {
     },
 }
 
+impl ReceiptResponse {
+    /// A refusal that names no existing holder.
+    pub fn refused(reason: impl Into<String>) -> Self {
+        ReceiptResponse::Refused {
+            reason: reason.into(),
+            existing_did: None,
+            existing_received_at: None,
+        }
+    }
+}
+
 // ── Claim verification (did:key → ed25519) ─────────────────────────
 
 /// Longest `did` string accepted before any decoding.

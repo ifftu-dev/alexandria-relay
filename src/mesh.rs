@@ -13,11 +13,11 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use libp2p::kad;
-use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+use crate::addr::tcp_and_quic;
 use crate::profile::NetworkProfile;
 
 /// How often the relay runs a Kademlia bootstrap while it has a profile.
@@ -57,16 +57,7 @@ pub(crate) fn dial_addrs(resolved: &[IpAddr], fallback: &[IpAddr], port: u16) ->
         resolved
     };
     ips.iter()
-        .flat_map(|ip| {
-            let base = Multiaddr::empty().with(match ip {
-                IpAddr::V4(v4) => Protocol::Ip4(*v4),
-                IpAddr::V6(v6) => Protocol::Ip6(*v6),
-            });
-            [
-                base.clone().with(Protocol::Tcp(port)),
-                base.with(Protocol::Udp(port)).with(Protocol::QuicV1),
-            ]
-        })
+        .flat_map(|ip| tcp_and_quic(*ip, port, port))
         .collect()
 }
 

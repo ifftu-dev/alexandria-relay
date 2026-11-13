@@ -206,11 +206,7 @@ impl RegistryStore {
         claim: &UsernameClaim,
     ) -> ReceiptResponse {
         if let Err(e) = verify_claim(claim) {
-            return ReceiptResponse::Refused {
-                reason: format!("invalid claim: {e}"),
-                existing_did: None,
-                existing_received_at: None,
-            };
+            return ReceiptResponse::refused(format!("invalid claim: {e}"));
         }
 
         let now = unix_now();
@@ -260,11 +256,7 @@ impl RegistryStore {
                 } else {
                     let bytes = canonical_receipt_bytes(&claim.sig, received_at, relay_peer_id);
                     let Some(sig) = countersign(keypair, &bytes) else {
-                        return ReceiptResponse::Refused {
-                            reason: "relay signing failed".to_string(),
-                            existing_did: None,
-                            existing_received_at: None,
-                        };
+                        return ReceiptResponse::refused("relay signing failed");
                     };
                     let _ = self.conn.execute(
                         "UPDATE receipts SET claim_sig = ?2, receipt_sig = ?3 WHERE username = ?1",
@@ -288,11 +280,7 @@ impl RegistryStore {
         let received_at = unix_now();
         let bytes = canonical_receipt_bytes(&claim.sig, received_at, relay_peer_id);
         let Some(sig) = countersign(keypair, &bytes) else {
-            return ReceiptResponse::Refused {
-                reason: "relay signing failed".to_string(),
-                existing_did: None,
-                existing_received_at: None,
-            };
+            return ReceiptResponse::refused("relay signing failed");
         };
 
         if let Err(e) = self.conn.execute(
@@ -300,11 +288,7 @@ impl RegistryStore {
              VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params![claim.username, claim.did, claim.sig, received_at, sig],
         ) {
-            return ReceiptResponse::Refused {
-                reason: format!("store error: {e}"),
-                existing_did: None,
-                existing_received_at: None,
-            };
+            return ReceiptResponse::refused(format!("store error: {e}"));
         }
 
         ReceiptResponse::Granted(RelayReceipt {

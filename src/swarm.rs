@@ -19,7 +19,7 @@ use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{identify, kad, noise, relay, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder};
 use tokio::sync::{mpsc, watch, RwLock};
 
-use crate::addr::{client_bucket, extract_ip, is_globally_routable};
+use crate::addr::{client_bucket, extract_ip, is_globally_routable, tcp_and_quic};
 use crate::config::{Limits, RelayConfig, USERNAME_REQUEST_MAX_BYTES};
 use crate::http::RelayMetrics;
 use crate::mesh::{self, Mesh, Resolved};
@@ -213,15 +213,7 @@ pub(crate) async fn start_swarm(
         match tokio::net::lookup_host(format!("{host}:{tcp_port}")).await {
             Ok(addrs) => {
                 for sa in addrs {
-                    let ip = match sa.ip() {
-                        IpAddr::V4(v4) => Protocol::Ip4(v4),
-                        IpAddr::V6(v6) => Protocol::Ip6(v6),
-                    };
-                    let base = Multiaddr::empty().with(ip);
-                    for addr in [
-                        base.clone().with(Protocol::Tcp(tcp_port)),
-                        base.with(Protocol::Udp(quic_port)).with(Protocol::QuicV1),
-                    ] {
+                    for addr in tcp_and_quic(sa.ip(), tcp_port, quic_port) {
                         external_registered.push(addr.clone());
                         event_loop.swarm.add_external_address(addr);
                     }
@@ -891,21 +883,23 @@ impl EventLoop {
                 // The store thread answers; the event loop sends the
                 // response when it arrives and keeps serving meanwhile.
                 let pending = if rate_limited {
-                    Err(refused("too many username claims — try again shortly"))
+                    Err(ReceiptResponse::refused(
+                        "too many username claims — try again shortly",
+                    ))
                 } else {
                     match &self.registry_store {
-                        Some(store) => store
-                            .request_receipt(request.claim)
-                            .map_err(|_| refused("relay busy — try again shortly")),
-                        None => Err(refused("registry store unavailable")),
+                        Some(store) => store.request_receipt(request.claim).map_err(|_| {
+                            ReceiptResponse::refused("relay busy — try again shortly")
+                        }),
+                        None => Err(ReceiptResponse::refused("registry store unavailable")),
                     }
                 };
                 match pending {
                     Ok(reply) => self.pending_receipts.push(
                         async move {
-                            let response = reply
-                                .await
-                                .unwrap_or_else(|_| refused("registry store unavailable"));
+                            let response = reply.await.unwrap_or_else(|_| {
+                                ReceiptResponse::refused("registry store unavailable")
+                            });
                             (channel, response)
                         }
                         .boxed(),
@@ -949,15 +943,6 @@ impl EventLoop {
             }
             _ => {}
         }
-    }
-}
-
-/// A refusal that carries no existing holder.
-fn refused(reason: &str) -> ReceiptResponse {
-    ReceiptResponse::Refused {
-        reason: reason.to_string(),
-        existing_did: None,
-        existing_received_at: None,
     }
 }
 
