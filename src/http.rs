@@ -20,6 +20,7 @@ use crate::addr::{client_bucket, truncate_ip};
 use crate::config::Limits;
 #[cfg(test)]
 use crate::config::{DEFAULT_LOOKUP_LIMIT, DEFAULT_LOOKUP_MAX_TRACKED};
+use crate::rate::RateWindows;
 use crate::store::{StoreError, StoreHandle};
 
 // ── Metrics ──────────────────────────────────────────────────────────
@@ -296,18 +297,16 @@ fn admin_authorised(expected: Option<&str>, headers: &axum::http::HeaderMap) -> 
 /// `std::sync::Mutex` rather than tokio's: the critical section is a map
 /// lookup and an integer bump, never held across an await.
 pub(crate) struct LookupLimiter {
-    windows: std::sync::Mutex<HashMap<IpAddr, (usize, Instant)>>,
+    windows: std::sync::Mutex<RateWindows<IpAddr>>,
     limit: usize,
-    window: Duration,
     max_tracked: usize,
 }
 
 impl LookupLimiter {
     pub(crate) fn new(limits: &Limits) -> Self {
         LookupLimiter {
-            windows: std::sync::Mutex::new(HashMap::new()),
+            windows: std::sync::Mutex::new(RateWindows::new(limits.lookup_window)),
             limit: limits.lookup_limit,
-            window: limits.lookup_window,
             max_tracked: limits.lookup_max_tracked,
         }
     }
@@ -325,18 +324,13 @@ impl LookupLimiter {
         };
         let now = Instant::now();
         if map.len() >= self.max_tracked {
-            map.retain(|_, (_, started)| now.duration_since(*started) < self.window);
+            let window = map.window();
+            map.forget_older_than(now, window);
             if map.len() >= self.max_tracked {
                 map.clear();
             }
         }
-        let (count, started) = map.entry(ip).or_insert((0, now));
-        if now.duration_since(*started) >= self.window {
-            *count = 0;
-            *started = now;
-        }
-        *count += 1;
-        *count > self.limit
+        map.hit(ip, now) > self.limit
     }
 }
 

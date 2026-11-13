@@ -70,6 +70,7 @@ pub mod doctor;
 mod http;
 mod mesh;
 pub mod profile;
+mod rate;
 mod store;
 mod swarm;
 pub mod username_reg;

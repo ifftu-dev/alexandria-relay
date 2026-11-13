@@ -24,6 +24,7 @@ use crate::config::{Limits, RelayConfig, USERNAME_REQUEST_MAX_BYTES};
 use crate::http::RelayMetrics;
 use crate::mesh::{self, Mesh, Resolved};
 use crate::profile::NetworkProfile;
+use crate::rate::RateWindows;
 use crate::store::{MirroredRecord, StoreHandle, MIRROR_PRUNE_INTERVAL};
 use crate::username_reg::{self, ReceiptRequest, ReceiptResponse};
 use crate::StartError;
@@ -175,8 +176,8 @@ pub(crate) async fn start_swarm(
         start_time: Instant::now(),
         total_connections_served: 0,
         ip_active_connections: HashMap::new(),
-        ip_rate_windows: HashMap::new(),
-        username_rate_windows: HashMap::new(),
+        ip_rate_windows: RateWindows::new(config.limits.ip_rate_window),
+        username_rate_windows: RateWindows::new(config.limits.receipt_window),
         pending_receipts: FuturesUnordered::new(),
         health_baseline: HealthCounts::default(),
     };
@@ -312,12 +313,12 @@ pub(crate) struct EventLoop {
     total_connections_served: u64,
     /// IP-level rate limiting state.
     ip_active_connections: HashMap<IpAddr, usize>,
-    ip_rate_windows: HashMap<IpAddr, (usize, Instant)>,
+    ip_rate_windows: RateWindows<IpAddr>,
     /// Per-peer rate limiting for username-receipt requests. Keyed by PeerId
     /// rather than IP because the claim is bound to a DID, not to a network
     /// location, and the connection-level IP limiter already covers the
     /// network side.
-    username_rate_windows: HashMap<PeerId, (usize, Instant)>,
+    username_rate_windows: RateWindows<PeerId>,
     /// Receipt requests the store thread is still answering, each paired
     /// with the channel its response goes back on.
     pending_receipts: FuturesUnordered<PendingReceipt>,
@@ -500,12 +501,10 @@ impl EventLoop {
 
         // Prune stale rate window entries
         let now = Instant::now();
-        let ip_window = self.limits.ip_rate_window;
-        let receipt_window = self.limits.receipt_window;
         self.ip_rate_windows
-            .retain(|_, (_, started)| now.duration_since(*started) < ip_window * 2);
+            .forget_older_than(now, self.limits.ip_rate_window * 2);
         self.username_rate_windows
-            .retain(|_, (_, started)| now.duration_since(*started) < receipt_window * 2);
+            .forget_older_than(now, self.limits.receipt_window * 2);
     }
 
     /// A lookup of profile relay `peer` finished: dial it unless it is
@@ -626,18 +625,11 @@ impl EventLoop {
                     let active = self.ip_active_connections.entry(ip).or_insert(0);
                     *active += 1;
 
-                    let (attempts, window_start) = self
-                        .ip_rate_windows
-                        .entry(ip)
-                        .or_insert((0, Instant::now()));
-                    if window_start.elapsed() > self.limits.ip_rate_window {
-                        *attempts = 0;
-                        *window_start = Instant::now();
-                    }
-                    *attempts += 1;
+                    let active = *active;
+                    let attempts = self.ip_rate_windows.hit(ip, Instant::now());
 
-                    if *active > self.limits.max_connections_per_ip
-                        || *attempts > self.limits.max_new_connections_per_ip
+                    if active > self.limits.max_connections_per_ip
+                        || attempts > self.limits.max_new_connections_per_ip
                     {
                         log::warn!(
                             "IP rate limit exceeded for {ip} (active:{active}, attempts:{attempts}), \
@@ -887,16 +879,8 @@ impl EventLoop {
                 // Per-peer budget. Claim signatures are free to mint
                 // offline, so without this one connection can receipt
                 // the whole namespace.
-                let (count, window_start) = self
-                    .username_rate_windows
-                    .entry(peer)
-                    .or_insert((0, Instant::now()));
-                if window_start.elapsed() > self.limits.receipt_window {
-                    *count = 0;
-                    *window_start = Instant::now();
-                }
-                *count += 1;
-                let rate_limited = *count > self.limits.receipt_limit;
+                let count = self.username_rate_windows.hit(peer, Instant::now());
+                let rate_limited = count > self.limits.receipt_limit;
                 if rate_limited {
                     event!(
                         event_target::RECEIPT,
