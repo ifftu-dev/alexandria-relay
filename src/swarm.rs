@@ -6,7 +6,9 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::StreamExt;
+use futures::future::BoxFuture;
+use futures::stream::FuturesUnordered;
+use futures::{FutureExt, StreamExt};
 use libp2p::core::transport::ListenerId;
 use libp2p::identity::Keypair;
 use libp2p::kad::store::MemoryStore;
@@ -19,14 +21,13 @@ use tokio::sync::{watch, RwLock};
 use crate::addr::{client_bucket, extract_ip, is_globally_routable};
 use crate::config::{Limits, RelayConfig, USERNAME_REQUEST_MAX_BYTES};
 use crate::http::RelayMetrics;
-use crate::store::RegistryStore;
+use crate::store::{MirroredRecord, StoreHandle, MIRROR_PRUNE_INTERVAL};
 use crate::username_reg::{self, ReceiptRequest, ReceiptResponse};
 use crate::StartError;
 
 /// How long startup waits for the IPv4 listeners to report their addresses.
 const LISTEN_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub(crate) type SharedStore = Arc<std::sync::Mutex<RegistryStore>>;
 type RelaySwarm = libp2p::Swarm<RelayBehaviour>;
 
 // ── Network Behaviour ────────────────────────────────────────────────
@@ -61,13 +62,11 @@ pub(crate) struct Started {
 pub(crate) async fn start_swarm(
     config: &RelayConfig,
     keypair: Keypair,
-    registry_store: Option<SharedStore>,
+    registry_store: Option<StoreHandle>,
     metrics: Arc<RwLock<RelayMetrics>>,
     http_port: u16,
 ) -> Result<Started, StartError> {
     let local_peer_id = keypair.public().to_peer_id();
-    // Countersigning needs the keypair after the swarm takes ownership.
-    let signing_keypair = keypair.clone();
     let limits = config.limits.clone();
 
     let mut swarm = SwarmBuilder::with_existing_identity(keypair)
@@ -87,19 +86,18 @@ pub(crate) async fn start_swarm(
         })
         .build();
 
-    // Warm-load mirrored DHT records so the registry survives restarts.
-    if let Some(store) = registry_store.as_ref().and_then(|s| s.lock().ok()) {
-        let records = store.load_kad_records();
+    // Warm-load mirrored DHT records, with their expiry and publisher, so
+    // the registry survives restarts. Expired rows are not returned.
+    if let Some(store) = registry_store.as_ref() {
+        let records = store.load_kad_records().await.unwrap_or_default();
         let n = records.len();
-        for (key, value) in records {
-            let record = kad::Record {
-                key: kad::RecordKey::new(&key),
-                value,
-                publisher: None,
-                expires: None,
-            };
+        for record in records {
             use libp2p::kad::store::RecordStore;
-            let _ = swarm.behaviour_mut().kademlia.store_mut().put(record);
+            let _ = swarm
+                .behaviour_mut()
+                .kademlia
+                .store_mut()
+                .put(record.into_kad());
         }
         if n > 0 {
             log::info!("Warm-loaded {n} DHT records from disk");
@@ -130,7 +128,6 @@ pub(crate) async fn start_swarm(
     let mut event_loop = EventLoop {
         swarm,
         local_peer_id,
-        signing_keypair,
         registry_store,
         metrics,
         limits: config.limits.clone(),
@@ -139,6 +136,7 @@ pub(crate) async fn start_swarm(
         ip_active_connections: HashMap::new(),
         ip_rate_windows: HashMap::new(),
         username_rate_windows: HashMap::new(),
+        pending_receipts: FuturesUnordered::new(),
     };
     let listen_addrs = event_loop.await_listeners(&[tcp4, quic4]).await?;
 
@@ -242,8 +240,7 @@ fn first_port(addrs: &[Multiaddr], quic: bool) -> Option<u16> {
 pub(crate) struct EventLoop {
     swarm: RelaySwarm,
     local_peer_id: PeerId,
-    signing_keypair: Keypair,
-    registry_store: Option<SharedStore>,
+    registry_store: Option<StoreHandle>,
     metrics: Arc<RwLock<RelayMetrics>>,
     limits: Limits,
     start_time: Instant,
@@ -256,7 +253,19 @@ pub(crate) struct EventLoop {
     /// location, and the connection-level IP limiter already covers the
     /// network side.
     username_rate_windows: HashMap<PeerId, (usize, Instant)>,
+    /// Receipt requests the store thread is still answering, each paired
+    /// with the channel its response goes back on.
+    pending_receipts: FuturesUnordered<PendingReceipt>,
 }
+
+/// A receipt response on its way back from the store thread.
+type PendingReceipt = BoxFuture<
+    'static,
+    (
+        request_response::ResponseChannel<ReceiptResponse>,
+        ReceiptResponse,
+    ),
+>;
 
 impl EventLoop {
     /// Drive the swarm until every listener in `ids` has reported at least
@@ -296,11 +305,28 @@ impl EventLoop {
     pub(crate) async fn run(mut self, mut shutdown: watch::Receiver<bool>) {
         let mut health_interval = tokio::time::interval(self.limits.health_log_interval);
         health_interval.tick().await; // consume immediate tick
+                                      // The first tick fires at once: prune whatever expired while the
+                                      // relay was down.
+        let mut prune_interval = tokio::time::interval(MIRROR_PRUNE_INTERVAL);
 
         loop {
             tokio::select! {
                 _ = health_interval.tick() => self.on_health_tick().await,
+                _ = prune_interval.tick() => {
+                    if let Some(store) = &self.registry_store {
+                        store.prune_expired();
+                    }
+                }
                 _ = shutdown.changed() => break,
+                Some((channel, response)) = self.pending_receipts.next(),
+                    if !self.pending_receipts.is_empty() =>
+                {
+                    let _ = self
+                        .swarm
+                        .behaviour_mut()
+                        .username_reg
+                        .send_response(channel, response);
+                }
                 event = self.swarm.select_next_some() => self.on_event(event).await,
             }
         }
@@ -546,11 +572,14 @@ impl EventLoop {
                                 .store_mut()
                                 .put(record.clone())
                                 .is_ok();
-                            if accepted {
-                                if let Some(store) =
-                                    self.registry_store.as_ref().and_then(|s| s.lock().ok())
-                                {
-                                    store.save_kad_record(record.key.as_ref(), &record.value);
+                            let mirrored = MirroredRecord::from_kad(record);
+                            if let (true, Some(store), Some(mirrored)) =
+                                (accepted, &self.registry_store, mirrored)
+                            {
+                                if !store.mirror(mirrored) {
+                                    log::warn!(
+                                        "DHT mirror queue full — record kept in memory only"
+                                    );
                                 }
                             }
                         }
@@ -596,31 +625,36 @@ impl EventLoop {
                     log::warn!("username-reg: rate limiting {peer} ({count} requests in window)");
                 }
 
-                let response = if rate_limited {
-                    ReceiptResponse::Refused {
-                        reason: "too many username claims — try again shortly".to_string(),
-                        existing_did: None,
-                        existing_received_at: None,
-                    }
+                // The store thread answers; the event loop sends the
+                // response when it arrives and keeps serving meanwhile.
+                let pending = if rate_limited {
+                    Err(refused("too many username claims — try again shortly"))
                 } else {
-                    match self.registry_store.as_ref().and_then(|s| s.lock().ok()) {
-                        Some(mut store) => store.handle_receipt(
-                            &self.signing_keypair,
-                            &local_peer_id.to_string(),
-                            &request.claim,
-                        ),
-                        None => ReceiptResponse::Refused {
-                            reason: "registry store unavailable".to_string(),
-                            existing_did: None,
-                            existing_received_at: None,
-                        },
+                    match &self.registry_store {
+                        Some(store) => store
+                            .request_receipt(request.claim)
+                            .map_err(|_| refused("relay busy — try again shortly")),
+                        None => Err(refused("registry store unavailable")),
                     }
                 };
-                let _ = self
-                    .swarm
-                    .behaviour_mut()
-                    .username_reg
-                    .send_response(channel, response);
+                match pending {
+                    Ok(reply) => self.pending_receipts.push(
+                        async move {
+                            let response = reply
+                                .await
+                                .unwrap_or_else(|_| refused("registry store unavailable"));
+                            (channel, response)
+                        }
+                        .boxed(),
+                    ),
+                    Err(response) => {
+                        let _ = self
+                            .swarm
+                            .behaviour_mut()
+                            .username_reg
+                            .send_response(channel, response);
+                    }
+                }
             }
             SwarmEvent::Behaviour(RelayBehaviourEvent::UsernameReg(event)) => {
                 log::debug!("username-reg event: {event:?}");
@@ -641,6 +675,15 @@ impl EventLoop {
             }
             _ => {}
         }
+    }
+}
+
+/// A refusal that carries no existing holder.
+fn refused(reason: &str) -> ReceiptResponse {
+    ReceiptResponse::Refused {
+        reason: reason.to_string(),
+        existing_did: None,
+        existing_received_at: None,
     }
 }
 

@@ -2,13 +2,21 @@
 //! mirror, in one SQLite database under the data directory.
 //!
 //! First-seen semantics for receipts are described in [`crate::username_reg`].
-//! The mirror keeps inbound DHT records so the in-memory Kademlia store can be
-//! refilled after a restart.
+//! The mirror keeps inbound DHT records, with their expiry and publisher, so
+//! the in-memory Kademlia store can be refilled after a restart.
+//!
+//! [`RegistryStore`] is synchronous. The running relay never calls it from an
+//! async task: [`StoreHandle::spawn`] moves it onto a dedicated thread, and the
+//! event loop and HTTP handlers talk to that thread over a bounded channel.
 
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rusqlite::Connection;
+use libp2p::identity::Keypair;
+use libp2p::kad;
+use libp2p::PeerId;
+use rusqlite::{Connection, OptionalExtension};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::config::{DEFAULT_KAD_MAX_RECORDS, DEFAULT_KAD_MAX_RECORD_BYTES};
 use crate::username_reg::{
@@ -16,16 +24,95 @@ use crate::username_reg::{
     RelayReceipt, UsernameClaim, RELEASE_GRACE_SECS,
 };
 
+/// Schema version, kept in SQLite's `user_version`. A database with any
+/// other version was written by another binary and is recreated: the project
+/// is pre-launch and its data disposable, so there are no migrations.
+const SCHEMA_VERSION: i64 = 2;
+
+/// How long a write waits on a locked database before failing.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Requests that may wait for the store thread. A burst beyond this drops
+/// mirror writes (the record still lives in memory) and refuses receipts
+/// rather than stalling the event loop.
+const QUEUE_CAPACITY: usize = 1024;
+
+/// How often the event loop asks the store to drop expired mirror rows.
+pub(crate) const MIRROR_PRUNE_INTERVAL: Duration = Duration::from_secs(600);
+
+/// Expiry sort key: a record without an expiry sorts after every real one.
+/// The same expression backs the eviction index, so the two must match.
+const EXPIRY_ORDER: &str = "COALESCE(expires_at, 9223372036854775807)";
+
+pub(crate) fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// One mirrored DHT record, as stored on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MirroredRecord {
+    pub(crate) key: Vec<u8>,
+    pub(crate) value: Vec<u8>,
+    /// The publisher's PeerId bytes, when the record names one.
+    pub(crate) publisher: Option<Vec<u8>>,
+    /// Absolute Unix seconds; `None` means the record never expires.
+    pub(crate) expires_at: Option<i64>,
+}
+
+impl MirroredRecord {
+    /// The on-disk form of `record`, with its expiry made absolute against
+    /// the wall clock. `None` if it has already expired.
+    pub(crate) fn from_kad(record: &kad::Record) -> Option<Self> {
+        let expires_at = match record.expires {
+            Some(at) => {
+                let left = at.checked_duration_since(Instant::now())?;
+                Some(unix_now().saturating_add(left.as_secs() as i64))
+            }
+            None => None,
+        };
+        Some(MirroredRecord {
+            key: record.key.to_vec(),
+            value: record.value.clone(),
+            publisher: record.publisher.map(|p| p.to_bytes()),
+            expires_at,
+        })
+    }
+
+    /// The in-memory form, with the absolute expiry turned back into an
+    /// [`Instant`].
+    pub(crate) fn into_kad(self) -> kad::Record {
+        let now = unix_now();
+        let expires = self.expires_at.map(|at| {
+            let left = u64::try_from(at.saturating_sub(now)).unwrap_or(0);
+            Instant::now() + Duration::from_secs(left)
+        });
+        kad::Record {
+            key: kad::RecordKey::new(&self.key),
+            value: self.value,
+            publisher: self
+                .publisher
+                .and_then(|bytes| PeerId::from_bytes(&bytes).ok()),
+            expires,
+        }
+    }
+}
+
 pub struct RegistryStore {
     conn: Connection,
     /// Ceiling on the on-disk Kademlia mirror, the same cap as the memory
     /// store's. Held here so the store bounds itself without reaching back
     /// into the swarm.
-    kad_max_records: i64,
+    kad_max_records: usize,
     /// Ceiling on a single mirrored value. The caller checks this too;
     /// checked again here so the storage layer cannot be made to write an
     /// unbounded blob by a future caller that forgets.
     kad_max_value_bytes: usize,
+    /// Rows in `kad_records`, counted once at open and kept in step with
+    /// every insert and delete, so a write never scans the table.
+    mirror_count: usize,
 }
 
 impl RegistryStore {
@@ -33,7 +120,7 @@ impl RegistryStore {
     /// `max_value_bytes` each. [`RegistryStore::open`] starts with the
     /// default limits.
     pub fn with_kad_caps(mut self, max_records: usize, max_value_bytes: usize) -> Self {
-        self.kad_max_records = i64::try_from(max_records).unwrap_or(i64::MAX);
+        self.kad_max_records = max_records;
         self.kad_max_value_bytes = max_value_bytes;
         self
     }
@@ -42,26 +129,70 @@ impl RegistryStore {
         std::fs::create_dir_all(data_dir).map_err(|e| format!("create data dir: {e}"))?;
         let conn = Connection::open(data_dir.join("username_registry.db"))
             .map_err(|e| format!("open registry db: {e}"))?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS receipts (
-                 username    TEXT PRIMARY KEY,
-                 did         TEXT NOT NULL,
-                 claim_sig   TEXT NOT NULL,
-                 received_at INTEGER NOT NULL,
-                 receipt_sig TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS kad_records (
-                 key   BLOB PRIMARY KEY,
-                 value BLOB NOT NULL
-             );",
-        )
-        .map_err(|e| format!("init registry schema: {e}"))?;
-        // Older stores predate releases — guarded ALTER.
-        let _ = conn.execute("ALTER TABLE receipts ADD COLUMN released_at INTEGER", []);
+        conn.busy_timeout(BUSY_TIMEOUT)
+            .map_err(|e| format!("set busy timeout: {e}"))?;
+        // Write-ahead log with normal sync: a commit appends to the log
+        // without an fsync; only checkpoints sync. A crash can lose the last
+        // few commits but never corrupts the database.
+        let mode: String = conn
+            .pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))
+            .map_err(|e| format!("enable WAL: {e}"))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            return Err(format!("enable WAL: journal mode is {mode}"));
+        }
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(|e| format!("set synchronous: {e}"))?;
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .map_err(|e| format!("read schema version: {e}"))?;
+        if version != SCHEMA_VERSION {
+            let existing: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|e| format!("inspect registry db: {e}"))?;
+            if existing > 0 {
+                log::warn!(
+                    "Registry store has schema version {version}, expected {SCHEMA_VERSION} \
+                     — recreating it empty"
+                );
+            }
+            conn.execute_batch(&format!(
+                "BEGIN;
+                 DROP TABLE IF EXISTS receipts;
+                 DROP TABLE IF EXISTS kad_records;
+                 CREATE TABLE receipts (
+                     username    TEXT PRIMARY KEY,
+                     did         TEXT NOT NULL,
+                     claim_sig   TEXT NOT NULL,
+                     received_at INTEGER NOT NULL,
+                     receipt_sig TEXT NOT NULL,
+                     released_at INTEGER
+                 );
+                 CREATE TABLE kad_records (
+                     key        BLOB PRIMARY KEY,
+                     value      BLOB NOT NULL,
+                     publisher  BLOB,
+                     expires_at INTEGER
+                 );
+                 CREATE INDEX kad_records_eviction ON kad_records ({EXPIRY_ORDER});
+                 PRAGMA user_version = {SCHEMA_VERSION};
+                 COMMIT;"
+            ))
+            .map_err(|e| format!("create registry schema: {e}"))?;
+        }
+
+        let mirror_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM kad_records", [], |r| r.get(0))
+            .map_err(|e| format!("count mirrored records: {e}"))?;
         Ok(RegistryStore {
             conn,
-            kad_max_records: DEFAULT_KAD_MAX_RECORDS as i64,
+            kad_max_records: DEFAULT_KAD_MAX_RECORDS,
             kad_max_value_bytes: DEFAULT_KAD_MAX_RECORD_BYTES,
+            mirror_count: usize::try_from(mirror_count).unwrap_or(0),
         })
     }
 
@@ -69,7 +200,7 @@ impl RegistryStore {
     /// countersign with the relay key.
     pub fn handle_receipt(
         &mut self,
-        keypair: &libp2p::identity::Keypair,
+        keypair: &Keypair,
         relay_peer_id: &str,
         claim: &UsernameClaim,
     ) -> ReceiptResponse {
@@ -81,10 +212,7 @@ impl RegistryStore {
             };
         }
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        let now = unix_now();
 
         let existing: Option<(String, String, i64, String, Option<i64>)> = self
             .conn
@@ -156,10 +284,7 @@ impl RegistryStore {
             };
         }
 
-        let received_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        let received_at = unix_now();
         let bytes = canonical_receipt_bytes(&claim.sig, received_at, relay_peer_id);
         let Some(sig) = countersign(keypair, &bytes) else {
             return ReceiptResponse::Refused {
@@ -188,54 +313,124 @@ impl RegistryStore {
         })
     }
 
-    /// Mirror a kad record for restart persistence.
-    pub fn save_kad_record(&self, key: &[u8], value: &[u8]) {
-        if value.len() > self.kad_max_value_bytes {
+    /// Mirror a kad record for restart persistence, then hold the mirror to
+    /// its record cap. `now` is the current Unix time.
+    pub(crate) fn save_kad_record(&mut self, record: &MirroredRecord, now: i64) {
+        if record.value.len() > self.kad_max_value_bytes {
             return;
         }
-        let _ = self.conn.execute(
-            "INSERT INTO kad_records (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            rusqlite::params![key, value],
-        );
-        self.trim_kad_records();
+        if record.expires_at.is_some_and(|at| at <= now) {
+            return;
+        }
+        let known = self
+            .conn
+            .prepare_cached("SELECT 1 FROM kad_records WHERE key = ?1")
+            .and_then(|mut stmt| {
+                stmt.query_row([&record.key], |_| Ok(()))
+                    .optional()
+                    .map(|row| row.is_some())
+            });
+        let Ok(known) = known else {
+            return;
+        };
+        let written = self
+            .conn
+            .prepare_cached(
+                "INSERT INTO kad_records (key, value, publisher, expires_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(key) DO UPDATE SET
+                     value = excluded.value,
+                     publisher = excluded.publisher,
+                     expires_at = excluded.expires_at",
+            )
+            .and_then(|mut stmt| {
+                stmt.execute(rusqlite::params![
+                    record.key,
+                    record.value,
+                    record.publisher,
+                    record.expires_at
+                ])
+            });
+        if written.is_ok() && !known {
+            self.mirror_count += 1;
+        }
+        self.trim_kad_records(now);
     }
 
-    /// Hold the mirror to its record cap, evicting oldest-first.
+    /// Hold the mirror to its record cap.
     ///
     /// The in-memory Kademlia store has its own ceiling, but it is emptied on
     /// every restart and refilled from here — so without a ceiling on the table
     /// itself, records that were long ago evicted from memory stay on disk
-    /// forever and the volume grows without bound. `rowid` is insertion order
-    /// (an `ON CONFLICT` update keeps the original), so ascending rowid is
-    /// oldest-first.
-    fn trim_kad_records(&self) {
-        let count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM kad_records", [], |r| r.get(0))
-            .unwrap_or(0);
-        let excess = count - self.kad_max_records;
-        if excess <= 0 {
+    /// forever and the volume grows without bound.
+    ///
+    /// Expired records go first, then the soonest-expiring, then (among equal
+    /// expiries, and records that never expire) the oldest-inserted: `rowid`
+    /// is insertion order, since an `ON CONFLICT` update keeps the original.
+    /// Evicting by insertion order alone would drop the earliest users'
+    /// records first however long they had left.
+    fn trim_kad_records(&mut self, now: i64) {
+        if self.mirror_count <= self.kad_max_records {
             return;
         }
-        let _ = self.conn.execute(
-            "DELETE FROM kad_records WHERE rowid IN (
-                 SELECT rowid FROM kad_records ORDER BY rowid ASC LIMIT ?1
-             )",
-            rusqlite::params![excess],
+        self.prune_expired(now);
+        let excess = self.mirror_count.saturating_sub(self.kad_max_records);
+        if excess == 0 {
+            return;
+        }
+        let deleted = self.conn.execute(
+            &format!(
+                "DELETE FROM kad_records WHERE rowid IN (
+                     SELECT rowid FROM kad_records ORDER BY {EXPIRY_ORDER} ASC, rowid ASC
+                     LIMIT ?1
+                 )"
+            ),
+            rusqlite::params![excess as i64],
         );
+        if let Ok(n) = deleted {
+            self.mirror_count = self.mirror_count.saturating_sub(n);
+        }
     }
 
-    /// All mirrored kad records, for warm-loading the MemoryStore at boot.
-    pub fn load_kad_records(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let Ok(mut stmt) = self.conn.prepare("SELECT key, value FROM kad_records") else {
+    /// Delete every mirrored record that has expired by `now`. Returns how
+    /// many went.
+    pub(crate) fn prune_expired(&mut self, now: i64) -> usize {
+        let deleted = self
+            .conn
+            .execute(
+                "DELETE FROM kad_records WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+                [now],
+            )
+            .unwrap_or(0);
+        self.mirror_count = self.mirror_count.saturating_sub(deleted);
+        deleted
+    }
+
+    /// Mirrored records still live at `now`, for warm-loading the
+    /// MemoryStore at boot.
+    pub(crate) fn load_kad_records(&self, now: i64) -> Vec<MirroredRecord> {
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT key, value, publisher, expires_at FROM kad_records
+             WHERE expires_at IS NULL OR expires_at > ?1",
+        ) else {
             return Vec::new();
         };
-        stmt.query_map([], |r| {
-            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+        stmt.query_map([now], |r| {
+            Ok(MirroredRecord {
+                key: r.get(0)?,
+                value: r.get(1)?,
+                publisher: r.get(2)?,
+                expires_at: r.get(3)?,
+            })
         })
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default()
+    }
+
+    /// Rows in the mirror, from the cached count.
+    #[cfg(test)]
+    pub(crate) fn mirror_count(&self) -> usize {
+        self.mirror_count
     }
 
     pub fn receipt_count(&self) -> i64 {
@@ -247,10 +442,7 @@ impl RegistryStore {
     /// Current holder of a username (receipted claims only), for the
     /// HTTP availability endpoint.
     pub fn lookup_username(&self, username: &str) -> Option<(String, i64)> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        let now = unix_now();
         self.conn
             .query_row(
                 "SELECT did, received_at, released_at FROM receipts WHERE username = ?1",
@@ -269,6 +461,143 @@ impl RegistryStore {
                 None => true,
             })
             .map(|(did, received_at, _)| (did, received_at))
+    }
+}
+
+// ── Store actor ──────────────────────────────────────────────────────
+
+/// What the store thread can be asked to do.
+enum Command {
+    Receipt {
+        claim: Box<UsernameClaim>,
+        reply: oneshot::Sender<ReceiptResponse>,
+    },
+    Lookup {
+        username: String,
+        reply: oneshot::Sender<Option<(String, i64)>>,
+    },
+    Mirror(MirroredRecord),
+    LoadMirror {
+        reply: oneshot::Sender<Vec<MirroredRecord>>,
+    },
+    PruneExpired,
+    ReceiptCount {
+        reply: oneshot::Sender<i64>,
+    },
+    Close {
+        reply: oneshot::Sender<()>,
+    },
+}
+
+/// The store queue was full or the store thread has stopped.
+#[derive(Debug)]
+pub(crate) struct StoreBusy;
+
+/// A cheap, cloneable handle to the store thread. Every SQLite call runs on
+/// that thread, in the order requests arrive.
+#[derive(Clone)]
+pub(crate) struct StoreHandle {
+    tx: mpsc::Sender<Command>,
+}
+
+impl StoreHandle {
+    /// Move `store` onto a dedicated thread. `keypair` countersigns
+    /// receipts there. The thread stops on [`StoreHandle::close`] or when
+    /// every handle is dropped.
+    pub(crate) fn spawn(mut store: RegistryStore, keypair: Keypair) -> std::io::Result<Self> {
+        let (tx, mut rx) = mpsc::channel(QUEUE_CAPACITY);
+        let relay_peer_id = keypair.public().to_peer_id().to_string();
+        std::thread::Builder::new()
+            .name("relay-store".to_string())
+            .spawn(move || {
+                while let Some(command) = rx.blocking_recv() {
+                    match command {
+                        Command::Receipt { claim, reply } => {
+                            let _ =
+                                reply.send(store.handle_receipt(&keypair, &relay_peer_id, &claim));
+                        }
+                        Command::Lookup { username, reply } => {
+                            let _ = reply.send(store.lookup_username(&username));
+                        }
+                        Command::Mirror(record) => store.save_kad_record(&record, unix_now()),
+                        Command::LoadMirror { reply } => {
+                            let _ = reply.send(store.load_kad_records(unix_now()));
+                        }
+                        Command::PruneExpired => {
+                            let n = store.prune_expired(unix_now());
+                            if n > 0 {
+                                log::debug!("Pruned {n} expired DHT records from the mirror");
+                            }
+                        }
+                        Command::ReceiptCount { reply } => {
+                            let _ = reply.send(store.receipt_count());
+                        }
+                        Command::Close { reply } => {
+                            drop(store);
+                            let _ = reply.send(());
+                            return;
+                        }
+                    }
+                }
+            })?;
+        Ok(StoreHandle { tx })
+    }
+
+    /// Queue a receipt request without waiting. The returned receiver
+    /// yields the response once the store thread has handled it.
+    pub(crate) fn request_receipt(
+        &self,
+        claim: UsernameClaim,
+    ) -> Result<oneshot::Receiver<ReceiptResponse>, StoreBusy> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .try_send(Command::Receipt {
+                claim: Box::new(claim),
+                reply,
+            })
+            .map_err(|_| StoreBusy)?;
+        Ok(rx)
+    }
+
+    /// Queue a record for the mirror without waiting. `false` if the queue
+    /// was full and the write was dropped.
+    pub(crate) fn mirror(&self, record: MirroredRecord) -> bool {
+        self.tx.try_send(Command::Mirror(record)).is_ok()
+    }
+
+    /// Queue a prune of expired mirror rows without waiting.
+    pub(crate) fn prune_expired(&self) {
+        let _ = self.tx.try_send(Command::PruneExpired);
+    }
+
+    pub(crate) async fn lookup_username(
+        &self,
+        username: String,
+    ) -> Result<Option<(String, i64)>, StoreBusy> {
+        self.ask(|reply| Command::Lookup { username, reply }).await
+    }
+
+    pub(crate) async fn load_kad_records(&self) -> Result<Vec<MirroredRecord>, StoreBusy> {
+        self.ask(|reply| Command::LoadMirror { reply }).await
+    }
+
+    pub(crate) async fn receipt_count(&self) -> Result<i64, StoreBusy> {
+        self.ask(|reply| Command::ReceiptCount { reply }).await
+    }
+
+    /// Finish every request queued so far, close the database and stop the
+    /// thread.
+    pub(crate) async fn close(&self) {
+        let _ = self.ask(|reply| Command::Close { reply }).await;
+    }
+
+    async fn ask<T>(
+        &self,
+        command: impl FnOnce(oneshot::Sender<T>) -> Command,
+    ) -> Result<T, StoreBusy> {
+        let (reply, rx) = oneshot::channel();
+        self.tx.send(command(reply)).await.map_err(|_| StoreBusy)?;
+        rx.await.map_err(|_| StoreBusy)
     }
 }
 
@@ -491,21 +820,53 @@ mod tests {
         assert!(rel.is_none());
     }
 
+    /// A record that expires at `expires_at` (Unix seconds), or never.
+    fn rec(key: &str, expires_at: Option<i64>) -> MirroredRecord {
+        MirroredRecord {
+            key: key.as_bytes().to_vec(),
+            value: b"v".to_vec(),
+            publisher: None,
+            expires_at,
+        }
+    }
+
+    fn keys(s: &RegistryStore, now: i64) -> Vec<String> {
+        let mut keys: Vec<String> = s
+            .load_kad_records(now)
+            .into_iter()
+            .map(|r| String::from_utf8(r.key).unwrap())
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    fn temp_dir() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("relay-test-{}", rand::random::<u64>()))
+    }
+
+    const NOW: i64 = 1_000_000;
+
     #[test]
     fn kad_record_mirror_round_trips() {
-        let (s, _, _) = store();
-        s.save_kad_record(b"k1", b"v1");
-        s.save_kad_record(b"k1", b"v2"); // upsert
-        s.save_kad_record(b"k2", b"v3");
-        let mut records = s.load_kad_records();
-        records.sort();
-        assert_eq!(
-            records,
-            vec![
-                (b"k1".to_vec(), b"v2".to_vec()),
-                (b"k2".to_vec(), b"v3".to_vec())
-            ]
-        );
+        let (mut s, _, _) = store();
+        let publisher = libp2p::PeerId::random().to_bytes();
+        let first = MirroredRecord {
+            key: b"k1".to_vec(),
+            value: b"v1".to_vec(),
+            publisher: Some(publisher.clone()),
+            expires_at: Some(NOW + 100),
+        };
+        let updated = MirroredRecord {
+            value: b"v2".to_vec(),
+            expires_at: Some(NOW + 200),
+            ..first.clone()
+        };
+        s.save_kad_record(&first, NOW);
+        s.save_kad_record(&updated, NOW); // upsert
+        s.save_kad_record(&rec("k2", None), NOW);
+        let mut records = s.load_kad_records(NOW);
+        records.sort_by(|a, b| a.key.cmp(&b.key));
+        assert_eq!(records, vec![updated, rec("k2", None)]);
     }
 
     #[test]
@@ -513,13 +874,154 @@ mod tests {
         // The record cap and value size are configuration; the mirror must
         // follow them, not the defaults.
         let (s, _, _) = store();
-        let s = s.with_kad_caps(2, 8);
-        s.save_kad_record(b"k1", b"v");
-        s.save_kad_record(b"k2", b"v");
-        s.save_kad_record(b"k3", b"v");
-        s.save_kad_record(b"big", &[0u8; 9]);
-        let mut keys: Vec<Vec<u8>> = s.load_kad_records().into_iter().map(|(k, _)| k).collect();
-        keys.sort();
-        assert_eq!(keys, vec![b"k2".to_vec(), b"k3".to_vec()]);
+        let mut s = s.with_kad_caps(2, 8);
+        s.save_kad_record(&rec("k1", None), NOW);
+        s.save_kad_record(&rec("k2", None), NOW);
+        s.save_kad_record(&rec("k3", None), NOW);
+        let mut big = rec("big", None);
+        big.value = vec![0u8; 9];
+        s.save_kad_record(&big, NOW);
+        assert_eq!(keys(&s, NOW), ["k2", "k3"]);
+    }
+
+    #[test]
+    fn eviction_takes_expired_then_soonest_expiring_then_oldest() {
+        let (s, _, _) = store();
+        let mut s = s.with_kad_caps(4, 64);
+        // Inserted oldest first. "early" is the oldest and expires latest,
+        // so insertion-order eviction would drop it first.
+        s.save_kad_record(&rec("early", Some(NOW + 900)), NOW);
+        s.save_kad_record(&rec("forever-a", None), NOW);
+        s.save_kad_record(&rec("soon", Some(NOW + 100)), NOW);
+        s.save_kad_record(&rec("lapsing", Some(NOW + 10)), NOW);
+        let later = NOW + 50; // "lapsing" has now expired
+
+        s.save_kad_record(&rec("forever-b", None), later);
+        assert_eq!(
+            keys(&s, NOW),
+            ["early", "forever-a", "forever-b", "soon"],
+            "the expired record goes first"
+        );
+
+        s.save_kad_record(&rec("forever-c", None), later);
+        assert_eq!(
+            keys(&s, later),
+            ["early", "forever-a", "forever-b", "forever-c"],
+            "then the soonest-expiring"
+        );
+
+        s.save_kad_record(&rec("forever-d", None), later);
+        assert_eq!(
+            keys(&s, later),
+            ["forever-a", "forever-b", "forever-c", "forever-d"],
+            "a record that never expires outlives one that does"
+        );
+
+        s.save_kad_record(&rec("forever-e", None), later);
+        assert_eq!(
+            keys(&s, later),
+            ["forever-b", "forever-c", "forever-d", "forever-e"],
+            "among records that never expire, the oldest goes"
+        );
+    }
+
+    #[test]
+    fn the_cached_count_follows_inserts_upserts_evictions_and_prunes() {
+        let dir = temp_dir();
+        let mut s = RegistryStore::open(&dir).unwrap().with_kad_caps(3, 64);
+        assert_eq!(s.mirror_count(), 0);
+        s.save_kad_record(&rec("a", Some(NOW + 10)), NOW);
+        s.save_kad_record(&rec("b", Some(NOW + 20)), NOW);
+        s.save_kad_record(&rec("a", Some(NOW + 30)), NOW); // upsert
+        assert_eq!(s.mirror_count(), 2);
+        s.save_kad_record(&rec("c", None), NOW);
+        s.save_kad_record(&rec("d", None), NOW); // evicts one
+        assert_eq!(s.mirror_count(), 3);
+        assert_eq!(s.prune_expired(NOW + 30), 1, "\"a\" lapsed at +30");
+        assert_eq!(s.mirror_count(), 2);
+        drop(s);
+
+        // Reopening counts the table once.
+        let s = RegistryStore::open(&dir).unwrap();
+        assert_eq!(s.mirror_count(), 2);
+        assert_eq!(keys(&s, NOW + 30), ["c", "d"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expired_rows_are_skipped_on_load_and_never_written() {
+        let (mut s, _, _) = store();
+        s.save_kad_record(&rec("live", Some(NOW + 60)), NOW);
+        s.save_kad_record(&rec("lapsing", Some(NOW + 5)), NOW);
+        s.save_kad_record(&rec("stale", Some(NOW - 1)), NOW);
+        assert_eq!(
+            s.mirror_count(),
+            2,
+            "an already-expired record is not written"
+        );
+        assert_eq!(keys(&s, NOW + 5), ["live"]);
+    }
+
+    #[test]
+    fn a_record_keeps_its_expiry_and_publisher_through_the_mirror() {
+        let publisher = libp2p::PeerId::random();
+        let record = kad::Record {
+            key: kad::RecordKey::new(&b"k"),
+            value: b"v".to_vec(),
+            publisher: Some(publisher),
+            expires: Some(Instant::now() + Duration::from_secs(3600)),
+        };
+        let back = MirroredRecord::from_kad(&record).unwrap().into_kad();
+        assert_eq!(back.key, record.key);
+        assert_eq!(back.publisher, Some(publisher));
+        let left = back
+            .expires
+            .unwrap()
+            .duration_since(Instant::now())
+            .as_secs();
+        assert!((3598..=3600).contains(&left), "{left}s left");
+
+        let expired = kad::Record {
+            expires: Some(Instant::now() - Duration::from_secs(1)),
+            ..record
+        };
+        assert!(MirroredRecord::from_kad(&expired).is_none());
+    }
+
+    #[test]
+    fn the_store_opens_in_wal_mode_with_normal_sync() {
+        let (s, _, _) = store();
+        let mode: String = s
+            .conn
+            .pragma_query_value(None, "journal_mode", |r| r.get(0))
+            .unwrap();
+        let sync: i64 = s
+            .conn
+            .pragma_query_value(None, "synchronous", |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        assert_eq!(sync, 1, "NORMAL");
+    }
+
+    #[test]
+    fn a_store_from_an_older_binary_is_recreated() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = Connection::open(dir.join("username_registry.db")).unwrap();
+        old.execute_batch(
+            "CREATE TABLE receipts (username TEXT PRIMARY KEY, did TEXT NOT NULL,
+                 claim_sig TEXT NOT NULL, received_at INTEGER NOT NULL,
+                 receipt_sig TEXT NOT NULL);
+             CREATE TABLE kad_records (key BLOB PRIMARY KEY, value BLOB NOT NULL);
+             INSERT INTO kad_records VALUES (x'6f6c64', x'00');",
+        )
+        .unwrap();
+        drop(old);
+
+        let mut s = RegistryStore::open(&dir).unwrap();
+        assert_eq!(s.mirror_count(), 0);
+        s.save_kad_record(&rec("new", Some(NOW + 1)), NOW);
+        assert_eq!(keys(&s, NOW), ["new"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

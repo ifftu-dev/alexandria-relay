@@ -20,7 +20,7 @@ use crate::addr::{client_bucket, truncate_ip};
 use crate::config::Limits;
 #[cfg(test)]
 use crate::config::{DEFAULT_LOOKUP_LIMIT, DEFAULT_LOOKUP_MAX_TRACKED};
-use crate::swarm::SharedStore;
+use crate::store::StoreHandle;
 
 // ── Metrics ──────────────────────────────────────────────────────────
 
@@ -231,7 +231,7 @@ fn validated_admin_token(raw: Option<&str>) -> Option<String> {
 pub(crate) async fn serve(
     listener: tokio::net::TcpListener,
     metrics: Arc<RwLock<RelayMetrics>>,
-    registry: Option<SharedStore>,
+    registry: Option<StoreHandle>,
     admin_token: Option<&str>,
     trusted_proxy_header: Option<HeaderName>,
     limits: &Limits,
@@ -310,9 +310,12 @@ pub(crate) async fn serve(
                             );
                         }
                         let name = name.trim().trim_start_matches('@').to_lowercase();
-                        let holder = registry.as_ref().and_then(|r| {
-                            r.lock().ok().and_then(|store| store.lookup_username(&name))
-                        });
+                        let holder = match &registry {
+                            Some(store) => {
+                                store.lookup_username(name.clone()).await.unwrap_or(None)
+                            }
+                            None => None,
+                        };
                         match holder {
                             Some((did, received_at)) => (
                                 axum::http::StatusCode::OK,

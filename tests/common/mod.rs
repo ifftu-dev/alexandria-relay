@@ -68,7 +68,8 @@ pub fn test_config(data_dir: &Path) -> RelayConfig {
 /// A relay running in-process for one test.
 pub struct TestRelay {
     handle: Option<RelayHandle>,
-    _data_dir: TempDir,
+    /// `None` when the caller owns the data directory ([`TestRelay::start_in`]).
+    _data_dir: Option<TempDir>,
 }
 
 impl TestRelay {
@@ -79,8 +80,16 @@ impl TestRelay {
 
     /// Start a relay with [`test_config`] adjusted by `configure`.
     pub async fn start_with(configure: impl FnOnce(&mut RelayConfig)) -> Self {
-        let _ = env_logger::builder().is_test(true).try_init();
         let data_dir = TempDir::new();
+        let mut relay = Self::start_in(&data_dir, configure).await;
+        relay._data_dir = Some(data_dir);
+        relay
+    }
+
+    /// Start a relay on a data directory the caller owns, so a second relay
+    /// can start from the same directory after this one stops.
+    pub async fn start_in(data_dir: &TempDir, configure: impl FnOnce(&mut RelayConfig)) -> Self {
+        let _ = env_logger::builder().is_test(true).try_init();
         let mut config = test_config(data_dir.path());
         configure(&mut config);
         let handle = tokio::time::timeout(STEP_TIMEOUT, start(config))
@@ -89,7 +98,7 @@ impl TestRelay {
             .expect("relay starts");
         TestRelay {
             handle: Some(handle),
-            _data_dir: data_dir,
+            _data_dir: None,
         }
     }
 
