@@ -1,6 +1,7 @@
 # Runtime configuration, module split and the black-box test seam
 
 Status: implemented
+Updated: 2026-11-13
 Triage: done
 Repos: alexandria-relay
 Part of: alexandria-relay/docs/relay-hardening-spec.md

@@ -168,6 +168,69 @@ async fn connections_past_the_http_limit_wait_for_a_free_slot() {
     relay.stop().await;
 }
 
+// ── Handshake bound ──────────────────────────────────────────────────
+
+/// Dial the relay at `relay_addr` (with its `/p2p` suffix) from a fresh
+/// swarm. `Ok` once a connection is established, `Err` with the dial error.
+async fn dial(relay_addr: &Multiaddr) -> Result<(), String> {
+    let mut swarm = SwarmBuilder::with_new_identity()
+        .with_tokio()
+        .with_tcp(
+            tcp::Config::default(),
+            noise::Config::new,
+            yamux::Config::default,
+        )
+        .expect("dialer TCP transport")
+        .with_behaviour(|_| libp2p::swarm::dummy::Behaviour)
+        .expect("dialer behaviour")
+        .build();
+    swarm.dial(relay_addr.clone()).map_err(|e| e.to_string())?;
+    let outcome = async {
+        loop {
+            match swarm.select_next_some().await {
+                SwarmEvent::ConnectionEstablished { .. } => return Ok(()),
+                SwarmEvent::OutgoingConnectionError { error, .. } => return Err(error.to_string()),
+                _ => {}
+            }
+        }
+    };
+    tokio::time::timeout(STEP_TIMEOUT, outcome)
+        .await
+        .expect("dial timed out")
+}
+
+#[tokio::test]
+async fn dials_are_refused_while_the_pending_incoming_cap_is_reached() {
+    // The established-connection limits only apply after the handshake, so
+    // without this cap half-open connections hold handshake state unbounded.
+    let relay = TestRelay::start_with(|c| c.limits.max_pending_incoming = 1).await;
+    let relay_addr = relay.tcp_addr();
+    let tcp_port = common::port_of(relay.handle().listen_addrs(), false).expect("TCP port");
+
+    // Take the only handshake slot with a socket that never negotiates.
+    let stalled = tokio::net::TcpStream::connect(("127.0.0.1", tcp_port))
+        .await
+        .expect("connect");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        dial(&relay_addr).await.is_err(),
+        "a dial completed while the pending-incoming cap was reached"
+    );
+
+    // Closing it frees the slot.
+    drop(stalled);
+    let deadline = Instant::now() + STEP_TIMEOUT;
+    while let Err(e) = dial(&relay_addr).await {
+        assert!(
+            Instant::now() < deadline,
+            "dials still refused after the slot was freed: {e}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    relay.stop().await;
+}
+
 // ── Routing-table admission ──────────────────────────────────────────
 
 /// A peer that connects to the relay and reports one external address

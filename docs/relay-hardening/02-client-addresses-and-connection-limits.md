@@ -1,6 +1,7 @@
 # Make per-address limits see clients and bound the handshake surface
 
 Status: implemented
+Updated: 2026-11-13
 Triage: done
 Repos: alexandria-relay
 Part of: alexandria-relay/docs/relay-hardening-spec.md
@@ -83,3 +84,13 @@ implement-spec workflow.
   limiters still key on the full address; they are not configurable and
   are listed as affected in the operations doc. The Fly configs do not
   enable the header flag; that is a deploy decision.
+
+- 2026-11-13, review fixes: the per-IP connection limiter, the receipt
+  limiter and the lookup limiter share one window counter
+  (`src/rate.rs`). The connection and receipt windows now end exactly
+  their length after they opened, as the lookup window already did; they
+  used to run until strictly past it. Not covered black-box: two IPv6
+  clients in one /64 sharing the connection-limiter budget would need two
+  addresses in one /64 on the test host, and loopback has only `::1`. The
+  bucketing stays unit-tested in `src/addr.rs`, and the lookup limiter's
+  /64 case is tested over HTTP.

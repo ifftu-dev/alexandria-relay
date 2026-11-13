@@ -6,10 +6,11 @@
 //! the in-memory Kademlia store can be refilled after a restart.
 //!
 //! [`RegistryStore`] is synchronous. The running relay never calls it from an
-//! async task: [`StoreHandle::spawn`] moves it onto a dedicated thread, and the
-//! event loop and HTTP handlers talk to that thread over a bounded channel.
+//! async task: [`StoreHandle::open`] opens it on a dedicated thread and keeps
+//! it there, and the event loop and HTTP handlers talk to that thread over a
+//! bounded channel.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use libp2p::identity::Keypair;
@@ -20,8 +21,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::config::{DEFAULT_KAD_MAX_RECORDS, DEFAULT_KAD_MAX_RECORD_BYTES};
 use crate::username_reg::{
-    canonical_receipt_bytes, countersign, release_valid, verify_claim, ReceiptResponse,
-    RelayReceipt, UsernameClaim, RELEASE_GRACE_SECS,
+    canonical_receipt_bytes, countersign, release_frees_at, release_valid, verify_claim,
+    ReceiptResponse, RelayReceipt, UsernameClaim,
 };
 
 /// Schema version, kept in SQLite's `user_version`. A database with any
@@ -205,11 +206,7 @@ impl RegistryStore {
         claim: &UsernameClaim,
     ) -> ReceiptResponse {
         if let Err(e) = verify_claim(claim) {
-            return ReceiptResponse::Refused {
-                reason: format!("invalid claim: {e}"),
-                existing_did: None,
-                existing_received_at: None,
-            };
+            return ReceiptResponse::refused(format!("invalid claim: {e}"));
         }
 
         let now = unix_now();
@@ -227,7 +224,7 @@ impl RegistryStore {
         if let Some((did, claim_sig, received_at, receipt_sig, released_at)) = existing {
             // A grace-elapsed release frees the row for new claimants.
             if let Some(rel) = released_at {
-                if did != claim.did && now >= rel + RELEASE_GRACE_SECS {
+                if did != claim.did && now >= release_frees_at(rel) {
                     let _ = self.conn.execute(
                         "DELETE FROM receipts WHERE username = ?1",
                         [&claim.username],
@@ -259,11 +256,7 @@ impl RegistryStore {
                 } else {
                     let bytes = canonical_receipt_bytes(&claim.sig, received_at, relay_peer_id);
                     let Some(sig) = countersign(keypair, &bytes) else {
-                        return ReceiptResponse::Refused {
-                            reason: "relay signing failed".to_string(),
-                            existing_did: None,
-                            existing_received_at: None,
-                        };
+                        return ReceiptResponse::refused("relay signing failed");
                     };
                     let _ = self.conn.execute(
                         "UPDATE receipts SET claim_sig = ?2, receipt_sig = ?3 WHERE username = ?1",
@@ -287,11 +280,7 @@ impl RegistryStore {
         let received_at = unix_now();
         let bytes = canonical_receipt_bytes(&claim.sig, received_at, relay_peer_id);
         let Some(sig) = countersign(keypair, &bytes) else {
-            return ReceiptResponse::Refused {
-                reason: "relay signing failed".to_string(),
-                existing_did: None,
-                existing_received_at: None,
-            };
+            return ReceiptResponse::refused("relay signing failed");
         };
 
         if let Err(e) = self.conn.execute(
@@ -299,11 +288,7 @@ impl RegistryStore {
              VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params![claim.username, claim.did, claim.sig, received_at, sig],
         ) {
-            return ReceiptResponse::Refused {
-                reason: format!("store error: {e}"),
-                existing_did: None,
-                existing_received_at: None,
-            };
+            return ReceiptResponse::refused(format!("store error: {e}"));
         }
 
         ReceiptResponse::Granted(RelayReceipt {
@@ -440,10 +425,12 @@ impl RegistryStore {
     }
 
     /// Current holder of a username (receipted claims only), for the
-    /// HTTP availability endpoint.
-    pub fn lookup_username(&self, username: &str) -> Option<(String, i64)> {
+    /// HTTP availability endpoint. `Ok(None)` means nobody holds it; a
+    /// failed query is an error, never a free name.
+    pub fn lookup_username(&self, username: &str) -> rusqlite::Result<Option<(String, i64)>> {
         let now = unix_now();
-        self.conn
+        let row = self
+            .conn
             .query_row(
                 "SELECT did, received_at, released_at FROM receipts WHERE username = ?1",
                 [username],
@@ -455,26 +442,27 @@ impl RegistryStore {
                     ))
                 },
             )
-            .ok()
+            .optional()?;
+        Ok(row
             .filter(|(_, _, rel)| match rel {
-                Some(rel_at) => now < rel_at + RELEASE_GRACE_SECS,
+                Some(rel_at) => now < release_frees_at(*rel_at),
                 None => true,
             })
-            .map(|(did, received_at, _)| (did, received_at))
+            .map(|(did, received_at, _)| (did, received_at)))
     }
 }
 
 // ── Store actor ──────────────────────────────────────────────────────
 
 /// What the store thread can be asked to do.
-enum Command {
+enum StoreRequest {
     Receipt {
         claim: Box<UsernameClaim>,
         reply: oneshot::Sender<ReceiptResponse>,
     },
     Lookup {
         username: String,
-        reply: oneshot::Sender<Option<(String, i64)>>,
+        reply: oneshot::Sender<rusqlite::Result<Option<(String, i64)>>>,
     },
     Mirror(MirroredRecord),
     LoadMirror {
@@ -489,57 +477,100 @@ enum Command {
     },
 }
 
-/// The store queue was full or the store thread has stopped.
-#[derive(Debug)]
-pub(crate) struct StoreBusy;
+/// Why the store could not answer a request.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum StoreError {
+    /// The queue was full; the request was not taken.
+    #[error("the store queue is full")]
+    Busy,
+    /// The store thread has stopped, or never started.
+    #[error("the store is not running")]
+    Stopped,
+    /// The store took the request and the query failed.
+    #[error("store query failed: {0}")]
+    Query(#[source] rusqlite::Error),
+    /// The store could not be opened.
+    #[error("{0}")]
+    Open(String),
+}
+
+/// The store thread's loop: answer each request in arrival order until
+/// told to close or every handle is gone.
+fn serve(mut store: RegistryStore, keypair: &Keypair, mut rx: mpsc::Receiver<StoreRequest>) {
+    let relay_peer_id = keypair.public().to_peer_id().to_string();
+    while let Some(request) = rx.blocking_recv() {
+        match request {
+            StoreRequest::Receipt { claim, reply } => {
+                let _ = reply.send(store.handle_receipt(keypair, &relay_peer_id, &claim));
+            }
+            StoreRequest::Lookup { username, reply } => {
+                let _ = reply.send(store.lookup_username(&username));
+            }
+            StoreRequest::Mirror(record) => store.save_kad_record(&record, unix_now()),
+            StoreRequest::LoadMirror { reply } => {
+                let _ = reply.send(store.load_kad_records(unix_now()));
+            }
+            StoreRequest::PruneExpired => {
+                let n = store.prune_expired(unix_now());
+                if n > 0 {
+                    log::debug!("Pruned {n} expired DHT records from the mirror");
+                }
+            }
+            StoreRequest::ReceiptCount { reply } => {
+                let _ = reply.send(store.receipt_count());
+            }
+            StoreRequest::Close { reply } => {
+                drop(store);
+                let _ = reply.send(());
+                return;
+            }
+        }
+    }
+}
 
 /// A cheap, cloneable handle to the store thread. Every SQLite call runs on
 /// that thread, in the order requests arrive.
 #[derive(Clone)]
 pub(crate) struct StoreHandle {
-    tx: mpsc::Sender<Command>,
+    tx: mpsc::Sender<StoreRequest>,
 }
 
 impl StoreHandle {
-    /// Move `store` onto a dedicated thread. `keypair` countersigns
-    /// receipts there. The thread stops on [`StoreHandle::close`] or when
-    /// every handle is dropped.
-    pub(crate) fn spawn(mut store: RegistryStore, keypair: Keypair) -> std::io::Result<Self> {
-        let (tx, mut rx) = mpsc::channel(QUEUE_CAPACITY);
-        let relay_peer_id = keypair.public().to_peer_id().to_string();
+    /// Open the store under `data_dir` on a dedicated thread, its mirror
+    /// capped at `max_records` records of at most `max_value_bytes`, and
+    /// return a handle once it is open. Opening (creating the directory,
+    /// switching to WAL, checking the schema) runs on that thread too, so a
+    /// slow or locked database never holds up a runtime worker. `keypair`
+    /// countersigns receipts there. The thread stops on
+    /// [`StoreHandle::close`] or when every handle is dropped.
+    pub(crate) async fn open(
+        data_dir: PathBuf,
+        max_records: usize,
+        max_value_bytes: usize,
+        keypair: Keypair,
+    ) -> Result<Self, StoreError> {
+        let (tx, rx) = mpsc::channel(QUEUE_CAPACITY);
+        let (opened_tx, opened_rx) = oneshot::channel();
         std::thread::Builder::new()
             .name("relay-store".to_string())
-            .spawn(move || {
-                while let Some(command) = rx.blocking_recv() {
-                    match command {
-                        Command::Receipt { claim, reply } => {
-                            let _ =
-                                reply.send(store.handle_receipt(&keypair, &relay_peer_id, &claim));
-                        }
-                        Command::Lookup { username, reply } => {
-                            let _ = reply.send(store.lookup_username(&username));
-                        }
-                        Command::Mirror(record) => store.save_kad_record(&record, unix_now()),
-                        Command::LoadMirror { reply } => {
-                            let _ = reply.send(store.load_kad_records(unix_now()));
-                        }
-                        Command::PruneExpired => {
-                            let n = store.prune_expired(unix_now());
-                            if n > 0 {
-                                log::debug!("Pruned {n} expired DHT records from the mirror");
-                            }
-                        }
-                        Command::ReceiptCount { reply } => {
-                            let _ = reply.send(store.receipt_count());
-                        }
-                        Command::Close { reply } => {
-                            drop(store);
-                            let _ = reply.send(());
-                            return;
-                        }
-                    }
+            .spawn(move || match RegistryStore::open(&data_dir) {
+                Ok(store) => {
+                    let _ = opened_tx.send(Ok(()));
+                    serve(
+                        store.with_kad_caps(max_records, max_value_bytes),
+                        &keypair,
+                        rx,
+                    );
                 }
-            })?;
+                Err(e) => {
+                    let _ = opened_tx.send(Err(e));
+                }
+            })
+            .map_err(|e| StoreError::Open(format!("spawn store thread: {e}")))?;
+        opened_rx
+            .await
+            .map_err(|_| StoreError::Stopped)?
+            .map_err(StoreError::Open)?;
         Ok(StoreHandle { tx })
     }
 
@@ -548,56 +579,64 @@ impl StoreHandle {
     pub(crate) fn request_receipt(
         &self,
         claim: UsernameClaim,
-    ) -> Result<oneshot::Receiver<ReceiptResponse>, StoreBusy> {
+    ) -> Result<oneshot::Receiver<ReceiptResponse>, StoreError> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .try_send(Command::Receipt {
+            .try_send(StoreRequest::Receipt {
                 claim: Box::new(claim),
                 reply,
             })
-            .map_err(|_| StoreBusy)?;
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => StoreError::Busy,
+                mpsc::error::TrySendError::Closed(_) => StoreError::Stopped,
+            })?;
         Ok(rx)
     }
 
     /// Queue a record for the mirror without waiting. `false` if the queue
     /// was full and the write was dropped.
     pub(crate) fn mirror(&self, record: MirroredRecord) -> bool {
-        self.tx.try_send(Command::Mirror(record)).is_ok()
+        self.tx.try_send(StoreRequest::Mirror(record)).is_ok()
     }
 
     /// Queue a prune of expired mirror rows without waiting.
     pub(crate) fn prune_expired(&self) {
-        let _ = self.tx.try_send(Command::PruneExpired);
+        let _ = self.tx.try_send(StoreRequest::PruneExpired);
     }
 
     pub(crate) async fn lookup_username(
         &self,
         username: String,
-    ) -> Result<Option<(String, i64)>, StoreBusy> {
-        self.ask(|reply| Command::Lookup { username, reply }).await
+    ) -> Result<Option<(String, i64)>, StoreError> {
+        self.ask(|reply| StoreRequest::Lookup { username, reply })
+            .await?
+            .map_err(StoreError::Query)
     }
 
-    pub(crate) async fn load_kad_records(&self) -> Result<Vec<MirroredRecord>, StoreBusy> {
-        self.ask(|reply| Command::LoadMirror { reply }).await
+    pub(crate) async fn load_kad_records(&self) -> Result<Vec<MirroredRecord>, StoreError> {
+        self.ask(|reply| StoreRequest::LoadMirror { reply }).await
     }
 
-    pub(crate) async fn receipt_count(&self) -> Result<i64, StoreBusy> {
-        self.ask(|reply| Command::ReceiptCount { reply }).await
+    pub(crate) async fn receipt_count(&self) -> Result<i64, StoreError> {
+        self.ask(|reply| StoreRequest::ReceiptCount { reply }).await
     }
 
     /// Finish every request queued so far, close the database and stop the
     /// thread.
     pub(crate) async fn close(&self) {
-        let _ = self.ask(|reply| Command::Close { reply }).await;
+        let _ = self.ask(|reply| StoreRequest::Close { reply }).await;
     }
 
     async fn ask<T>(
         &self,
-        command: impl FnOnce(oneshot::Sender<T>) -> Command,
-    ) -> Result<T, StoreBusy> {
+        request: impl FnOnce(oneshot::Sender<T>) -> StoreRequest,
+    ) -> Result<T, StoreError> {
         let (reply, rx) = oneshot::channel();
-        self.tx.send(command(reply)).await.map_err(|_| StoreBusy)?;
-        rx.await.map_err(|_| StoreBusy)
+        self.tx
+            .send(request(reply))
+            .await
+            .map_err(|_| StoreError::Stopped)?;
+        rx.await.map_err(|_| StoreError::Stopped)
     }
 }
 
@@ -767,16 +806,59 @@ mod tests {
         ));
         // Grace elapsed (released_at=0) → lookup hides it, and a new
         // DID can claim the name.
-        assert!(s.lookup_username("ada_99").is_none());
+        assert!(s.lookup_username("ada_99").unwrap().is_none());
         let newcomer = make_claim(2, "ada_99", 2000);
         match s.handle_receipt(&kp, &pid, &newcomer) {
             ReceiptResponse::Granted(_) => {}
             other => panic!("expected Granted for newcomer, got {other:?}"),
         }
         assert_eq!(
-            s.lookup_username("ada_99").map(|(did, _)| did),
+            s.lookup_username("ada_99").unwrap().map(|(did, _)| did),
             Some(newcomer.did)
         );
+    }
+
+    #[test]
+    fn a_release_dated_near_the_end_of_time_never_frees_the_name() {
+        // `released_at` is whatever the owner signed. Adding the grace
+        // window to a value near i64::MAX must not overflow: in a debug
+        // build that panics the store thread, and in a release build it
+        // wraps negative and frees the name at once.
+        let (mut s, kp, pid) = store();
+        let key1 = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+        let mut claim = make_claim(1, "ada_99", 1000);
+        assert!(matches!(
+            s.handle_receipt(&kp, &pid, &claim),
+            ReceiptResponse::Granted(_)
+        ));
+        let rel_at = i64::MAX - 10;
+        let sig = key1.sign(&canonical_release_bytes(
+            &claim.username,
+            &claim.did,
+            rel_at,
+        ));
+        claim.release = Some(Release {
+            released_at: rel_at,
+            sig: hex::encode(sig.to_bytes()),
+        });
+        assert!(matches!(
+            s.handle_receipt(&kp, &pid, &claim),
+            ReceiptResponse::Granted(_)
+        ));
+
+        assert!(s.lookup_username("ada_99").unwrap().is_some());
+        let other = make_claim(2, "ada_99", 2000);
+        assert!(matches!(
+            s.handle_receipt(&kp, &pid, &other),
+            ReceiptResponse::Refused { .. }
+        ));
+    }
+
+    #[test]
+    fn a_lookup_that_fails_is_an_error_not_a_free_name() {
+        let (s, _, _) = store();
+        s.conn.execute_batch("DROP TABLE receipts").unwrap();
+        assert!(s.lookup_username("ada_99").is_err());
     }
 
     #[test]
@@ -800,7 +882,7 @@ mod tests {
         });
         let _ = s.handle_receipt(&kp, &pid, &claim);
         // Still within grace: visible, and another DID is refused.
-        assert!(s.lookup_username("ada_99").is_some());
+        assert!(s.lookup_username("ada_99").unwrap().is_some());
         let other = make_claim(2, "ada_99", 2000);
         assert!(matches!(
             s.handle_receipt(&kp, &pid, &other),

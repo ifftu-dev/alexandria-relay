@@ -1,6 +1,7 @@
 # Publish images and binaries on every tag
 
 Status: implemented
+Updated: 2026-11-13
 Triage: done
 Repos: alexandria-relay
 Part of: alexandria-relay/docs/relay-hardening-spec.md
@@ -101,3 +102,15 @@ by the invoked implement-spec workflow.
     deploy, which makes the dry run safe. The image now runs the musl
     build. Follow-ups: watch CPU on Fly and consider mimalloc if musl's
     allocator shows; add build attestations.
+
+### Pending maintainer verification
+
+- 2026-11-13: two acceptance items need a real tag run and what it
+  publishes:
+  - a pre-release tag (or a manual run) publishes an image whose smoke
+    step runs `--generate-key` on both amd64 and arm64;
+  - the tag creates a release holding `alexandria-relay-linux-amd64`,
+    `alexandria-relay-linux-arm64` and `SHA256SUMS`.
+
+  The pull-request items (check, clippy, fmt, test, audit, deny and Docker
+  Build) are shown by the next pull request's CI run.

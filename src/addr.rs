@@ -15,6 +15,19 @@ pub(crate) fn extract_ip(addr: &Multiaddr) -> Option<IpAddr> {
     })
 }
 
+/// The TCP and QUIC addresses of `ip`: `/ip*/<ip>/tcp/<tcp_port>` and
+/// `/ip*/<ip>/udp/<quic_port>/quic-v1`.
+pub(crate) fn tcp_and_quic(ip: IpAddr, tcp_port: u16, quic_port: u16) -> [Multiaddr; 2] {
+    let base = Multiaddr::empty().with(match ip {
+        IpAddr::V4(v4) => Protocol::Ip4(v4),
+        IpAddr::V6(v6) => Protocol::Ip6(v6),
+    });
+    [
+        base.clone().with(Protocol::Tcp(tcp_port)),
+        base.with(Protocol::Udp(quic_port)).with(Protocol::QuicV1),
+    ]
+}
+
 /// The key every per-client limit and record uses for `ip`: the full IPv4
 /// address, or the /64 an IPv6 address sits in.
 ///
@@ -54,6 +67,15 @@ pub(crate) fn truncate_ip(ip: &IpAddr) -> String {
 /// Returns `true` if the multiaddr starts with a globally routable IP.
 /// Rejects loopback, private (RFC 1918 / RFC 4193), link-local, and
 /// unspecified addresses to prevent Kademlia routing table pollution.
+///
+/// Deliberately separate from the profile's fallback-IP check
+/// (`profile::is_public_ip`). That one copies the app's profile validation
+/// rule for rule, so a profile the app refuses is refused here too, and it
+/// changes only when the app's does. This one is the relay's own filter on
+/// what peers report about themselves: it also passes DNS forms, and it
+/// does not refuse the documentation and benchmarking ranges, which only a
+/// profile author could mistype and which no peer gains anything by
+/// reporting.
 pub(crate) fn is_globally_routable(addr: &Multiaddr) -> bool {
     match addr.iter().next() {
         Some(Protocol::Ip4(ip)) => {

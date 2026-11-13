@@ -26,6 +26,13 @@ pub const PROTOCOL: &str = "/alexandria/username-reg/1.0";
 /// app's `RELEASE_GRACE_SECS`).
 pub const RELEASE_GRACE_SECS: i64 = 30 * 24 * 3600;
 
+/// When a name released at `released_at` frees up. The release time is
+/// owner-signed and unchecked, so the sum saturates: a release dated near
+/// the end of time keeps the name held rather than wrapping into the past.
+pub(crate) fn release_frees_at(released_at: i64) -> i64 {
+    released_at.saturating_add(RELEASE_GRACE_SECS)
+}
+
 // ── Wire types (mirror the main app's domain::username_claim) ──────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -76,6 +83,17 @@ pub enum ReceiptResponse {
         existing_did: Option<String>,
         existing_received_at: Option<i64>,
     },
+}
+
+impl ReceiptResponse {
+    /// A refusal that names no existing holder.
+    pub fn refused(reason: impl Into<String>) -> Self {
+        ReceiptResponse::Refused {
+            reason: reason.into(),
+            existing_did: None,
+            existing_received_at: None,
+        }
+    }
 }
 
 // ── Claim verification (did:key → ed25519) ─────────────────────────

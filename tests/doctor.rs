@@ -79,6 +79,20 @@ fn doctor_fails_without_an_external_host() {
 }
 
 #[test]
+fn doctor_fails_when_the_advertised_address_resolves_but_nothing_answers() {
+    // `::1` resolves without a lookup, and nothing listens there: the relay
+    // binds IPv4 loopback only. Its IPv6 forms are dialled and refused,
+    // which proves the doctor dials rather than stopping at resolution.
+    let dir = TempDir::new();
+    let output = doctor(&dir, &["--public-host", "::1"], None);
+    let summary = stdout(&output);
+    assert!(!output.status.success(), "{summary}");
+    assert!(summary.contains("FAIL  /ip6/::1/tcp/"), "{summary}");
+    assert!(summary.contains("Reachable on 0 of"), "{summary}");
+    assert!(summary.contains("Result: NOT reachable"), "{summary}");
+}
+
+#[test]
 fn doctor_fails_when_no_advertised_address_answers() {
     // `invalid.` never resolves (RFC 6761), so nothing advertised is
     // reachable.

@@ -204,13 +204,15 @@ async fn an_expired_mirrored_record_is_absent_after_a_restart() {
     relay.stop().await;
 }
 
-/// How long one lookup may take while the store is busy. Generous for a
-/// debug build on a loaded CI runner; a lookup stuck behind the event loop
-/// or a lock takes far longer, or times out.
-const BUSY_LOOKUP_BOUND: Duration = Duration::from_secs(1);
+/// How long one request may take while the store is busy or stalled.
+/// Generous for a debug build on a loaded CI runner; a request stuck behind
+/// the event loop or a lock takes far longer, or times out.
+const BUSY_BOUND: Duration = Duration::from_secs(1);
 
-// One runtime thread for relay, client and lookups alike: the one-vCPU case,
-// where any store work done on the runtime delays every other task.
+// One runtime thread for relay, client and lookups alike: the one-vCPU case.
+// This guards lookup latency under load; on a machine where SQLite writes are
+// cheap it passes even with the store on the runtime. The next test is the
+// one that catches store work on the runtime thread.
 #[tokio::test]
 async fn lookups_answer_while_a_burst_of_dht_puts_is_in_flight() {
     // Lift the lookup budget: this test is about the store, not the limiter.
@@ -245,8 +247,122 @@ async fn lookups_answer_while_a_burst_of_dht_puts_is_in_flight() {
         .expect("burst task");
     assert!(acked > 0, "the burst reached the relay");
     assert!(
-        slowest < BUSY_LOOKUP_BOUND,
+        slowest < BUSY_BOUND,
         "slowest of {lookups} lookups took {slowest:?}"
     );
+    relay.stop().await;
+}
+
+// One runtime thread for relay, client and HTTP alike, so a store call made
+// on it would stop everything for as long as the call blocks.
+#[tokio::test]
+async fn the_relay_keeps_serving_while_the_store_is_stalled() {
+    let data_dir = TempDir::new();
+    let relay = TestRelay::start_in(&data_dir, |_| {}).await;
+    let relay_addr = relay.tcp_addr();
+    // Another writer holds the database: every store write now waits out
+    // the busy timeout, seconds, before it gives up.
+    let locker = rusqlite::Connection::open(data_dir.path().join("username_registry.db")).unwrap();
+    locker.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+    let mut publisher = DhtClient::new();
+    let records: Vec<Record> = (0..5)
+        .map(|i| {
+            publisher.record(
+                format!("stalled/{i}").as_bytes(),
+                b"v",
+                Duration::from_secs(3600),
+            )
+        })
+        .collect();
+    let started = Instant::now();
+    let puts = tokio::spawn(async move {
+        let acked = publisher.put_all(&relay_addr, records).await;
+        (acked, started.elapsed())
+    });
+
+    let mut checks = 0;
+    let mut slowest = Duration::ZERO;
+    while !puts.is_finished() || checks < 5 {
+        let asked = Instant::now();
+        let (status, _) = relay.get("/health", None).await;
+        slowest = slowest.max(asked.elapsed());
+        assert_eq!(status, 200);
+        checks += 1;
+    }
+    let (acked, puts_took) = puts.await.expect("puts task");
+    drop(locker);
+
+    assert_eq!(acked, 5, "every put was acknowledged");
+    assert!(
+        puts_took < BUSY_BOUND,
+        "the puts took {puts_took:?} while the store was stalled"
+    );
+    assert!(
+        slowest < BUSY_BOUND,
+        "slowest of {checks} health checks took {slowest:?} while the store was stalled"
+    );
+    relay.stop().await;
+}
+
+// One runtime thread for the relay and the ticker alike.
+#[tokio::test]
+async fn opening_a_locked_store_does_not_stall_the_runtime() {
+    // A database another process holds under an exclusive lock: opening it
+    // waits out the store's busy timeout, seconds, then gives up.
+    let data_dir = TempDir::new();
+    let locker = rusqlite::Connection::open(data_dir.path().join("username_registry.db")).unwrap();
+    locker
+        .execute_batch("CREATE TABLE held (x); BEGIN EXCLUSIVE; INSERT INTO held VALUES (1);")
+        .unwrap();
+
+    // If the store opened on the runtime thread, this ticker would stop for
+    // the whole wait.
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ticker = tokio::spawn({
+        let done = done.clone();
+        async move {
+            let mut worst = Duration::ZERO;
+            let mut last = Instant::now();
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                worst = worst.max(last.elapsed());
+                last = Instant::now();
+            }
+            worst
+        }
+    });
+    // Let the ticker take its first reading before the relay starts.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let relay = TestRelay::start_in(&data_dir, |_| {}).await;
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    let worst = ticker.await.expect("ticker task");
+    assert!(
+        worst < Duration::from_secs(1),
+        "the runtime stalled for {worst:?} while the store opened"
+    );
+    // The relay came up without its store and says so rather than guessing.
+    let (status, _) = relay.get("/username/ada_99", None).await;
+    assert_eq!(status, 503);
+
+    relay.stop().await;
+    drop(locker);
+}
+
+#[tokio::test]
+async fn a_lookup_the_store_cannot_answer_does_not_report_the_name_free() {
+    // A regular file where the data directory should be: the store cannot
+    // open, and the relay runs without receipts. Not knowing who holds a
+    // name must not read as "nobody does".
+    let dir = TempDir::new();
+    let not_a_dir = dir.path().join("occupied");
+    std::fs::write(&not_a_dir, b"not a directory").unwrap();
+    let relay = TestRelay::start_with(|c| c.data_dir = not_a_dir).await;
+
+    let (status, body) = relay.get("/username/ada_99", None).await;
+    assert_eq!(status, 503, "{body}");
+    assert!(!body.contains("\"available\""), "{body}");
+
     relay.stop().await;
 }

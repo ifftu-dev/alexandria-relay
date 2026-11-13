@@ -10,6 +10,7 @@ use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
 use libp2p::core::transport::ListenerId;
+use libp2p::core::ConnectedPoint;
 use libp2p::identity::Keypair;
 use libp2p::kad::store::MemoryStore;
 use libp2p::multiaddr::Protocol;
@@ -19,17 +20,45 @@ use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{identify, kad, noise, relay, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder};
 use tokio::sync::{mpsc, watch, RwLock};
 
-use crate::addr::{client_bucket, extract_ip, is_globally_routable};
+use crate::addr::{client_bucket, extract_ip, is_globally_routable, tcp_and_quic};
 use crate::config::{Limits, RelayConfig, USERNAME_REQUEST_MAX_BYTES};
 use crate::http::RelayMetrics;
 use crate::mesh::{self, Mesh, Resolved};
 use crate::profile::NetworkProfile;
+use crate::rate::RateWindows;
 use crate::store::{MirroredRecord, StoreHandle, MIRROR_PRUNE_INTERVAL};
 use crate::username_reg::{self, ReceiptRequest, ReceiptResponse};
 use crate::StartError;
 
 /// How long startup waits for the IPv4 listeners to report their addresses.
 const LISTEN_TIMEOUT: Duration = Duration::from_secs(10);
+
+// ── Per-event logging ────────────────────────────────────────────────
+
+/// The level of every per-event line: one per connection, Identify,
+/// reservation, circuit, receipt request or Kademlia request. These grow
+/// with traffic, so they stay below the default `info` filter; the counters
+/// and the periodic health line carry their totals.
+const EVENT_LEVEL: log::Level = log::Level::Debug;
+
+/// Targets of the per-event lines, one per kind, all under
+/// `alexandria_relay::event`: `RUST_LOG=alexandria_relay::event=debug` turns
+/// every one on, `RUST_LOG=alexandria_relay::event::receipt=debug` one kind.
+mod event_target {
+    pub(super) const CONNECTION: &str = "alexandria_relay::event::connection";
+    pub(super) const IDENTIFY: &str = "alexandria_relay::event::identify";
+    pub(super) const RESERVATION: &str = "alexandria_relay::event::reservation";
+    pub(super) const CIRCUIT: &str = "alexandria_relay::event::circuit";
+    pub(super) const RECEIPT: &str = "alexandria_relay::event::receipt";
+    pub(super) const KAD: &str = "alexandria_relay::event::kad";
+}
+
+/// Log a per-event line on `target` at [`EVENT_LEVEL`].
+macro_rules! event {
+    ($target:expr, $($arg:tt)+) => {
+        log::log!(target: $target, EVENT_LEVEL, $($arg)+)
+    };
+}
 
 type RelaySwarm = libp2p::Swarm<RelayBehaviour>;
 
@@ -148,8 +177,8 @@ pub(crate) async fn start_swarm(
         start_time: Instant::now(),
         total_connections_served: 0,
         ip_active_connections: HashMap::new(),
-        ip_rate_windows: HashMap::new(),
-        username_rate_windows: HashMap::new(),
+        ip_rate_windows: RateWindows::new(config.limits.ip_rate_window),
+        username_rate_windows: RateWindows::new(config.limits.receipt_window),
         pending_receipts: FuturesUnordered::new(),
         health_baseline: HealthCounts::default(),
     };
@@ -185,15 +214,7 @@ pub(crate) async fn start_swarm(
         match tokio::net::lookup_host(format!("{host}:{tcp_port}")).await {
             Ok(addrs) => {
                 for sa in addrs {
-                    let ip = match sa.ip() {
-                        IpAddr::V4(v4) => Protocol::Ip4(v4),
-                        IpAddr::V6(v6) => Protocol::Ip6(v6),
-                    };
-                    let base = Multiaddr::empty().with(ip);
-                    for addr in [
-                        base.clone().with(Protocol::Tcp(tcp_port)),
-                        base.with(Protocol::Udp(quic_port)).with(Protocol::QuicV1),
-                    ] {
+                    for addr in tcp_and_quic(sa.ip(), tcp_port, quic_port) {
                         external_registered.push(addr.clone());
                         event_loop.swarm.add_external_address(addr);
                     }
@@ -285,12 +306,12 @@ pub(crate) struct EventLoop {
     total_connections_served: u64,
     /// IP-level rate limiting state.
     ip_active_connections: HashMap<IpAddr, usize>,
-    ip_rate_windows: HashMap<IpAddr, (usize, Instant)>,
+    ip_rate_windows: RateWindows<IpAddr>,
     /// Per-peer rate limiting for username-receipt requests. Keyed by PeerId
     /// rather than IP because the claim is bound to a DID, not to a network
     /// location, and the connection-level IP limiter already covers the
     /// network side.
-    username_rate_windows: HashMap<PeerId, (usize, Instant)>,
+    username_rate_windows: RateWindows<PeerId>,
     /// Receipt requests the store thread is still answering, each paired
     /// with the channel its response goes back on.
     pending_receipts: FuturesUnordered<PendingReceipt>,
@@ -386,15 +407,24 @@ impl EventLoop {
     /// Run until `shutdown` fires (or its sender is dropped).
     pub(crate) async fn run(mut self, mut shutdown: watch::Receiver<bool>) {
         let mut health_interval = tokio::time::interval(self.limits.health_log_interval);
-        health_interval.tick().await; // consume immediate tick
-                                      // The first tick fires at once: prune whatever expired while the
-                                      // relay was down.
+        // Consume the immediate tick: the first health line comes one
+        // interval in.
+        health_interval.tick().await;
+        // The first tick fires at once: prune whatever expired while the
+        // relay was down.
         let mut prune_interval = tokio::time::interval(MIRROR_PRUNE_INTERVAL);
 
         // Both fire immediately: the first lookups are the startup dials.
         let mut redial_interval = tokio::time::interval(mesh::REDIAL_CHECK_INTERVAL);
         let mut bootstrap_interval = tokio::time::interval(mesh::BOOTSTRAP_INTERVAL);
         let meshed = self.mesh.is_some();
+
+        // Announce at once, whatever the mesh looks like: a relay alone in
+        // its profile, or whose peers are all down, still holds its own
+        // provider record and serves it to the app nodes that reach it.
+        // Kademlia republishes it on its provider-record interval from here
+        // on, and joining the mesh announces again to reach the new peers.
+        self.announce();
 
         loop {
             tokio::select! {
@@ -464,12 +494,10 @@ impl EventLoop {
 
         // Prune stale rate window entries
         let now = Instant::now();
-        let ip_window = self.limits.ip_rate_window;
-        let receipt_window = self.limits.receipt_window;
         self.ip_rate_windows
-            .retain(|_, (_, started)| now.duration_since(*started) < ip_window * 2);
+            .forget_older_than(now, self.limits.ip_rate_window * 2);
         self.username_rate_windows
-            .retain(|_, (_, started)| now.duration_since(*started) < receipt_window * 2);
+            .forget_older_than(now, self.limits.receipt_window * 2);
     }
 
     /// A lookup of profile relay `peer` finished: dial it unless it is
@@ -550,347 +578,38 @@ impl EventLoop {
     }
 
     async fn on_event(&mut self, event: SwarmEvent<RelayBehaviourEvent>) {
-        let local_peer_id = self.local_peer_id;
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
-                log::info!("Listening on {address}/p2p/{local_peer_id}");
+                log::info!("Listening on {address}/p2p/{}", self.local_peer_id);
             }
-
-            // ── Connection Management ────────────────────────
             SwarmEvent::ConnectionEstablished {
-                peer_id: pid,
-                endpoint,
-                ..
-            } => {
-                self.total_connections_served += 1;
-                let remote_addr = endpoint.get_remote_address();
-                log::debug!(
-                    "CONNECT peer:{pid} endpoint:{remote_addr} total_served:{}",
-                    self.total_connections_served
-                );
-
-                // Record the peer's client bucket so /peers can publish its
-                // truncated prefix. Captured on every Established and
-                // overwritten on reconnect — last-known address wins.
-                let bucket = extract_ip(remote_addr).map(client_bucket);
-                {
-                    let connections = self.swarm.connected_peers().count();
-                    let mut m = self.metrics.write().await;
-                    m.connections = connections;
-                    m.total_connections_served = self.total_connections_served;
-                    if let Some(ip) = bucket {
-                        m.peer_source_ips.insert(pid, ip);
-                    }
-                }
-
-                // IP-level rate limiting, keyed on the client bucket so one
-                // IPv6 subscriber cannot rotate through its /64.
-                if let Some(ip) = bucket {
-                    let active = self.ip_active_connections.entry(ip).or_insert(0);
-                    *active += 1;
-
-                    let (attempts, window_start) = self
-                        .ip_rate_windows
-                        .entry(ip)
-                        .or_insert((0, Instant::now()));
-                    if window_start.elapsed() > self.limits.ip_rate_window {
-                        *attempts = 0;
-                        *window_start = Instant::now();
-                    }
-                    *attempts += 1;
-
-                    if *active > self.limits.max_connections_per_ip
-                        || *attempts > self.limits.max_new_connections_per_ip
-                    {
-                        log::warn!(
-                            "IP rate limit exceeded for {ip} (active:{active}, attempts:{attempts}), \
-                             disconnecting {pid}"
-                        );
-                        let _ = self.swarm.disconnect_peer_id(pid);
-                        let mut m = self.metrics.write().await;
-                        m.ip_rate_limited += 1;
-                    }
-                }
-
-                // The remote address is deliberately not added to the
-                // routing table: for an inbound connection it is the peer's
-                // ephemeral source port, often a NAT mapping, which other
-                // peers cannot dial. The peer enters the table from its
-                // Identify-reported addresses (see the Identify arm).
-
-                if self.mesh.as_ref().is_some_and(|m| m.is_member(&pid)) {
-                    let dialed = endpoint.is_dialer().then(|| remote_addr.clone());
-                    self.on_mesh_connected(pid, dialed).await;
-                }
-            }
+                peer_id, endpoint, ..
+            } => self.on_connection_established(peer_id, &endpoint).await,
             SwarmEvent::ConnectionClosed {
-                peer_id: pid,
+                peer_id,
                 num_established,
                 endpoint,
                 ..
             } => {
-                // Decrement IP active connection count
-                if let Some(ip) = extract_ip(endpoint.get_remote_address()).map(client_bucket) {
-                    if let Some(active) = self.ip_active_connections.get_mut(&ip) {
-                        *active = active.saturating_sub(1);
-                        if *active == 0 {
-                            self.ip_active_connections.remove(&ip);
-                        }
-                    }
-                }
-
-                // When the peer has zero remaining connections,
-                // forget the peer's WAN IP and reservation flag.
-                // (libp2p delivers `num_established` post-decrement.)
-                if num_established == 0 {
-                    let connections = self.swarm.connected_peers().count();
-                    let mut m = self.metrics.write().await;
-                    m.connections = connections;
-                    m.peer_source_ips.remove(&pid);
-                    m.peers_with_reservation.remove(&pid);
-                    if let Some(mesh) = self.mesh.as_mut().filter(|m| m.is_member(&pid)) {
-                        mesh.on_unreachable(&pid);
-                        m.reachable_relays = mesh.reachable();
-                        log::info!("MESH lost profile relay {pid}; redialling with backoff");
-                    }
-                }
-
-                log::debug!("DISCONNECT peer:{pid} remaining_for_peer:{num_established}");
+                self.on_connection_closed(peer_id, num_established, &endpoint)
+                    .await
             }
-
-            // ── Identify ─────────────────────────────────────
-            SwarmEvent::Behaviour(RelayBehaviourEvent::Identify(identify::Event::Received {
-                peer_id: pid,
-                info,
-                ..
-            })) => {
-                log::debug!(
-                    "IDENTIFY peer:{pid} proto:{} agent:{}",
-                    info.protocol_version,
-                    info.agent_version
-                );
-                {
-                    let mut m = self.metrics.write().await;
-                    m.identify_received += 1;
-                }
-                // Add reported listen addresses to Kademlia, filtering
-                // out unroutable addresses and capping per-peer count.
-                let mut added = 0usize;
-                for addr in &info.listen_addrs {
-                    if added >= self.limits.max_identify_addrs {
-                        break;
-                    }
-                    if is_globally_routable(addr) {
-                        self.swarm
-                            .behaviour_mut()
-                            .kademlia
-                            .add_address(&pid, addr.clone());
-                        added += 1;
-                    }
-                }
+            SwarmEvent::Behaviour(RelayBehaviourEvent::Identify(event)) => {
+                self.on_identify(event).await
             }
-
-            // ── Relay Events ─────────────────────────────────
-            SwarmEvent::Behaviour(RelayBehaviourEvent::Relay(event)) => match &event {
-                relay::Event::ReservationReqAccepted { src_peer_id, .. } => {
-                    log::debug!("RELAY reservation accepted for {src_peer_id}");
-                    let mut m = self.metrics.write().await;
-                    m.reservations_accepted += 1;
-                    m.peers_with_reservation.insert(*src_peer_id);
-                }
-                relay::Event::CircuitReqAccepted {
-                    src_peer_id,
-                    dst_peer_id,
-                    ..
-                } => {
-                    log::debug!("RELAY circuit {src_peer_id} → {dst_peer_id}");
-                    let mut m = self.metrics.write().await;
-                    m.circuits_accepted += 1;
-                }
-                relay::Event::CircuitClosed {
-                    src_peer_id,
-                    dst_peer_id,
-                    ..
-                } => {
-                    log::debug!("RELAY circuit closed {src_peer_id} → {dst_peer_id}");
-                    let mut m = self.metrics.write().await;
-                    m.circuits_closed += 1;
-                }
-                relay::Event::ReservationReqDenied { src_peer_id, .. } => {
-                    log::debug!("RELAY reservation denied for {src_peer_id}");
-                    let mut m = self.metrics.write().await;
-                    m.reservations_denied += 1;
-                }
-                relay::Event::CircuitReqDenied {
-                    src_peer_id,
-                    dst_peer_id,
-                    ..
-                } => {
-                    log::debug!("RELAY circuit denied {src_peer_id} → {dst_peer_id}");
-                    let mut m = self.metrics.write().await;
-                    m.circuits_denied += 1;
-                }
-                _ => {
-                    log::debug!("RELAY event: {event:?}");
-                }
-            },
-
-            // ── Kademlia Events ──────────────────────────────
-            SwarmEvent::Behaviour(RelayBehaviourEvent::Kademlia(event)) => {
-                accept_provider_announcement(&mut self.swarm.behaviour_mut().kademlia, &event);
-                match &event {
-                    kad::Event::OutboundQueryProgressed {
-                        result: kad::QueryResult::Bootstrap(result),
-                        step,
-                        ..
-                    } if step.last => {
-                        if let Some(mesh) = self.mesh.as_mut() {
-                            match result {
-                                Ok(_) => log::debug!("MESH bootstrap complete"),
-                                Err(e) => log::warn!("MESH bootstrap failed: {e}"),
-                            }
-                            mesh.on_bootstrap_finished(result.is_ok());
-                            self.metrics.write().await.bootstrap_status = mesh.status().as_str();
-                        }
-                    }
-                    kad::Event::RoutingUpdated {
-                        peer, addresses, ..
-                    } => {
-                        log::debug!("KAD routing updated peer:{peer} addrs:{}", addresses.len());
-                        let mut m = self.metrics.write().await;
-                        m.kad_routing_updated += 1;
-                    }
-                    kad::Event::InboundRequest {
-                        request:
-                            kad::InboundRequest::PutRecord {
-                                record: Some(record),
-                                ..
-                            },
-                    } => {
-                        // FilterBoth mode: store explicitly + mirror to
-                        // disk so records survive relay restarts.
-                        //
-                        // Offer to the memory store FIRST and mirror only
-                        // what it accepted. The memory store enforces the
-                        // record cap; mirroring before that check meant
-                        // records it rejected were still written to disk,
-                        // so the SQLite table had no ceiling at all and an
-                        // attacker could fill the volume with unique keys
-                        // at the maximum record size apiece.
-                        if record.value.len() <= self.limits.kad_max_record_bytes {
-                            use libp2p::kad::store::RecordStore;
-                            let accepted = self
-                                .swarm
-                                .behaviour_mut()
-                                .kademlia
-                                .store_mut()
-                                .put(record.clone())
-                                .is_ok();
-                            let mirrored = MirroredRecord::from_kad(record);
-                            if let (true, Some(store), Some(mirrored)) =
-                                (accepted, &self.registry_store, mirrored)
-                            {
-                                if !store.mirror(mirrored) {
-                                    log::warn!(
-                                        "DHT mirror queue full — record kept in memory only"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    kad::Event::InboundRequest { request } => {
-                        log::debug!("KAD inbound request: {request:?}");
-                    }
-                    _ => {
-                        log::trace!("KAD event: {event:?}");
-                    }
-                }
-            }
-
-            // ── Username receipt requests ────────────────────
-            SwarmEvent::Behaviour(RelayBehaviourEvent::UsernameReg(
-                request_response::Event::Message {
-                    peer,
-                    message:
-                        request_response::Message::Request {
-                            request, channel, ..
-                        },
-                    ..
-                },
-            )) => {
-                log::debug!(
-                    "username-reg: receipt request from {peer} for @{}",
-                    request.claim.username
-                );
-                self.metrics.write().await.receipt_requests += 1;
-                // Per-peer budget. Claim signatures are free to mint
-                // offline, so without this one connection can receipt
-                // the whole namespace.
-                let (count, window_start) = self
-                    .username_rate_windows
-                    .entry(peer)
-                    .or_insert((0, Instant::now()));
-                if window_start.elapsed() > self.limits.receipt_window {
-                    *count = 0;
-                    *window_start = Instant::now();
-                }
-                *count += 1;
-                let rate_limited = *count > self.limits.receipt_limit;
-                if rate_limited {
-                    log::debug!("username-reg: rate limiting {peer} ({count} requests in window)");
-                }
-
-                // The store thread answers; the event loop sends the
-                // response when it arrives and keeps serving meanwhile.
-                let pending = if rate_limited {
-                    Err(refused("too many username claims — try again shortly"))
-                } else {
-                    match &self.registry_store {
-                        Some(store) => store
-                            .request_receipt(request.claim)
-                            .map_err(|_| refused("relay busy — try again shortly")),
-                        None => Err(refused("registry store unavailable")),
-                    }
-                };
-                match pending {
-                    Ok(reply) => self.pending_receipts.push(
-                        async move {
-                            let response = reply
-                                .await
-                                .unwrap_or_else(|_| refused("registry store unavailable"));
-                            (channel, response)
-                        }
-                        .boxed(),
-                    ),
-                    Err(response) => {
-                        let _ = self
-                            .swarm
-                            .behaviour_mut()
-                            .username_reg
-                            .send_response(channel, response);
-                    }
-                }
-            }
+            SwarmEvent::Behaviour(RelayBehaviourEvent::Relay(event)) => self.on_relay(event).await,
+            SwarmEvent::Behaviour(RelayBehaviourEvent::Kademlia(event)) => self.on_kad(event).await,
             SwarmEvent::Behaviour(RelayBehaviourEvent::UsernameReg(event)) => {
-                log::debug!("username-reg event: {event:?}");
+                self.on_username_reg(event).await
             }
-
             SwarmEvent::OutgoingConnectionError {
-                peer_id: Some(pid),
+                peer_id: Some(peer),
                 error,
                 ..
-            } => {
-                if let Some(mesh) = self.mesh.as_mut().filter(|m| m.is_member(&pid)) {
-                    log::debug!("MESH dial to profile relay {pid} failed: {error}");
-                    mesh.on_dial_failed(&pid);
-                }
-            }
-
-            // ── Other Events ─────────────────────────────────
+            } => self.on_dial_error(peer, &error),
             SwarmEvent::ListenerError { listener_id, error } => {
                 log::error!("Listener {listener_id:?} error: {error}");
-                let mut m = self.metrics.write().await;
-                m.listener_errors += 1;
+                self.metrics.write().await.listener_errors += 1;
             }
             SwarmEvent::ListenerClosed {
                 listener_id,
@@ -902,14 +621,352 @@ impl EventLoop {
             _ => {}
         }
     }
-}
 
-/// A refusal that carries no existing holder.
-fn refused(reason: &str) -> ReceiptResponse {
-    ReceiptResponse::Refused {
-        reason: reason.to_string(),
-        existing_did: None,
-        existing_received_at: None,
+    // ── Connection management ────────────────────────────────────────
+
+    async fn on_connection_established(&mut self, pid: PeerId, endpoint: &ConnectedPoint) {
+        self.total_connections_served += 1;
+        let remote_addr = endpoint.get_remote_address();
+        event!(
+            event_target::CONNECTION,
+            "CONNECT peer:{pid} endpoint:{remote_addr} total_served:{}",
+            self.total_connections_served
+        );
+
+        // Record the peer's client bucket so /peers can publish its
+        // truncated prefix. Captured on every Established and overwritten on
+        // reconnect — last-known address wins.
+        let bucket = extract_ip(remote_addr).map(client_bucket);
+        {
+            let connections = self.swarm.connected_peers().count();
+            let mut m = self.metrics.write().await;
+            m.connections = connections;
+            m.total_connections_served = self.total_connections_served;
+            if let Some(ip) = bucket {
+                m.peer_source_ips.insert(pid, ip);
+            }
+        }
+
+        // IP-level rate limiting, keyed on the client bucket so one IPv6
+        // subscriber cannot rotate through its /64.
+        if let Some(ip) = bucket {
+            let active = self.ip_active_connections.entry(ip).or_insert(0);
+            *active += 1;
+
+            let active = *active;
+            let attempts = self.ip_rate_windows.hit(ip, Instant::now());
+
+            if active > self.limits.max_connections_per_ip
+                || attempts > self.limits.max_new_connections_per_ip
+            {
+                log::warn!(
+                    "IP rate limit exceeded for {ip} (active:{active}, attempts:{attempts}), \
+                     disconnecting {pid}"
+                );
+                let _ = self.swarm.disconnect_peer_id(pid);
+                let mut m = self.metrics.write().await;
+                m.ip_rate_limited += 1;
+            }
+        }
+
+        // The remote address is deliberately not added to the routing table:
+        // for an inbound connection it is the peer's ephemeral source port,
+        // often a NAT mapping, which other peers cannot dial. The peer enters
+        // the table from its Identify-reported addresses (see `on_identify`).
+
+        if self.mesh.as_ref().is_some_and(|m| m.is_member(&pid)) {
+            let dialed = endpoint.is_dialer().then(|| remote_addr.clone());
+            self.on_mesh_connected(pid, dialed).await;
+        }
+    }
+
+    async fn on_connection_closed(
+        &mut self,
+        pid: PeerId,
+        num_established: u32,
+        endpoint: &ConnectedPoint,
+    ) {
+        // Decrement IP active connection count
+        if let Some(ip) = extract_ip(endpoint.get_remote_address()).map(client_bucket) {
+            if let Some(active) = self.ip_active_connections.get_mut(&ip) {
+                *active = active.saturating_sub(1);
+                if *active == 0 {
+                    self.ip_active_connections.remove(&ip);
+                }
+            }
+        }
+
+        // When the peer has zero remaining connections, forget the peer's
+        // WAN IP and reservation flag. (libp2p delivers `num_established`
+        // post-decrement.)
+        if num_established == 0 {
+            let connections = self.swarm.connected_peers().count();
+            let mut m = self.metrics.write().await;
+            m.connections = connections;
+            m.peer_source_ips.remove(&pid);
+            m.peers_with_reservation.remove(&pid);
+            if let Some(mesh) = self.mesh.as_mut().filter(|m| m.is_member(&pid)) {
+                mesh.on_unreachable(&pid);
+                m.reachable_relays = mesh.reachable();
+                log::info!("MESH lost profile relay {pid}; redialling with backoff");
+            }
+        }
+
+        event!(
+            event_target::CONNECTION,
+            "DISCONNECT peer:{pid} remaining_for_peer:{num_established}"
+        );
+    }
+
+    /// A dial failed. Only dials to profile relays are followed up.
+    fn on_dial_error(&mut self, pid: PeerId, error: &libp2p::swarm::DialError) {
+        if let Some(mesh) = self.mesh.as_mut().filter(|m| m.is_member(&pid)) {
+            log::debug!("MESH dial to profile relay {pid} failed: {error}");
+            mesh.on_dial_failed(&pid);
+        }
+    }
+
+    // ── Identify ─────────────────────────────────────────────────────
+
+    async fn on_identify(&mut self, event: identify::Event) {
+        let identify::Event::Received {
+            peer_id: pid, info, ..
+        } = event
+        else {
+            return;
+        };
+        event!(
+            event_target::IDENTIFY,
+            "IDENTIFY peer:{pid} proto:{} agent:{}",
+            info.protocol_version,
+            info.agent_version
+        );
+        self.metrics.write().await.identify_received += 1;
+        // Add reported listen addresses to Kademlia, filtering out
+        // unroutable addresses and capping per-peer count.
+        let mut added = 0usize;
+        for addr in &info.listen_addrs {
+            if added >= self.limits.max_identify_addrs {
+                break;
+            }
+            if is_globally_routable(addr) {
+                self.swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .add_address(&pid, addr.clone());
+                added += 1;
+            }
+        }
+    }
+
+    // ── Circuit relay ────────────────────────────────────────────────
+
+    async fn on_relay(&mut self, event: relay::Event) {
+        match &event {
+            relay::Event::ReservationReqAccepted { src_peer_id, .. } => {
+                event!(
+                    event_target::RESERVATION,
+                    "RELAY reservation accepted for {src_peer_id}"
+                );
+                let mut m = self.metrics.write().await;
+                m.reservations_accepted += 1;
+                m.peers_with_reservation.insert(*src_peer_id);
+            }
+            relay::Event::CircuitReqAccepted {
+                src_peer_id,
+                dst_peer_id,
+                ..
+            } => {
+                event!(
+                    event_target::CIRCUIT,
+                    "RELAY circuit {src_peer_id} → {dst_peer_id}"
+                );
+                self.metrics.write().await.circuits_accepted += 1;
+            }
+            relay::Event::CircuitClosed {
+                src_peer_id,
+                dst_peer_id,
+                ..
+            } => {
+                event!(
+                    event_target::CIRCUIT,
+                    "RELAY circuit closed {src_peer_id} → {dst_peer_id}"
+                );
+                self.metrics.write().await.circuits_closed += 1;
+            }
+            relay::Event::ReservationReqDenied { src_peer_id, .. } => {
+                event!(
+                    event_target::RESERVATION,
+                    "RELAY reservation denied for {src_peer_id}"
+                );
+                self.metrics.write().await.reservations_denied += 1;
+            }
+            relay::Event::CircuitReqDenied {
+                src_peer_id,
+                dst_peer_id,
+                ..
+            } => {
+                event!(
+                    event_target::CIRCUIT,
+                    "RELAY circuit denied {src_peer_id} → {dst_peer_id}"
+                );
+                self.metrics.write().await.circuits_denied += 1;
+            }
+            _ => {
+                event!(event_target::CIRCUIT, "RELAY event: {event:?}");
+            }
+        }
+    }
+
+    // ── Kademlia ─────────────────────────────────────────────────────
+
+    async fn on_kad(&mut self, event: kad::Event) {
+        accept_provider_announcement(&mut self.swarm.behaviour_mut().kademlia, &event);
+        match &event {
+            kad::Event::OutboundQueryProgressed {
+                result: kad::QueryResult::Bootstrap(result),
+                step,
+                ..
+            } if step.last => {
+                if let Some(mesh) = self.mesh.as_mut() {
+                    match result {
+                        Ok(_) => log::debug!("MESH bootstrap complete"),
+                        Err(e) => log::warn!("MESH bootstrap failed: {e}"),
+                    }
+                    mesh.on_bootstrap_finished(result.is_ok());
+                    self.metrics.write().await.bootstrap_status = mesh.status();
+                }
+            }
+            kad::Event::RoutingUpdated {
+                peer, addresses, ..
+            } => {
+                event!(
+                    event_target::KAD,
+                    "KAD routing updated peer:{peer} addrs:{}",
+                    addresses.len()
+                );
+                self.metrics.write().await.kad_routing_updated += 1;
+            }
+            kad::Event::InboundRequest {
+                request:
+                    kad::InboundRequest::PutRecord {
+                        record: Some(record),
+                        ..
+                    },
+            } => self.on_put_record(record),
+            kad::Event::InboundRequest { request } => {
+                event!(event_target::KAD, "KAD inbound request: {request:?}");
+            }
+            _ => {
+                log::trace!("KAD event: {event:?}");
+            }
+        }
+    }
+
+    /// An inbound DHT put, surfaced by FilterBoth mode: store it explicitly
+    /// and mirror it to disk so records survive relay restarts.
+    ///
+    /// Offer to the memory store FIRST and mirror only what it accepted. The
+    /// memory store enforces the record cap; mirroring before that check
+    /// meant records it rejected were still written to disk, so the SQLite
+    /// table had no ceiling at all and an attacker could fill the volume
+    /// with unique keys at the maximum record size apiece.
+    fn on_put_record(&mut self, record: &kad::Record) {
+        if record.value.len() > self.limits.kad_max_record_bytes {
+            return;
+        }
+        use libp2p::kad::store::RecordStore;
+        let accepted = self
+            .swarm
+            .behaviour_mut()
+            .kademlia
+            .store_mut()
+            .put(record.clone())
+            .is_ok();
+        let mirrored = MirroredRecord::from_kad(record);
+        if let (true, Some(store), Some(mirrored)) = (accepted, &self.registry_store, mirrored) {
+            if !store.mirror(mirrored) {
+                log::warn!("DHT mirror queue full — record kept in memory only");
+            }
+        }
+    }
+
+    // ── Username receipts ────────────────────────────────────────────
+
+    async fn on_username_reg(
+        &mut self,
+        event: request_response::Event<ReceiptRequest, ReceiptResponse>,
+    ) {
+        match event {
+            request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            } => self.on_receipt_request(peer, request, channel).await,
+            event => {
+                event!(event_target::RECEIPT, "username-reg event: {event:?}");
+            }
+        }
+    }
+
+    async fn on_receipt_request(
+        &mut self,
+        peer: PeerId,
+        request: ReceiptRequest,
+        channel: request_response::ResponseChannel<ReceiptResponse>,
+    ) {
+        event!(
+            event_target::RECEIPT,
+            "username-reg: receipt request from {peer} for @{}",
+            request.claim.username
+        );
+        self.metrics.write().await.receipt_requests += 1;
+        // Per-peer budget. Claim signatures are free to mint offline, so
+        // without this one connection can receipt the whole namespace.
+        let count = self.username_rate_windows.hit(peer, Instant::now());
+        let rate_limited = count > self.limits.receipt_limit;
+        if rate_limited {
+            event!(
+                event_target::RECEIPT,
+                "username-reg: rate limiting {peer} ({count} requests in window)"
+            );
+        }
+
+        // The store thread answers; the event loop sends the response when
+        // it arrives and keeps serving meanwhile.
+        let pending = if rate_limited {
+            Err(ReceiptResponse::refused(
+                "too many username claims — try again shortly",
+            ))
+        } else {
+            match &self.registry_store {
+                Some(store) => store
+                    .request_receipt(request.claim)
+                    .map_err(|_| ReceiptResponse::refused("relay busy — try again shortly")),
+                None => Err(ReceiptResponse::refused("registry store unavailable")),
+            }
+        };
+        match pending {
+            Ok(reply) => self.pending_receipts.push(
+                async move {
+                    let response = reply
+                        .await
+                        .unwrap_or_else(|_| ReceiptResponse::refused("registry store unavailable"));
+                    (channel, response)
+                }
+                .boxed(),
+            ),
+            Err(response) => {
+                let _ = self
+                    .swarm
+                    .behaviour_mut()
+                    .username_reg
+                    .send_response(channel, response);
+            }
+        }
     }
 }
 

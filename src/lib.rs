@@ -70,6 +70,7 @@ pub mod doctor;
 mod http;
 mod mesh;
 pub mod profile;
+mod rate;
 mod store;
 mod swarm;
 pub mod username_reg;
@@ -85,7 +86,7 @@ use tokio::task::JoinHandle;
 pub use config::{Cli, Limits, RelayConfig};
 
 use crate::http::RelayMetrics;
-use crate::store::{RegistryStore, StoreHandle};
+use crate::store::StoreHandle;
 
 /// Why [`start`] could not bring the relay up.
 pub type StartError = Box<dyn std::error::Error + Send + Sync>;
@@ -171,14 +172,15 @@ pub async fn start(config: RelayConfig) -> Result<RelayHandle, StartError> {
     log::info!("Relay PeerId: {peer_id}");
 
     // ── Persistent registry store ────────────────────────────────────
-    // Username receipts + mirrored DHT records, on the store's own thread.
-    let opened = RegistryStore::open(&config.data_dir).and_then(|s| {
-        let s = s.with_kad_caps(
-            config.limits.kad_max_records,
-            config.limits.kad_max_record_bytes,
-        );
-        StoreHandle::spawn(s, keypair.clone()).map_err(|e| format!("spawn store thread: {e}"))
-    });
+    // Username receipts + mirrored DHT records, opened and served on the
+    // store's own thread.
+    let opened = StoreHandle::open(
+        config.data_dir.clone(),
+        config.limits.kad_max_records,
+        config.limits.kad_max_record_bytes,
+        keypair.clone(),
+    )
+    .await;
     let registry_store = match opened {
         Ok(store) => {
             log::info!(
@@ -203,8 +205,7 @@ pub async fn start(config: RelayConfig) -> Result<RelayHandle, StartError> {
             mesh::BootstrapStatus::Pending
         } else {
             mesh::BootstrapStatus::Disabled
-        }
-        .as_str(),
+        },
         started: Some(std::time::Instant::now()),
         ..RelayMetrics::default()
     }));

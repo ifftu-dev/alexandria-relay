@@ -1,6 +1,7 @@
 # Move the store off the event loop and let the DHT mirror expire
 
 Status: implemented
+Updated: 2026-11-13
 Triage: done
 Repos: alexandria-relay
 Part of: alexandria-relay/docs/relay-hardening-spec.md
@@ -78,3 +79,16 @@ implement-spec workflow.
   reproducing the stall. The prune interval is a constant, not a flag. A
   full store queue drops the mirror write and refuses the receipt with
   "relay busy" rather than blocking the event loop.
+
+- 2026-11-13, review fixes: the store now opens on its own thread
+  (`StoreHandle::open`), so a locked database no longer holds a runtime
+  worker for the five-second busy timeout; a ticker on a one-thread
+  runtime stalled 5.2 s before and not at all after. `/username/:name`
+  answers 503 when the store is not running, its queue is full or the
+  query fails, where it used to report the name available. Store errors
+  tell busy from stopped. The burst test's claim is narrowed in its
+  comment: it guards lookup latency and passes against a store on the
+  runtime wherever writes are cheap. A new test holds the database's
+  write lock from another connection while DHT puts arrive: the puts are
+  acknowledged and `/health` answers within a second. With the event loop
+  waiting on the store it fails after 32 s (checked by mutation).
