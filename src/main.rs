@@ -70,6 +70,7 @@ mod username_reg;
 use serde::Serialize;
 use tokio::sync::RwLock;
 use username_reg::{ReceiptRequest, ReceiptResponse, RegistryStore};
+use zeroize::Zeroizing;
 
 // ── Configuration Constants ──────────────────────────────────────────
 
@@ -83,6 +84,22 @@ const MAX_CONNECTIONS_PER_PEER: u32 = 8;
 /// Maximum concurrent connections from a single IP address.
 /// Households / shared NATs commonly carry 5-10 simultaneous peers.
 const MAX_CONNECTIONS_PER_IP: usize = 32;
+
+/// Maximum incoming connections still in the transport handshake.
+///
+/// The established-connection limits above apply only after Noise and the
+/// muxer have been negotiated, so without this a flood of half-open
+/// connections holds handshake state with no ceiling at all.
+const MAX_PENDING_INCOMING: u32 = 256;
+
+/// Largest username-receipt request the codec will read.
+///
+/// A claim is a few hundred bytes: a username of at most 32 characters, a
+/// fixed-width `did:key`, a 128-character signature, and the app's receipts
+/// list (about 220 bytes per relay that has already countersigned). 8 KiB
+/// leaves room for a few dozen relays. The codec's default is 1 MiB, which
+/// the swarm would otherwise buffer and deserialize for every request.
+const USERNAME_REQUEST_MAX_BYTES: u64 = 8 * 1024;
 
 /// Maximum new connections from a single IP per rate window.
 const MAX_NEW_CONNS_PER_IP_PER_WINDOW: usize = 32;
@@ -412,18 +429,20 @@ fn admin_token_from_env() -> Option<String> {
 
 // ── Keypair Utilities ────────────────────────────────────────────────
 
+/// Build the relay keypair from a hex seed.
+///
+/// Every buffer that holds seed material is zeroized when it drops: the
+/// decoded bytes and the 32-byte key copy here, and the hex string at the
+/// caller. `ed25519_from_bytes` also zeroizes the slice it is given.
 fn keypair_from_seed(seed_hex: &str) -> Keypair {
-    let seed_bytes = hex::decode(seed_hex).expect("RELAY_SEED must be valid hex");
+    let seed_bytes = Zeroizing::new(hex::decode(seed_hex).expect("RELAY_SEED must be valid hex"));
     assert!(
         seed_bytes.len() >= 32,
         "RELAY_SEED must be at least 32 bytes (64 hex chars)"
     );
-    let mut key = [0u8; 32];
+    let mut key = Zeroizing::new([0u8; 32]);
     key.copy_from_slice(&seed_bytes[..32]);
-    let keypair = Keypair::ed25519_from_bytes(&mut key).expect("valid ed25519 seed");
-    // Zero seed material from memory
-    key.fill(0);
-    keypair
+    Keypair::ed25519_from_bytes(&mut *key).expect("valid ed25519 seed")
 }
 
 fn generate_seed() -> String {
@@ -464,8 +483,10 @@ fn main() {
         return;
     }
 
-    // Read and clear RELAY_SEED while single-threaded (safe — no tokio runtime yet)
-    let seed = std::env::var("RELAY_SEED").ok();
+    // Read and clear RELAY_SEED while single-threaded (safe — no tokio runtime yet).
+    // The copy we keep is zeroized when it drops; the process environment's
+    // own copy is released by `remove_var`, which is the most we can do there.
+    let seed = std::env::var("RELAY_SEED").ok().map(Zeroizing::new);
     if seed.is_some() {
         std::env::remove_var("RELAY_SEED");
     }
@@ -477,7 +498,7 @@ fn main() {
         .block_on(async_main(args, seed));
 }
 
-async fn async_main(args: Args, seed: Option<String>) {
+async fn async_main(args: Args, seed: Option<Zeroizing<String>>) {
     // ── Keypair ──────────────────────────────────────────────────────
     let keypair = match seed {
         Some(ref s) => {
@@ -1368,6 +1389,15 @@ fn accept_provider_announcement(kademlia: &mut kad::Behaviour<MemoryStore>, even
     }
 }
 
+/// Wire codec for `/alexandria/username-reg/1.0`, with the request size capped
+/// at [`USERNAME_REQUEST_MAX_BYTES`]. A request over the cap is read only up to
+/// the cap, fails to decode, and the stream is dropped without a response.
+type UsernameRegCodec = request_response::cbor::codec::Codec<ReceiptRequest, ReceiptResponse>;
+
+fn username_reg_codec() -> UsernameRegCodec {
+    UsernameRegCodec::default().set_request_size_maximum(USERNAME_REQUEST_MAX_BYTES)
+}
+
 fn build_behaviour(
     key: &libp2p::identity::Keypair,
 ) -> Result<RelayBehaviour, Box<dyn std::error::Error + Send + Sync>> {
@@ -1375,6 +1405,7 @@ fn build_behaviour(
 
     // ── Connection Limits (enforced at transport layer) ──────────────
     let limits = libp2p_connection_limits::ConnectionLimits::default()
+        .with_max_pending_incoming(Some(MAX_PENDING_INCOMING))
         .with_max_established(Some(MAX_CONNECTIONS as u32))
         .with_max_established_per_peer(Some(MAX_CONNECTIONS_PER_PEER));
     let connection_limits = libp2p_connection_limits::Behaviour::new(limits);
@@ -1417,7 +1448,8 @@ fn build_behaviour(
     kademlia.set_mode(Some(kad::Mode::Server));
 
     // ── Username receipt protocol ────────────────────────────────────
-    let username_reg = request_response::cbor::Behaviour::<ReceiptRequest, ReceiptResponse>::new(
+    let username_reg = request_response::cbor::Behaviour::with_codec(
+        username_reg_codec(),
         [(
             StreamProtocol::new(username_reg::PROTOCOL),
             ProtocolSupport::Inbound,
@@ -1573,6 +1605,89 @@ mod tests {
             Some(token),
             &bearer("0123456789abcdef012")
         ));
+    }
+
+    /// The request shape the app sends: its claim carries a `receipts` list
+    /// (one per relay that has already countersigned), which the relay's own
+    /// claim type does not model and ignores.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct AppReceiptRequest {
+        claim: AppClaim,
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct AppClaim {
+        version: u32,
+        username: String,
+        did: String,
+        claimed_at: i64,
+        sig: String,
+        receipts: Vec<username_reg::RelayReceipt>,
+    }
+
+    fn app_request(username: &str, receipts: usize) -> AppReceiptRequest {
+        AppReceiptRequest {
+            claim: AppClaim {
+                version: 1,
+                username: username.to_string(),
+                did: format!("did:key:z6Mk{}", "a".repeat(44)),
+                claimed_at: 1_700_000_000,
+                sig: "ab".repeat(64),
+                receipts: (0..receipts)
+                    .map(|_| username_reg::RelayReceipt {
+                        relay_peer_id: PeerId::random().to_string(),
+                        received_at: 1_700_000_000,
+                        sig: "cd".repeat(64),
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    /// Encode `request` the way the app's codec does, then read it with the
+    /// relay's codec.
+    fn read_with_relay_codec(request: AppReceiptRequest) -> std::io::Result<ReceiptRequest> {
+        use libp2p::request_response::Codec;
+        futures::executor::block_on(async {
+            let protocol = StreamProtocol::new(username_reg::PROTOCOL);
+            let mut app_codec = request_response::cbor::codec::Codec::<
+                AppReceiptRequest,
+                ReceiptResponse,
+            >::default();
+            let mut wire = Vec::new();
+            app_codec
+                .write_request(&protocol, &mut wire, request)
+                .await
+                .unwrap();
+            username_reg_codec()
+                .read_request(&protocol, &mut futures::io::Cursor::new(wire))
+                .await
+        })
+    }
+
+    #[test]
+    fn the_receipt_codec_reads_a_realistic_claim() {
+        // Thirty relays' receipts is far more than the network runs; it must
+        // still fit, or the cap would refuse real refreshes.
+        let decoded = read_with_relay_codec(app_request("ada_99", 30)).unwrap();
+        assert_eq!(decoded.claim.username, "ada_99");
+    }
+
+    #[test]
+    fn the_receipt_codec_refuses_a_request_over_the_cap() {
+        // Without the cap the codec reads up to 1 MiB per request.
+        let oversized = "a".repeat(USERNAME_REQUEST_MAX_BYTES as usize);
+        assert!(read_with_relay_codec(app_request(&oversized, 0)).is_err());
+    }
+
+    #[test]
+    fn the_seed_keypair_is_deterministic() {
+        // Zeroizing the seed buffers must not change the derived identity.
+        let seed = "11".repeat(32);
+        assert_eq!(
+            keypair_from_seed(&seed).public().to_peer_id(),
+            keypair_from_seed(&seed).public().to_peer_id()
+        );
     }
 
     #[test]
