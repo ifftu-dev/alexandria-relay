@@ -20,6 +20,7 @@ use crate::addr::{client_bucket, truncate_ip};
 use crate::config::{Limits, ADMIN_TOKEN_MIN_LEN};
 #[cfg(test)]
 use crate::config::{DEFAULT_LOOKUP_LIMIT, DEFAULT_LOOKUP_MAX_TRACKED};
+use crate::mesh::BootstrapStatus;
 use crate::rate::RateWindows;
 use crate::store::{StoreError, StoreHandle};
 
@@ -49,7 +50,7 @@ pub(crate) struct RelayMetrics {
     pub(crate) reachable_relays: usize,
     /// `disabled` (no profile), `pending`, `ok` or `failed`: the outcome of
     /// the last Kademlia bootstrap.
-    pub(crate) bootstrap_status: &'static str,
+    pub(crate) bootstrap_status: BootstrapStatus,
 
     // Rolling 60-second window snapshots — populated by a background
     // sampling task in `serve`. Drives /health/alerts.
@@ -211,9 +212,9 @@ impl RelayMetrics {
             "# HELP relay_bootstrap_status Kademlia bootstrap state: 1 for the current one."
         );
         let _ = writeln!(out, "# TYPE relay_bootstrap_status gauge");
-        for status in crate::mesh::BootstrapStatus::ALL {
-            let status = status.as_str();
+        for status in BootstrapStatus::ALL {
             let value = u8::from(status == self.bootstrap_status);
+            let status = status.as_str();
             let _ = writeln!(out, "relay_bootstrap_status{{status=\"{status}\"}} {value}");
         }
         let _ = writeln!(out, "# HELP relay_info This relay's PeerId and version.");

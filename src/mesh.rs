@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::addr::tcp_and_quic;
-use crate::profile::NetworkProfile;
+use crate::profile::{NetworkProfile, ProfileRelay};
 
 /// How often the relay runs a Kademlia bootstrap while it has a profile.
 /// Matches libp2p-kad's own periodic bootstrap default.
@@ -61,10 +61,13 @@ pub(crate) fn dial_addrs(resolved: &[IpAddr], fallback: &[IpAddr], port: u16) ->
         .collect()
 }
 
-/// Bootstrap state as `/health` and `/metrics` report it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Bootstrap state as `/health` and `/metrics` report it: serialized as
+/// [`BootstrapStatus::as_str`], the strings the monitoring observer reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum BootstrapStatus {
     /// No network profile: the relay joins no mesh.
+    #[default]
     Disabled,
     /// No bootstrap has completed yet.
     Pending,
@@ -93,11 +96,10 @@ impl BootstrapStatus {
     }
 }
 
-/// A profile relay other than this one.
+/// A profile relay other than this one, and this relay's state for it.
 struct MeshRelay {
-    dns_name: String,
-    port: u16,
-    fallback_ips: Vec<IpAddr>,
+    /// Its entry in the profile.
+    entry: ProfileRelay,
     /// The addresses the last lookup produced.
     addrs: Vec<Multiaddr>,
     connected: bool,
@@ -137,9 +139,7 @@ impl Mesh {
                 (
                     r.peer_id,
                     MeshRelay {
-                        dns_name: r.dns_name.clone(),
-                        port: r.port,
-                        fallback_ips: r.fallback_ips.clone(),
+                        entry: r.clone(),
                         addrs: Vec::new(),
                         connected: false,
                         next_dial: Some(now),
@@ -216,9 +216,9 @@ impl Mesh {
             return;
         };
         let (name, port, fallback) = (
-            relay.dns_name.clone(),
-            relay.port,
-            relay.fallback_ips.clone(),
+            relay.entry.dns_name.clone(),
+            relay.entry.port,
+            relay.entry.fallback_ips.clone(),
         );
         let tx = self.resolved_tx.clone();
         tokio::spawn(async move {
@@ -286,7 +286,7 @@ impl Mesh {
         relay.next_dial = Some(Instant::now() + relay.backoff);
         log::debug!(
             "MESH {peer} ({}) unreachable; next dial in {:?}",
-            relay.dns_name,
+            relay.entry.dns_name,
             relay.backoff
         );
         relay.backoff = (relay.backoff * 2).min(REDIAL_MAX);
@@ -312,6 +312,15 @@ impl Mesh {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bootstrap_states_serialize_as_the_strings_monitoring_reads() {
+        let expected = ["disabled", "pending", "ok", "failed"];
+        for (status, text) in BootstrapStatus::ALL.into_iter().zip(expected) {
+            assert_eq!(serde_json::to_value(status).unwrap(), text);
+            assert_eq!(status.as_str(), text);
+        }
+    }
 
     #[test]
     fn the_discovery_key_is_the_apps() {

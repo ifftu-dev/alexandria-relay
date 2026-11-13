@@ -455,7 +455,7 @@ impl RegistryStore {
 // ── Store actor ──────────────────────────────────────────────────────
 
 /// What the store thread can be asked to do.
-enum Command {
+enum StoreRequest {
     Receipt {
         claim: Box<UsernameClaim>,
         reply: oneshot::Sender<ReceiptResponse>,
@@ -478,57 +478,48 @@ enum Command {
 }
 
 /// Why the store could not answer a request.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum StoreError {
     /// The queue was full; the request was not taken.
+    #[error("the store queue is full")]
     Busy,
     /// The store thread has stopped, or never started.
+    #[error("the store is not running")]
     Stopped,
     /// The store took the request and the query failed.
-    Query(rusqlite::Error),
+    #[error("store query failed: {0}")]
+    Query(#[source] rusqlite::Error),
     /// The store could not be opened.
+    #[error("{0}")]
     Open(String),
 }
 
-impl std::fmt::Display for StoreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            StoreError::Open(e) => write!(f, "{e}"),
-            StoreError::Busy => write!(f, "the store queue is full"),
-            StoreError::Stopped => write!(f, "the store is not running"),
-            StoreError::Query(e) => write!(f, "store query failed: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for StoreError {}
-
 /// The store thread's loop: answer each request in arrival order until
 /// told to close or every handle is gone.
-fn serve(mut store: RegistryStore, keypair: &Keypair, mut rx: mpsc::Receiver<Command>) {
+fn serve(mut store: RegistryStore, keypair: &Keypair, mut rx: mpsc::Receiver<StoreRequest>) {
     let relay_peer_id = keypair.public().to_peer_id().to_string();
-    while let Some(command) = rx.blocking_recv() {
-        match command {
-            Command::Receipt { claim, reply } => {
+    while let Some(request) = rx.blocking_recv() {
+        match request {
+            StoreRequest::Receipt { claim, reply } => {
                 let _ = reply.send(store.handle_receipt(keypair, &relay_peer_id, &claim));
             }
-            Command::Lookup { username, reply } => {
+            StoreRequest::Lookup { username, reply } => {
                 let _ = reply.send(store.lookup_username(&username));
             }
-            Command::Mirror(record) => store.save_kad_record(&record, unix_now()),
-            Command::LoadMirror { reply } => {
+            StoreRequest::Mirror(record) => store.save_kad_record(&record, unix_now()),
+            StoreRequest::LoadMirror { reply } => {
                 let _ = reply.send(store.load_kad_records(unix_now()));
             }
-            Command::PruneExpired => {
+            StoreRequest::PruneExpired => {
                 let n = store.prune_expired(unix_now());
                 if n > 0 {
                     log::debug!("Pruned {n} expired DHT records from the mirror");
                 }
             }
-            Command::ReceiptCount { reply } => {
+            StoreRequest::ReceiptCount { reply } => {
                 let _ = reply.send(store.receipt_count());
             }
-            Command::Close { reply } => {
+            StoreRequest::Close { reply } => {
                 drop(store);
                 let _ = reply.send(());
                 return;
@@ -541,7 +532,7 @@ fn serve(mut store: RegistryStore, keypair: &Keypair, mut rx: mpsc::Receiver<Com
 /// that thread, in the order requests arrive.
 #[derive(Clone)]
 pub(crate) struct StoreHandle {
-    tx: mpsc::Sender<Command>,
+    tx: mpsc::Sender<StoreRequest>,
 }
 
 impl StoreHandle {
@@ -591,7 +582,7 @@ impl StoreHandle {
     ) -> Result<oneshot::Receiver<ReceiptResponse>, StoreError> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .try_send(Command::Receipt {
+            .try_send(StoreRequest::Receipt {
                 claim: Box::new(claim),
                 reply,
             })
@@ -605,44 +596,44 @@ impl StoreHandle {
     /// Queue a record for the mirror without waiting. `false` if the queue
     /// was full and the write was dropped.
     pub(crate) fn mirror(&self, record: MirroredRecord) -> bool {
-        self.tx.try_send(Command::Mirror(record)).is_ok()
+        self.tx.try_send(StoreRequest::Mirror(record)).is_ok()
     }
 
     /// Queue a prune of expired mirror rows without waiting.
     pub(crate) fn prune_expired(&self) {
-        let _ = self.tx.try_send(Command::PruneExpired);
+        let _ = self.tx.try_send(StoreRequest::PruneExpired);
     }
 
     pub(crate) async fn lookup_username(
         &self,
         username: String,
     ) -> Result<Option<(String, i64)>, StoreError> {
-        self.ask(|reply| Command::Lookup { username, reply })
+        self.ask(|reply| StoreRequest::Lookup { username, reply })
             .await?
             .map_err(StoreError::Query)
     }
 
     pub(crate) async fn load_kad_records(&self) -> Result<Vec<MirroredRecord>, StoreError> {
-        self.ask(|reply| Command::LoadMirror { reply }).await
+        self.ask(|reply| StoreRequest::LoadMirror { reply }).await
     }
 
     pub(crate) async fn receipt_count(&self) -> Result<i64, StoreError> {
-        self.ask(|reply| Command::ReceiptCount { reply }).await
+        self.ask(|reply| StoreRequest::ReceiptCount { reply }).await
     }
 
     /// Finish every request queued so far, close the database and stop the
     /// thread.
     pub(crate) async fn close(&self) {
-        let _ = self.ask(|reply| Command::Close { reply }).await;
+        let _ = self.ask(|reply| StoreRequest::Close { reply }).await;
     }
 
     async fn ask<T>(
         &self,
-        command: impl FnOnce(oneshot::Sender<T>) -> Command,
+        request: impl FnOnce(oneshot::Sender<T>) -> StoreRequest,
     ) -> Result<T, StoreError> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(command(reply))
+            .send(request(reply))
             .await
             .map_err(|_| StoreError::Stopped)?;
         rx.await.map_err(|_| StoreError::Stopped)

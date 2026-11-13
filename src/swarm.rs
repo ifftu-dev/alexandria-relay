@@ -790,7 +790,7 @@ impl EventLoop {
                                 Err(e) => log::warn!("MESH bootstrap failed: {e}"),
                             }
                             mesh.on_bootstrap_finished(result.is_ok());
-                            self.metrics.write().await.bootstrap_status = mesh.status().as_str();
+                            self.metrics.write().await.bootstrap_status = mesh.status();
                         }
                     }
                     kad::Event::RoutingUpdated {

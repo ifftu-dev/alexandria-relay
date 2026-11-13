@@ -205,8 +205,7 @@ pub async fn start(config: RelayConfig) -> Result<RelayHandle, StartError> {
             mesh::BootstrapStatus::Pending
         } else {
             mesh::BootstrapStatus::Disabled
-        }
-        .as_str(),
+        },
         started: Some(std::time::Instant::now()),
         ..RelayMetrics::default()
     }));

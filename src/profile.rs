@@ -63,16 +63,9 @@ struct RawRelay {
 }
 
 /// Why a profile was refused.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("invalid network profile: {0}")]
 pub struct ProfileError(String);
-
-impl std::fmt::Display for ProfileError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "invalid network profile: {}", self.0)
-    }
-}
-
-impl std::error::Error for ProfileError {}
 
 fn invalid<T>(message: impl Into<String>) -> Result<T, ProfileError> {
     Err(ProfileError(message.into()))
