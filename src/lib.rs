@@ -192,14 +192,16 @@ pub async fn start(config: RelayConfig) -> Result<RelayHandle, StartError> {
     };
 
     // ── Swarm ────────────────────────────────────────────────────────
-    let started = match swarm::start_swarm(&config, keypair, registry_store, metrics).await {
-        Ok(started) => started,
-        Err(e) => {
-            let _ = shutdown.send(true);
-            let _ = http_task.await;
-            return Err(e);
-        }
-    };
+    let started =
+        match swarm::start_swarm(&config, keypair, registry_store, metrics, http_addr.port()).await
+        {
+            Ok(started) => started,
+            Err(e) => {
+                let _ = shutdown.send(true);
+                let _ = http_task.await;
+                return Err(e);
+            }
+        };
     let swarm_task = tokio::spawn(started.event_loop.run(shutdown_rx));
 
     Ok(RelayHandle {

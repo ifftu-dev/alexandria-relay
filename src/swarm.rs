@@ -63,6 +63,7 @@ pub(crate) async fn start_swarm(
     keypair: Keypair,
     registry_store: Option<SharedStore>,
     metrics: Arc<RwLock<RelayMetrics>>,
+    http_port: u16,
 ) -> Result<Started, StartError> {
     let local_peer_id = keypair.public().to_peer_id();
     // Countersigning needs the keypair after the swarm takes ownership.
@@ -201,10 +202,7 @@ pub(crate) async fn start_swarm(
     }
 
     let l = &config.limits;
-    log::info!(
-        "Relay starting — TCP:{tcp_port} QUIC/UDP:{quic_port} Metrics HTTP:{}",
-        config.metrics_port,
-    );
+    log::info!("Relay starting — TCP:{tcp_port} QUIC/UDP:{quic_port} Metrics HTTP:{http_port}");
     log::info!(
         "Limits — max_conn:{} max_conn/peer:{} max_conn/ip:{} \
          relay_reservations:{} relay_circuits:{}",

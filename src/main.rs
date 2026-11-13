@@ -21,8 +21,10 @@ fn main() {
         println!("Deploy with:");
         println!("  RELAY_SEED={seed} alexandria-relay --port 4001");
         println!();
-        println!("Add to main app's discovery.rs:");
-        println!("  const RELAY_PEER_ID: &str = \"{peer_id}\";");
+        println!("To list this relay in a network, add its PeerId to the network");
+        println!("profile in the app repository (src-tauri/resources/networks/):");
+        println!("  - an entry in `relays`, for clients to connect through it;");
+        println!("  - `receipt_issuer_keys`, only if its username receipts are to be trusted.");
         return;
     }
 
