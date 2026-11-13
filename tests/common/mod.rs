@@ -12,9 +12,14 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use alexandria_relay::username_reg::{self, ReceiptRequest, ReceiptResponse, UsernameClaim};
 use alexandria_relay::{start, RelayConfig, RelayHandle};
+use ed25519_dalek::{Signer, SigningKey};
+use futures::StreamExt;
 use libp2p::multiaddr::Protocol;
-use libp2p::Multiaddr;
+use libp2p::request_response::{self, ProtocolSupport};
+use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
+use libp2p::{noise, relay, tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// How long any single wire interaction may take before a test fails.
@@ -166,4 +171,176 @@ pub fn port_of(addrs: &[Multiaddr], quic: bool) -> Option<u16> {
             _ => None,
         })
     })
+}
+
+// ── libp2p client ────────────────────────────────────────────────────
+
+/// What a test client speaks: circuit relay (as a client) and the
+/// username-receipt protocol (outbound).
+#[derive(NetworkBehaviour)]
+pub struct ClientBehaviour {
+    relay_client: relay::client::Behaviour,
+    username_reg: request_response::cbor::Behaviour<ReceiptRequest, ReceiptResponse>,
+}
+
+/// A second libp2p swarm in the same process, acting as an app node.
+pub struct TestClient {
+    swarm: Swarm<ClientBehaviour>,
+}
+
+impl TestClient {
+    pub fn new() -> Self {
+        let swarm = SwarmBuilder::with_new_identity()
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                noise::Config::new,
+                yamux::Config::default,
+            )
+            .expect("client TCP transport")
+            .with_relay_client(noise::Config::new, yamux::Config::default)
+            .expect("client relay transport")
+            .with_behaviour(|_, relay_client| ClientBehaviour {
+                relay_client,
+                username_reg: request_response::cbor::Behaviour::new(
+                    [(
+                        StreamProtocol::new(username_reg::PROTOCOL),
+                        ProtocolSupport::Outbound,
+                    )],
+                    request_response::Config::default(),
+                ),
+            })
+            .expect("client behaviour")
+            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+            .build();
+        TestClient { swarm }
+    }
+
+    /// Ask the relay at `relay_addr` (with its `/p2p` suffix) for a circuit
+    /// reservation. `Ok` carries the relayed addresses the reservation
+    /// produced; `Err` describes why the reservation listener closed.
+    pub async fn reserve(&mut self, relay_addr: &Multiaddr) -> Result<Vec<Multiaddr>, String> {
+        let listener = self
+            .swarm
+            .listen_on(relay_addr.clone().with(Protocol::P2pCircuit))
+            .map_err(|e| e.to_string())?;
+        let mut addrs = Vec::new();
+        let mut accepted = false;
+        let outcome = async {
+            loop {
+                match self.swarm.select_next_some().await {
+                    SwarmEvent::NewListenAddr {
+                        listener_id,
+                        address,
+                    } if listener_id == listener => {
+                        addrs.push(address);
+                        if accepted {
+                            return Ok(addrs);
+                        }
+                    }
+                    SwarmEvent::Behaviour(ClientBehaviourEvent::RelayClient(
+                        relay::client::Event::ReservationReqAccepted { .. },
+                    )) => {
+                        accepted = true;
+                        if !addrs.is_empty() {
+                            return Ok(addrs);
+                        }
+                    }
+                    SwarmEvent::ListenerClosed {
+                        listener_id,
+                        reason,
+                        ..
+                    } if listener_id == listener => {
+                        return Err(format!("{reason:?}"));
+                    }
+                    _ => {}
+                }
+            }
+        };
+        tokio::time::timeout(STEP_TIMEOUT, outcome)
+            .await
+            .expect("reservation timed out")
+    }
+
+    /// Send a username-receipt request for `claim` to the relay at
+    /// `relay_addr` (with its `/p2p` suffix) and return its response.
+    pub async fn request_receipt(
+        &mut self,
+        relay_addr: &Multiaddr,
+        claim: &UsernameClaim,
+    ) -> ReceiptResponse {
+        let relay_peer = relay_addr
+            .iter()
+            .find_map(|p| match p {
+                Protocol::P2p(peer) => Some(peer),
+                _ => None,
+            })
+            .expect("relay address carries /p2p");
+        let request_id = self
+            .swarm
+            .behaviour_mut()
+            .username_reg
+            .send_request_with_addresses(
+                &relay_peer,
+                ReceiptRequest {
+                    claim: claim.clone(),
+                },
+                vec![relay_addr.clone()],
+            );
+        let outcome = async {
+            loop {
+                if let SwarmEvent::Behaviour(ClientBehaviourEvent::UsernameReg(event)) =
+                    self.swarm.select_next_some().await
+                {
+                    match event {
+                        request_response::Event::Message {
+                            message:
+                                request_response::Message::Response {
+                                    request_id: id,
+                                    response,
+                                },
+                            ..
+                        } if id == request_id => return response,
+                        request_response::Event::OutboundFailure {
+                            request_id: id,
+                            error,
+                            ..
+                        } if id == request_id => panic!("receipt request failed: {error}"),
+                        _ => {}
+                    }
+                }
+            }
+        };
+        tokio::time::timeout(STEP_TIMEOUT, outcome)
+            .await
+            .expect("receipt request timed out")
+    }
+
+    pub fn peer_id(&self) -> PeerId {
+        *self.swarm.local_peer_id()
+    }
+}
+
+/// A validly signed username claim from the deterministic key `seed`.
+///
+/// The `did:key` encoding (multibase `z` + base58btc of `0xed 0x01` + key)
+/// and the signed bytes are the wire contract with the app, written out here
+/// rather than borrowed from the relay.
+pub fn signed_claim(seed: u8, username: &str, claimed_at: i64) -> UsernameClaim {
+    let key = SigningKey::from_bytes(&[seed; 32]);
+    let mut bytes = vec![0xed, 0x01];
+    bytes.extend_from_slice(key.verifying_key().as_bytes());
+    let did = format!("did:key:z{}", bs58::encode(bytes).into_string());
+    let signed = format!("alexandria-username-claim-v1|{username}|{did}|{claimed_at}");
+    let sig = key.sign(signed.as_bytes());
+    UsernameClaim {
+        version: 1,
+        username: username.to_string(),
+        did,
+        claimed_at,
+        sig: hex::encode(sig.to_bytes()),
+        receipt: None,
+        anchor: None,
+        release: None,
+    }
 }
