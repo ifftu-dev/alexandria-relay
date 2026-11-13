@@ -55,8 +55,9 @@ Run what CI runs before you push:
 cargo fmt --check
 cargo clippy --locked -- -D warnings
 cargo test --locked
-cargo audit            # cargo install cargo-audit --locked
-docker build .
+cargo audit                      # cargo install cargo-audit --locked
+cargo deny check licenses bans   # cargo install cargo-deny --locked
+docker build -t relay:local . && scripts/smoke-image.sh relay:local
 ```
 
 ## CI and releases
@@ -69,13 +70,36 @@ docker build .
 | Clippy | `cargo clippy --locked -- -D warnings` |
 | Format | `cargo fmt --check` |
 | Test | `cargo test --locked` |
-| Dependency audit | `cargo audit` (ignores in `.cargo/audit.toml`) |
-| Docker Build | builds the `Dockerfile` with fresh base images |
+| Dependency audit | `cargo audit` through `rustsec/audit-check` (ignores in `.cargo/audit.toml`) |
+| Licences and bans | `cargo deny check licenses bans` (configuration in `deny.toml`) |
+| Docker Build | builds the `Dockerfile` with fresh base images, then `scripts/smoke-image.sh` |
 
-The **Deploy** job runs only on `v*` tags or manual dispatch, after every
-other job passes. It deploys `fly.toml` (Mumbai) and `fly-eu.toml`
-(Frankfurt) in parallel, scales each to one machine and makes sure the
-`relay_data` volume exists. It needs the `FLY_API_TOKEN` repository secret.
+### What a tag produces
+
+Pushing a `v*` tag runs every job above except Docker Build, then:
+
+| Output | Where |
+| --- | --- |
+| Container image, `linux/amd64` and `linux/arm64` | `ghcr.io/ifftu-dev/alexandria-relay`, tagged with the version (`v1.2.3` → `1.2.3`), `latest` and `sha-<commit>` |
+| Static Linux binaries `alexandria-relay-linux-amd64` and `-arm64`, plus `SHA256SUMS` | The GitHub release created from the tag |
+| Deploy of that image to `fly.toml` (Mumbai) and `fly-eu.toml` (Frankfurt) | Fly.io |
+
+Each architecture builds natively on its own runner. The binary attached to
+the release is the one inside the image (`docker buildx build --target binary`
+exports it), and both are smoke-tested on their own architecture before
+anything is published. The image runs as uid/gid `10001` with
+`RELAY_DATA_DIR=/data`.
+
+A tag with a pre-release suffix (`v1.2.3-rc.1`) publishes the image without
+`latest`, marks the release as a pre-release and does not deploy. Use one to
+dry-run a release. A manual run (**Run workflow**) publishes only the
+`sha-<commit>` image, keeps the binaries as workflow artifacts, creates no
+release, and deploys unless `deploy` is unticked.
+
+The deploy copies the published image into each app's Fly registry and
+deploys it, so both regions run the same bytes and nothing builds on Fly. It
+scales each region to one machine and makes sure the `relay_data` volume
+exists. It needs the `FLY_API_TOKEN` repository secret.
 
 ```sh
 git tag vX.Y.Z && git push --tags
