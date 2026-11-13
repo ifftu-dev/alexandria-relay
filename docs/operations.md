@@ -82,6 +82,39 @@ are in seconds.
 Two bounds are part of the wire format and are not configurable: a username
 receipt request is at most 8 KiB, and its DID at most 64 characters.
 
+### DHT records and the store
+
+The relay keeps one SQLite database, `username_registry.db`, in
+`--data-dir`. It holds username receipts and a mirror of every DHT record the
+in-memory store accepted, with each record's expiry and publisher, so a
+restart reloads the records with the time they had left. The database runs
+in write-ahead-log mode, so the directory also holds `-wal` and `-shm` files
+and must be writable, not only the database file. All database work runs on
+one dedicated thread; a burst of DHT writes never delays circuits or HTTP.
+If that thread falls 1,024 requests behind, new mirror writes are dropped
+(the record stays in memory) and receipt requests are refused with "relay
+busy".
+
+- Expired records are skipped on reload and deleted every 10 minutes.
+- When the mirror is over `--kad-max-records`, it evicts expired records
+  first, then the soonest-expiring, then the oldest-inserted.
+- A database written by an older binary is recreated empty at startup. The
+  project is pre-launch, so there are no migrations.
+
+Memory and disk: the records the app writes are signed username claims,
+about 300 bytes bare and 0.8 to 1.5 KB with relay receipts, an anchor and a
+release. With per-record overhead, budget about 2 KB per record: the default
+16,384 records come to about 32 MiB of memory, and a similar amount on disk.
+The cap on record size (`--kad-max-record-bytes`, 64 KiB) is what someone
+writing junk records could reach, about 1 GiB at the default record cap;
+lower `--kad-max-records` on a small machine.
+
+Provider announcements are not mirrored; they expire on their own. The
+memory store keeps at most 20 providers per key (libp2p's default, the
+Kademlia `k`) and ignores further providers until one expires. The
+relay-discovery key is a single key, so at most 20 announcing relays are
+listed on any one relay at a time.
+
 Other hardening:
 - Private, CGNAT, link-local, ULA, IPv4-mapped, multicast and site-local
   addresses are kept out of the DHT routing table.
