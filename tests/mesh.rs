@@ -4,8 +4,9 @@
 //!
 //! The profiles here are synthetic. They have the shape of the app's network
 //! profile (the relay reads only `schema_version`, `network_id`, `relays` and
-//! `protocol_namespace`) and point at loopback relays through names that
-//! resolve to loopback.
+//! `protocol_namespace`) and name loopback relays `localhost` and
+//! `127.0.0.1`. The second is a name the app's DNS-name rule accepts and the
+//! resolver answers without a lookup, so nothing leaves the machine.
 
 mod common;
 
@@ -296,7 +297,7 @@ async fn two_relays_sharing_a_profile_find_each_other() {
     // B dials A by name. A's own dial to B is not needed for the mesh: B's
     // inbound connection is enough.
     let a = MeshMember::new("localhost");
-    let b = MeshMember::new("relay-b.localhost");
+    let b = MeshMember::new("127.0.0.1");
     let path = write_profile(
         dir.path(),
         &profile("testnet", "/alexandria/testnet", &[a.entry(), b.entry()]),
@@ -343,7 +344,7 @@ fn discovery_key(namespace: &str) -> kad::RecordKey {
 async fn an_announcing_relay_is_a_provider_on_its_bootstrap_peer() {
     let dir = TempDir::new();
     let bootstrap = MeshMember::new("localhost");
-    let announcer = MeshMember::new("relay-b.localhost");
+    let announcer = MeshMember::new("127.0.0.1");
     let path = write_profile(
         dir.path(),
         &profile(
@@ -384,8 +385,9 @@ async fn an_announcing_relay_is_a_provider_on_its_bootstrap_peer() {
 #[tokio::test]
 async fn a_relay_that_drops_is_dialled_again() {
     let dir = TempDir::new();
-    let a = MeshMember::new("localhost");
-    let b = MeshMember::new("relay-b.localhost");
+    // B leaves and comes back; A is the one that must reconnect.
+    let a = MeshMember::new("127.0.0.1");
+    let b = MeshMember::new("localhost");
     let path = write_profile(
         dir.path(),
         &profile("testnet", "/alexandria/testnet", &[a.entry(), b.entry()]),
