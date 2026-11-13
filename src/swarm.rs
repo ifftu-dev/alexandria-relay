@@ -396,11 +396,11 @@ impl EventLoop {
                     }
                 }
 
-                // Add to Kademlia routing table
-                self.swarm
-                    .behaviour_mut()
-                    .kademlia
-                    .add_address(&pid, remote_addr.clone());
+                // The remote address is deliberately not added to the
+                // routing table: for an inbound connection it is the peer's
+                // ephemeral source port, often a NAT mapping, which other
+                // peers cannot dial. The peer enters the table from its
+                // Identify-reported addresses (see the Identify arm).
             }
             SwarmEvent::ConnectionClosed {
                 peer_id: pid,

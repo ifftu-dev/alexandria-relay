@@ -7,8 +7,10 @@
 //!    can relay traffic through this node to reach each other.
 //!
 //! 2. **Kademlia DHT** — Uses the private `/alexandria/kad/1.0` protocol.
-//!    Peers register in the DHT on connect. The relay always runs in
-//!    Kademlia server mode (publicly reachable bootstrap node).
+//!    Peers enter the routing table from the routable addresses they report
+//!    through Identify, never from a connection's source address. The relay
+//!    always runs in Kademlia server mode (publicly reachable bootstrap
+//!    node).
 //!
 //! 3. **Identify** — Exchanges peer metadata (listen addresses, protocols)
 //!    so Kademlia can function correctly.
