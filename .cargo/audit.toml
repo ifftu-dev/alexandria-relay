@@ -20,6 +20,9 @@ ignore = [
     #   -0511  NXDOMAIN accepted for an empty non-terminal (no fixed version)
     #   -0512  DNSSEC accepted an unrelated signed RRset (no fixed version)
     #   -0514  resolver returned records that failed DNSSEC validation
+    #   -0530  parent-side NSEC at a zone cut accepted as nonexistence proof
+    #   -0531  child-side NSEC/NSEC3 accepted as proof of no DS record
+    #   -0532  parent-side NSEC3 at a zone cut accepted as nonexistence proof
     #
     # Not reachable: hickory arrives through libp2p's *optional* `dns` and
     # `mdns` features, which this crate does not enable (see the feature list
@@ -46,4 +49,7 @@ ignore = [
     "RUSTSEC-2026-0511",
     "RUSTSEC-2026-0512",
     "RUSTSEC-2026-0514",
+    "RUSTSEC-2026-0530",
+    "RUSTSEC-2026-0531",
+    "RUSTSEC-2026-0532",
 ]
