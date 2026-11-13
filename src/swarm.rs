@@ -413,9 +413,11 @@ impl EventLoop {
     /// Run until `shutdown` fires (or its sender is dropped).
     pub(crate) async fn run(mut self, mut shutdown: watch::Receiver<bool>) {
         let mut health_interval = tokio::time::interval(self.limits.health_log_interval);
-        health_interval.tick().await; // consume immediate tick
-                                      // The first tick fires at once: prune whatever expired while the
-                                      // relay was down.
+        // Consume the immediate tick: the first health line comes one
+        // interval in.
+        health_interval.tick().await;
+        // The first tick fires at once: prune whatever expired while the
+        // relay was down.
         let mut prune_interval = tokio::time::interval(MIRROR_PRUNE_INTERVAL);
 
         // Both fire immediately: the first lookups are the startup dials.

@@ -51,7 +51,7 @@ pub(crate) struct RelayMetrics {
     pub(crate) bootstrap_status: &'static str,
 
     // Rolling 60-second window snapshots — populated by a background
-    // sampling task in `run_metrics_server`. Drives /health/alerts.
+    // sampling task in `serve`. Drives /health/alerts.
     #[serde(skip)]
     pub(crate) prev_minute_circuits_denied: u64,
     #[serde(skip)]
