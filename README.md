@@ -27,6 +27,9 @@ Relay and bootstrap node for the Alexandria P2P network: one Rust binary
   ([limits](docs/operations.md#limits-and-hardening)).
 - Operational endpoints need a bearer token and answer `404` without it.
 - Any node can run a relay. The network does not depend on one instance.
+  With `--network-profile` a relay joins the other relays' DHT; with
+  `--announce` app nodes discover it. Neither makes it a receipt issuer:
+  that is the profile's issuer list.
 
 ## Quick start
 
@@ -53,6 +56,8 @@ and lookup budgets) are in
 | `--metrics-bind` / `RELAY_METRICS_BIND` | `0.0.0.0` | HTTP listen address; `127.0.0.1` keeps it behind a local reverse proxy |
 | `--public-host` / `RELAY_PUBLIC_HOST` | unset | Public hostname. Advertised (with its resolved IPs) in reservation responses; without it clients reject reservations |
 | `--data-dir` / `RELAY_DATA_DIR` | `./relay-data` | Receipts database and DHT record mirror |
+| `--network-profile` / `RELAY_NETWORK_PROFILE` | unset | The app's network profile JSON. With it the relay dials the profile's other relays, redials them with backoff and runs Kademlia bootstrap every 5 minutes; without it, it joins no mesh |
+| `--announce` / `RELAY_ANNOUNCE` | off | Publish this relay under the network's relay-discovery key so app nodes find it. Needs `--network-profile`. Advertises connectivity only; grants no receipt-issuer trust |
 | `--generate-key` | — | Print a keypair seed and exit |
 | `RELAY_SEED` (env only) | random | 32-byte hex seed for a stable PeerId. Read, then cleared from the environment at startup |
 | `RELAY_ADMIN_TOKEN` (env only) | unset | Bearer token for `/peers`, `/metrics` and `/health/alerts`; at least 16 characters, otherwise those endpoints stay off |
