@@ -1,0 +1,50 @@
+# cargo-deny configuration. CI runs `cargo deny check licenses bans`;
+# advisories stay with cargo-audit (.cargo/audit.toml).
+#
+# The relay ships as a container image and as static binaries, so every
+# licence below ends up redistributed inside a release artifact.
+
+[graph]
+# Only the platforms the relay is built for or developed on, so Windows-only
+# crates do not drown the duplicate-version warnings.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+
+[licenses]
+# Permissive licences only. An expression such as `MIT OR Apache-2.0` passes
+# when any one alternative is listed here. Adding a licence is a deliberate
+# change: say in the commit why it is compatible with redistribution.
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.93
+
+# The relay crate itself is not published (`publish = false`); its licence is
+# LICENSE.md at the repository root.
+[licenses.private]
+ignore = true
+
+[bans]
+# Duplicate versions are common in the libp2p tree and are reviewed when
+# libp2p is bumped, not on every pull request.
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+    # The release binaries are statically linked against musl. A system TLS
+    # stack would add a dynamic C dependency; libp2p's QUIC and TLS use rustls.
+    { name = "openssl-sys", reason = "keeps the release binaries static" },
+    { name = "native-tls", reason = "keeps the release binaries static" },
+]
