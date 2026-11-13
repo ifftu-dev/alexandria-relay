@@ -1,6 +1,7 @@
 # Runtime configuration, module split and the black-box test seam
 
-Triage: ready-for-agent
+Status: implemented
+Triage: done
 Repos: alexandria-relay
 Part of: alexandria-relay/docs/relay-hardening-spec.md
 
@@ -53,3 +54,26 @@ first red test is the start function returning bound addresses. Branch from
 `main` after ticket 01 lands; confirm ancestry before editing. Return
 commits, red/green evidence and unresolved blockers. Tracker updates are
 authorized by the invoked implement-spec workflow.
+
+## Notes
+
+- 2026-11-13: Done. The crate is now a library plus a thin binary, with
+  modules `config`, `swarm`, `http`, `store`, `username_reg` and `addr`; the
+  split commit moves code and unit tests unchanged. `RelayConfig` holds every
+  tunable, `Cli` builds it from flags and `RELAY_*` variables with the old
+  constants as defaults (a unit test pins them to the historical literals),
+  and `--help` lists every limit. `start(config)` returns a `RelayHandle`
+  with the PeerId, bound listen addresses, bound HTTP address and a graceful
+  `shutdown()`; the binary waits on SIGTERM/SIGINT and calls it. Red: the
+  first integration test failed to compile because `start`, `RelayConfig`
+  and `RelayHandle` did not exist; green: seven loopback tests in
+  `tests/relay.rs` pass in-process (bound ports, reservation with and
+  without an external host, receipt first-seen order, admin gating,
+  `/health`, shutdown releasing listeners), and the binary started on
+  ephemeral ports and shut down cleanly on SIGTERM.
+- Deviations: secrets (`RELAY_SEED`, `RELAY_ADMIN_TOKEN`) stay
+  environment-only rather than gaining flags, and are listed in `--help`.
+  `--listen-ip4` and `--listen-ip6` are new alongside `--metrics-bind`.
+  The disk mirror now follows the configured record cap and size instead of
+  its own copy of the defaults. The receipt request size cap (8 KiB) and
+  the negotiating-stream cap stay constants, since they are wire bounds.
