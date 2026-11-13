@@ -6,10 +6,11 @@
 //! the in-memory Kademlia store can be refilled after a restart.
 //!
 //! [`RegistryStore`] is synchronous. The running relay never calls it from an
-//! async task: [`StoreHandle::spawn`] moves it onto a dedicated thread, and the
-//! event loop and HTTP handlers talk to that thread over a bounded channel.
+//! async task: [`StoreHandle::open`] opens it on a dedicated thread and keeps
+//! it there, and the event loop and HTTP handlers talk to that thread over a
+//! bounded channel.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use libp2p::identity::Keypair;
@@ -501,11 +502,14 @@ pub(crate) enum StoreError {
     Stopped,
     /// The store took the request and the query failed.
     Query(rusqlite::Error),
+    /// The store could not be opened.
+    Open(String),
 }
 
 impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            StoreError::Open(e) => write!(f, "{e}"),
             StoreError::Busy => write!(f, "the store queue is full"),
             StoreError::Stopped => write!(f, "the store is not running"),
             StoreError::Query(e) => write!(f, "store query failed: {e}"),
@@ -515,6 +519,40 @@ impl std::fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
+/// The store thread's loop: answer each request in arrival order until
+/// told to close or every handle is gone.
+fn serve(mut store: RegistryStore, keypair: &Keypair, mut rx: mpsc::Receiver<Command>) {
+    let relay_peer_id = keypair.public().to_peer_id().to_string();
+    while let Some(command) = rx.blocking_recv() {
+        match command {
+            Command::Receipt { claim, reply } => {
+                let _ = reply.send(store.handle_receipt(keypair, &relay_peer_id, &claim));
+            }
+            Command::Lookup { username, reply } => {
+                let _ = reply.send(store.lookup_username(&username));
+            }
+            Command::Mirror(record) => store.save_kad_record(&record, unix_now()),
+            Command::LoadMirror { reply } => {
+                let _ = reply.send(store.load_kad_records(unix_now()));
+            }
+            Command::PruneExpired => {
+                let n = store.prune_expired(unix_now());
+                if n > 0 {
+                    log::debug!("Pruned {n} expired DHT records from the mirror");
+                }
+            }
+            Command::ReceiptCount { reply } => {
+                let _ = reply.send(store.receipt_count());
+            }
+            Command::Close { reply } => {
+                drop(store);
+                let _ = reply.send(());
+                return;
+            }
+        }
+    }
+}
+
 /// A cheap, cloneable handle to the store thread. Every SQLite call runs on
 /// that thread, in the order requests arrive.
 #[derive(Clone)]
@@ -523,45 +561,41 @@ pub(crate) struct StoreHandle {
 }
 
 impl StoreHandle {
-    /// Move `store` onto a dedicated thread. `keypair` countersigns
-    /// receipts there. The thread stops on [`StoreHandle::close`] or when
-    /// every handle is dropped.
-    pub(crate) fn spawn(mut store: RegistryStore, keypair: Keypair) -> std::io::Result<Self> {
-        let (tx, mut rx) = mpsc::channel(QUEUE_CAPACITY);
-        let relay_peer_id = keypair.public().to_peer_id().to_string();
+    /// Open the store under `data_dir` on a dedicated thread, its mirror
+    /// capped at `max_records` records of at most `max_value_bytes`, and
+    /// return a handle once it is open. Opening (creating the directory,
+    /// switching to WAL, checking the schema) runs on that thread too, so a
+    /// slow or locked database never holds up a runtime worker. `keypair`
+    /// countersigns receipts there. The thread stops on
+    /// [`StoreHandle::close`] or when every handle is dropped.
+    pub(crate) async fn open(
+        data_dir: PathBuf,
+        max_records: usize,
+        max_value_bytes: usize,
+        keypair: Keypair,
+    ) -> Result<Self, StoreError> {
+        let (tx, rx) = mpsc::channel(QUEUE_CAPACITY);
+        let (opened_tx, opened_rx) = oneshot::channel();
         std::thread::Builder::new()
             .name("relay-store".to_string())
-            .spawn(move || {
-                while let Some(command) = rx.blocking_recv() {
-                    match command {
-                        Command::Receipt { claim, reply } => {
-                            let _ =
-                                reply.send(store.handle_receipt(&keypair, &relay_peer_id, &claim));
-                        }
-                        Command::Lookup { username, reply } => {
-                            let _ = reply.send(store.lookup_username(&username));
-                        }
-                        Command::Mirror(record) => store.save_kad_record(&record, unix_now()),
-                        Command::LoadMirror { reply } => {
-                            let _ = reply.send(store.load_kad_records(unix_now()));
-                        }
-                        Command::PruneExpired => {
-                            let n = store.prune_expired(unix_now());
-                            if n > 0 {
-                                log::debug!("Pruned {n} expired DHT records from the mirror");
-                            }
-                        }
-                        Command::ReceiptCount { reply } => {
-                            let _ = reply.send(store.receipt_count());
-                        }
-                        Command::Close { reply } => {
-                            drop(store);
-                            let _ = reply.send(());
-                            return;
-                        }
-                    }
+            .spawn(move || match RegistryStore::open(&data_dir) {
+                Ok(store) => {
+                    let _ = opened_tx.send(Ok(()));
+                    serve(
+                        store.with_kad_caps(max_records, max_value_bytes),
+                        &keypair,
+                        rx,
+                    );
                 }
-            })?;
+                Err(e) => {
+                    let _ = opened_tx.send(Err(e));
+                }
+            })
+            .map_err(|e| StoreError::Open(format!("spawn store thread: {e}")))?;
+        opened_rx
+            .await
+            .map_err(|_| StoreError::Stopped)?
+            .map_err(StoreError::Open)?;
         Ok(StoreHandle { tx })
     }
 
@@ -823,7 +857,11 @@ mod tests {
             ReceiptResponse::Granted(_)
         ));
         let rel_at = i64::MAX - 10;
-        let sig = key1.sign(&canonical_release_bytes(&claim.username, &claim.did, rel_at));
+        let sig = key1.sign(&canonical_release_bytes(
+            &claim.username,
+            &claim.did,
+            rel_at,
+        ));
         claim.release = Some(Release {
             released_at: rel_at,
             sig: hex::encode(sig.to_bytes()),

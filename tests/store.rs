@@ -251,6 +251,51 @@ async fn lookups_answer_while_a_burst_of_dht_puts_is_in_flight() {
     relay.stop().await;
 }
 
+// One runtime thread for the relay and the ticker alike.
+#[tokio::test]
+async fn opening_a_locked_store_does_not_stall_the_runtime() {
+    // A database another process holds under an exclusive lock: opening it
+    // waits out the store's busy timeout, seconds, then gives up.
+    let data_dir = TempDir::new();
+    let locker = rusqlite::Connection::open(data_dir.path().join("username_registry.db")).unwrap();
+    locker
+        .execute_batch("CREATE TABLE held (x); BEGIN EXCLUSIVE; INSERT INTO held VALUES (1);")
+        .unwrap();
+
+    // If the store opened on the runtime thread, this ticker would stop for
+    // the whole wait.
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ticker = tokio::spawn({
+        let done = done.clone();
+        async move {
+            let mut worst = Duration::ZERO;
+            let mut last = Instant::now();
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                worst = worst.max(last.elapsed());
+                last = Instant::now();
+            }
+            worst
+        }
+    });
+    // Let the ticker take its first reading before the relay starts.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let relay = TestRelay::start_in(&data_dir, |_| {}).await;
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    let worst = ticker.await.expect("ticker task");
+    assert!(
+        worst < Duration::from_secs(1),
+        "the runtime stalled for {worst:?} while the store opened"
+    );
+    // The relay came up without its store and says so rather than guessing.
+    let (status, _) = relay.get("/username/ada_99", None).await;
+    assert_eq!(status, 503);
+
+    relay.stop().await;
+    drop(locker);
+}
+
 #[tokio::test]
 async fn a_lookup_the_store_cannot_answer_does_not_report_the_name_free() {
     // A regular file where the data directory should be: the store cannot
