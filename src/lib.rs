@@ -52,6 +52,9 @@
 //!
 //! # Join the network's relay mesh, and advertise this relay for discovery
 //! alexandria-relay --network-profile preprod.json --announce
+//!
+//! # Check that the advertised addresses answer, then exit (0 = reachable)
+//! alexandria-relay doctor --public-host relay.example.org
 //! ```
 
 //!
