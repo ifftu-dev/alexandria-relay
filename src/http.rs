@@ -20,7 +20,7 @@ use crate::addr::{client_bucket, truncate_ip};
 use crate::config::Limits;
 #[cfg(test)]
 use crate::config::{DEFAULT_LOOKUP_LIMIT, DEFAULT_LOOKUP_MAX_TRACKED};
-use crate::store::StoreHandle;
+use crate::store::{StoreError, StoreHandle};
 
 // ── Metrics ──────────────────────────────────────────────────────────
 
@@ -479,14 +479,25 @@ pub(crate) async fn serve(
                             );
                         }
                         let name = name.trim().trim_start_matches('@').to_lowercase();
+                        // Only an answer from the store can say a name is
+                        // free. Without one the relay does not know, and
+                        // "available" would invite a client to claim a name
+                        // someone else holds.
                         let holder = match &registry {
-                            Some(store) => {
-                                store.lookup_username(name.clone()).await.unwrap_or(None)
-                            }
-                            None => None,
+                            Some(store) => store.lookup_username(name.clone()).await,
+                            None => Err(StoreError::Stopped),
                         };
                         match holder {
-                            Some((did, received_at)) => (
+                            Err(e) => {
+                                log::warn!("Username lookup failed: {e}");
+                                (
+                                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                                    Json(serde_json::json!({
+                                        "error": "username registry unavailable — try again later"
+                                    })),
+                                )
+                            }
+                            Ok(Some((did, received_at))) => (
                                 axum::http::StatusCode::OK,
                                 Json(serde_json::json!({
                                     "username": name,
@@ -495,7 +506,7 @@ pub(crate) async fn serve(
                                     "received_at": received_at,
                                 })),
                             ),
-                            None => (
+                            Ok(None) => (
                                 axum::http::StatusCode::OK,
                                 Json(serde_json::json!({
                                     "username": name,

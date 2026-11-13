@@ -440,10 +440,12 @@ impl RegistryStore {
     }
 
     /// Current holder of a username (receipted claims only), for the
-    /// HTTP availability endpoint.
-    pub fn lookup_username(&self, username: &str) -> Option<(String, i64)> {
+    /// HTTP availability endpoint. `Ok(None)` means nobody holds it; a
+    /// failed query is an error, never a free name.
+    pub fn lookup_username(&self, username: &str) -> rusqlite::Result<Option<(String, i64)>> {
         let now = unix_now();
-        self.conn
+        let row = self
+            .conn
             .query_row(
                 "SELECT did, received_at, released_at FROM receipts WHERE username = ?1",
                 [username],
@@ -455,12 +457,13 @@ impl RegistryStore {
                     ))
                 },
             )
-            .ok()
+            .optional()?;
+        Ok(row
             .filter(|(_, _, rel)| match rel {
                 Some(rel_at) => now < rel_at + RELEASE_GRACE_SECS,
                 None => true,
             })
-            .map(|(did, received_at, _)| (did, received_at))
+            .map(|(did, received_at, _)| (did, received_at)))
     }
 }
 
@@ -474,7 +477,7 @@ enum Command {
     },
     Lookup {
         username: String,
-        reply: oneshot::Sender<Option<(String, i64)>>,
+        reply: oneshot::Sender<rusqlite::Result<Option<(String, i64)>>>,
     },
     Mirror(MirroredRecord),
     LoadMirror {
@@ -489,9 +492,28 @@ enum Command {
     },
 }
 
-/// The store queue was full or the store thread has stopped.
+/// Why the store could not answer a request.
 #[derive(Debug)]
-pub(crate) struct StoreBusy;
+pub(crate) enum StoreError {
+    /// The queue was full; the request was not taken.
+    Busy,
+    /// The store thread has stopped, or never started.
+    Stopped,
+    /// The store took the request and the query failed.
+    Query(rusqlite::Error),
+}
+
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StoreError::Busy => write!(f, "the store queue is full"),
+            StoreError::Stopped => write!(f, "the store is not running"),
+            StoreError::Query(e) => write!(f, "store query failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for StoreError {}
 
 /// A cheap, cloneable handle to the store thread. Every SQLite call runs on
 /// that thread, in the order requests arrive.
@@ -548,14 +570,17 @@ impl StoreHandle {
     pub(crate) fn request_receipt(
         &self,
         claim: UsernameClaim,
-    ) -> Result<oneshot::Receiver<ReceiptResponse>, StoreBusy> {
+    ) -> Result<oneshot::Receiver<ReceiptResponse>, StoreError> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .try_send(Command::Receipt {
                 claim: Box::new(claim),
                 reply,
             })
-            .map_err(|_| StoreBusy)?;
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => StoreError::Busy,
+                mpsc::error::TrySendError::Closed(_) => StoreError::Stopped,
+            })?;
         Ok(rx)
     }
 
@@ -573,15 +598,17 @@ impl StoreHandle {
     pub(crate) async fn lookup_username(
         &self,
         username: String,
-    ) -> Result<Option<(String, i64)>, StoreBusy> {
-        self.ask(|reply| Command::Lookup { username, reply }).await
+    ) -> Result<Option<(String, i64)>, StoreError> {
+        self.ask(|reply| Command::Lookup { username, reply })
+            .await?
+            .map_err(StoreError::Query)
     }
 
-    pub(crate) async fn load_kad_records(&self) -> Result<Vec<MirroredRecord>, StoreBusy> {
+    pub(crate) async fn load_kad_records(&self) -> Result<Vec<MirroredRecord>, StoreError> {
         self.ask(|reply| Command::LoadMirror { reply }).await
     }
 
-    pub(crate) async fn receipt_count(&self) -> Result<i64, StoreBusy> {
+    pub(crate) async fn receipt_count(&self) -> Result<i64, StoreError> {
         self.ask(|reply| Command::ReceiptCount { reply }).await
     }
 
@@ -594,10 +621,13 @@ impl StoreHandle {
     async fn ask<T>(
         &self,
         command: impl FnOnce(oneshot::Sender<T>) -> Command,
-    ) -> Result<T, StoreBusy> {
+    ) -> Result<T, StoreError> {
         let (reply, rx) = oneshot::channel();
-        self.tx.send(command(reply)).await.map_err(|_| StoreBusy)?;
-        rx.await.map_err(|_| StoreBusy)
+        self.tx
+            .send(command(reply))
+            .await
+            .map_err(|_| StoreError::Stopped)?;
+        rx.await.map_err(|_| StoreError::Stopped)
     }
 }
 
@@ -767,16 +797,23 @@ mod tests {
         ));
         // Grace elapsed (released_at=0) → lookup hides it, and a new
         // DID can claim the name.
-        assert!(s.lookup_username("ada_99").is_none());
+        assert!(s.lookup_username("ada_99").unwrap().is_none());
         let newcomer = make_claim(2, "ada_99", 2000);
         match s.handle_receipt(&kp, &pid, &newcomer) {
             ReceiptResponse::Granted(_) => {}
             other => panic!("expected Granted for newcomer, got {other:?}"),
         }
         assert_eq!(
-            s.lookup_username("ada_99").map(|(did, _)| did),
+            s.lookup_username("ada_99").unwrap().map(|(did, _)| did),
             Some(newcomer.did)
         );
+    }
+
+    #[test]
+    fn a_lookup_that_fails_is_an_error_not_a_free_name() {
+        let (s, _, _) = store();
+        s.conn.execute_batch("DROP TABLE receipts").unwrap();
+        assert!(s.lookup_username("ada_99").is_err());
     }
 
     #[test]
@@ -800,7 +837,7 @@ mod tests {
         });
         let _ = s.handle_receipt(&kp, &pid, &claim);
         // Still within grace: visible, and another DID is refused.
-        assert!(s.lookup_username("ada_99").is_some());
+        assert!(s.lookup_username("ada_99").unwrap().is_some());
         let other = make_claim(2, "ada_99", 2000);
         assert!(matches!(
             s.handle_receipt(&kp, &pid, &other),

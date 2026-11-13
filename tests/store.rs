@@ -250,3 +250,20 @@ async fn lookups_answer_while_a_burst_of_dht_puts_is_in_flight() {
     );
     relay.stop().await;
 }
+
+#[tokio::test]
+async fn a_lookup_the_store_cannot_answer_does_not_report_the_name_free() {
+    // A regular file where the data directory should be: the store cannot
+    // open, and the relay runs without receipts. Not knowing who holds a
+    // name must not read as "nobody does".
+    let dir = TempDir::new();
+    let not_a_dir = dir.path().join("occupied");
+    std::fs::write(&not_a_dir, b"not a directory").unwrap();
+    let relay = TestRelay::start_with(|c| c.data_dir = not_a_dir).await;
+
+    let (status, body) = relay.get("/username/ada_99", None).await;
+    assert_eq!(status, 503, "{body}");
+    assert!(!body.contains("\"available\""), "{body}");
+
+    relay.stop().await;
+}
