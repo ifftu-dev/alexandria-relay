@@ -133,6 +133,12 @@ pub const DEFAULT_HEALTH_LOG_INTERVAL_SECS: u64 = 300;
 /// A wire-format bound, not a tunable.
 pub(crate) const USERNAME_REQUEST_MAX_BYTES: u64 = 8 * 1024;
 
+/// What `--announce` does and does not grant, logged at startup when
+/// announcing. The flag's `--help` text says the same.
+pub(crate) const ANNOUNCE_SCOPE: &str = "Announcing advertises connectivity only: it grants \
+    no username-receipt issuer trust, which comes from the network profile's issuer list \
+    and the on-chain relay registry.";
+
 // ── Configuration ────────────────────────────────────────────────────
 
 /// Every limit the relay enforces. [`Limits::default`] is the set the relay
@@ -228,6 +234,13 @@ pub struct RelayConfig {
     /// Bearer token for the operational HTTP routes. `None`, empty or shorter
     /// than 16 characters leaves those routes answering 404.
     pub admin_token: Option<String>,
+    /// Path to the network profile JSON. With one, the relay dials the
+    /// profile's other relays and runs Kademlia bootstrap; without one it
+    /// joins no mesh.
+    pub network_profile: Option<PathBuf>,
+    /// Publish this relay as a provider under the network's relay-discovery
+    /// key. Needs `network_profile`. Advertises connectivity only.
+    pub announce: bool,
     pub limits: Limits,
 }
 
@@ -244,6 +257,8 @@ impl Default for RelayConfig {
             public_host: None,
             data_dir: PathBuf::from("./relay-data"),
             admin_token: None,
+            network_profile: None,
+            announce: false,
             limits: Limits::default(),
         }
     }
@@ -325,6 +340,25 @@ pub struct Cli {
     /// records). On a container host, point this at a mounted volume
     #[arg(long, env = "RELAY_DATA_DIR", default_value = "./relay-data")]
     pub data_dir: PathBuf,
+
+    /// Network profile JSON (the app's `resources/networks/<network>.json`).
+    /// With it, the relay dials the profile's other relays at startup,
+    /// reconnects when they drop and runs Kademlia bootstrap periodically.
+    /// Without it, the relay joins no mesh
+    #[arg(long, env = "RELAY_NETWORK_PROFILE", help_heading = "Mesh")]
+    pub network_profile: Option<PathBuf>,
+
+    /// Publish this relay as a provider under the network's relay-discovery
+    /// key so app nodes find it without configuration. Needs
+    /// --network-profile. Announcing advertises connectivity only and grants
+    /// no receipt-issuer trust: that comes from the profile's issuer list
+    #[arg(
+        long,
+        env = "RELAY_ANNOUNCE",
+        requires = "network_profile",
+        help_heading = "Mesh"
+    )]
+    pub announce: bool,
 
     /// Maximum concurrent connections in total
     #[arg(long, env = "RELAY_MAX_CONNECTIONS", default_value_t = DEFAULT_MAX_CONNECTIONS, help_heading = "Connection limits")]
@@ -443,6 +477,8 @@ impl Cli {
             public_host: self.public_host,
             data_dir: self.data_dir,
             admin_token: None,
+            network_profile: self.network_profile,
+            announce: self.announce,
             limits: Limits {
                 max_connections: self.max_connections,
                 max_connections_per_peer: self.max_connections_per_peer,
@@ -517,6 +553,8 @@ mod tests {
         assert_eq!(config.metrics_port, 9090);
         assert_eq!(config.metrics_bind, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert_eq!(config.data_dir, PathBuf::from("./relay-data"));
+        assert_eq!(config.network_profile, None, "no profile: no mesh");
+        assert!(!config.announce);
         let secs = Duration::from_secs;
         assert_eq!(
             config.limits,
@@ -601,6 +639,35 @@ mod tests {
             "RELAY_ADMIN_TOKEN",
         ] {
             assert!(help.contains(var), "--help does not mention {var}");
+        }
+    }
+
+    #[test]
+    fn announce_needs_a_network_profile() {
+        assert!(Cli::try_parse_from(["alexandria-relay", "--announce"]).is_err());
+        let config = Cli::try_parse_from([
+            "alexandria-relay",
+            "--network-profile",
+            "network.json",
+            "--announce",
+        ])
+        .expect("flags parse")
+        .into_config();
+        assert_eq!(config.network_profile, Some(PathBuf::from("network.json")));
+        assert!(config.announce);
+    }
+
+    #[test]
+    fn help_says_announcing_grants_no_issuer_trust() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+        for text in [
+            "RELAY_NETWORK_PROFILE",
+            "RELAY_ANNOUNCE",
+            "advertises connectivity only",
+            "no receipt-issuer trust",
+        ] {
+            assert!(help.contains(text), "--help does not mention {text:?}");
         }
     }
 

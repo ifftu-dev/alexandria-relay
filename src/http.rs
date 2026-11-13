@@ -35,6 +35,14 @@ pub(crate) struct RelayMetrics {
     pub(crate) listener_errors: u64,
     pub(crate) ip_rate_limited: u64,
 
+    /// Other relays named in the network profile (0 without a profile).
+    pub(crate) profile_relays: usize,
+    /// Profile relays this relay currently holds a connection to.
+    pub(crate) reachable_relays: usize,
+    /// `disabled` (no profile), `pending`, `ok` or `failed`: the outcome of
+    /// the last Kademlia bootstrap.
+    pub(crate) bootstrap_status: &'static str,
+
     // Rolling 60-second window snapshots — populated by a background
     // sampling task in `run_metrics_server`. Drives /health/alerts.
     #[serde(skip)]
@@ -312,6 +320,9 @@ pub(crate) async fn serve(
                         "peer_id": lock.peer_id,
                         "uptime_seconds": lock.uptime_seconds,
                         "connections": lock.connections,
+                        "profile_relays": lock.profile_relays,
+                        "reachable_relays": lock.reachable_relays,
+                        "bootstrap_status": lock.bootstrap_status,
                     }))
                 }
             }),

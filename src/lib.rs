@@ -47,6 +47,9 @@
 //!
 //! # Or run with an ephemeral keypair (PeerId changes each restart)
 //! alexandria-relay --port 4001
+//!
+//! # Join the network's relay mesh, and advertise this relay for discovery
+//! alexandria-relay --network-profile preprod.json --announce
 //! ```
 
 //!
@@ -59,6 +62,8 @@
 mod addr;
 pub mod config;
 mod http;
+mod mesh;
+pub mod profile;
 mod store;
 mod swarm;
 pub mod username_reg;
@@ -120,6 +125,16 @@ impl RelayHandle {
 /// register external addresses and spawn the event loop. Returns once every
 /// listener is bound. Must be called inside a Tokio runtime.
 pub async fn start(config: RelayConfig) -> Result<RelayHandle, StartError> {
+    if config.announce && config.network_profile.is_none() {
+        let why = "--announce needs --network-profile: the relay-discovery key comes \
+                   from the profile's protocol namespace";
+        return Err(why.into());
+    }
+    let profile = match &config.network_profile {
+        Some(path) => Some(profile::NetworkProfile::load(path)?),
+        None => None,
+    };
+
     // ── Keypair ──────────────────────────────────────────────────────
     let keypair = match config.keypair.clone() {
         Some(k) => {
@@ -162,6 +177,12 @@ pub async fn start(config: RelayConfig) -> Result<RelayHandle, StartError> {
 
     let metrics = Arc::new(RwLock::new(RelayMetrics {
         peer_id: peer_id.to_string(),
+        bootstrap_status: if profile.is_some() {
+            mesh::BootstrapStatus::Pending
+        } else {
+            mesh::BootstrapStatus::Disabled
+        }
+        .as_str(),
         ..RelayMetrics::default()
     }));
     let (shutdown, shutdown_rx) = watch::channel(false);
@@ -192,16 +213,23 @@ pub async fn start(config: RelayConfig) -> Result<RelayHandle, StartError> {
     };
 
     // ── Swarm ────────────────────────────────────────────────────────
-    let started =
-        match swarm::start_swarm(&config, keypair, registry_store, metrics, http_addr.port()).await
-        {
-            Ok(started) => started,
-            Err(e) => {
-                let _ = shutdown.send(true);
-                let _ = http_task.await;
-                return Err(e);
-            }
-        };
+    let started = match swarm::start_swarm(
+        &config,
+        keypair,
+        registry_store,
+        metrics,
+        http_addr.port(),
+        profile,
+    )
+    .await
+    {
+        Ok(started) => started,
+        Err(e) => {
+            let _ = shutdown.send(true);
+            let _ = http_task.await;
+            return Err(e);
+        }
+    };
     let swarm_task = tokio::spawn(started.event_loop.run(shutdown_rx));
 
     Ok(RelayHandle {
