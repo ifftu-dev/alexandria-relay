@@ -100,11 +100,12 @@ Tuning notes:
 
 ## Deployment (Fly.io)
 
-The `Dockerfile` builds with `rust:1.89-slim-bookworm` and runs on
-`debian:bookworm-slim`. Both stages refuse to build if `ca-certificates` is
-older than `20250419~deb12u2` (the eMudhra trust-store fix). Cargo uses the
-committed lockfile. Updating the repository does not update running machines:
-rebuild and redeploy.
+The `Dockerfile` builds a static musl binary with `rust:1.89-alpine` and runs
+it on `debian:bookworm-slim` as uid/gid `10001`, with `RELAY_DATA_DIR=/data`.
+The runtime stage refuses to build if `ca-certificates` is older than
+`20250419~deb12u2` (the eMudhra trust-store fix). Cargo uses the committed
+lockfile. Updating the repository does not update running machines: tag a
+release or run the workflow to redeploy.
 
 Fly services (`fly.toml`, `fly-eu.toml`):
 

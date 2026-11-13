@@ -7,6 +7,14 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      deploy:
+        description: Deploy the published image to both Fly regions
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -61,21 +69,35 @@ jobs:
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.89.0"
-      - uses: Swatinem/rust-cache@v2
       # Ignores live in .cargo/audit.toml, each with the reason it is not
       # reachable. This node is public infrastructure with no authentication
       # in front of it, so an unreviewed advisory in its tree is a live one.
-      - run: cargo install cargo-audit --locked
-      - run: cargo audit
+      # The action caches the cargo-audit binary between runs.
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
+  deny:
+    name: Licences and bans
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Configuration in deny.toml. A licence outside the allow list fails.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans
+
+  # Build-only check on pull requests and main. Tags and manual runs build
+  # and publish in the `image` job instead.
   docker:
     name: Docker Build
     runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/'))
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -84,14 +106,190 @@ jobs:
           context: .
           pull: true
           push: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          load: true
+          tags: alexandria-relay:ci
+          cache-from: type=gha,scope=linux-amd64
+          cache-to: type=gha,scope=linux-amd64,mode=max
+      - run: scripts/smoke-image.sh alexandria-relay:ci
 
+  # Publishing runs on `v*` tags and manual runs, after every check passes.
+  # Each architecture builds natively on its own runner, pushes its image by
+  # digest and exports the same static binary; `manifest` joins the two
+  # images under one set of tags. Image: ghcr.io/<owner>/<repo>.
+  image:
+    name: Publish ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    needs: [check, clippy, fmt, test, audit, deny]
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+      # Provenance off so each digest is a plain image manifest and the
+      # joined tag is a clean two-platform index (what Fly pulls).
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          pull: true
+          provenance: false
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=linux-${{ matrix.arch }}
+          cache-to: type=gha,scope=linux-${{ matrix.arch }},mode=max
+      - name: Smoke-test the pushed image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          docker pull "$IMAGE@$DIGEST"
+          scripts/smoke-image.sh "$IMAGE@$DIGEST"
+      - name: Record the digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+          retention-days: 1
+      # Same build, served from cache: export the binary the image carries.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          target: binary
+          outputs: type=local,dest=dist
+          cache-from: type=gha,scope=linux-${{ matrix.arch }}
+      - name: Check and name the binary
+        run: |
+          file dist/alexandria-relay | tee /dev/stderr | grep -Eq 'static(-pie)? linked|statically linked'
+          dist/alexandria-relay --generate-key | grep -q 'PeerId:'
+          mv dist/alexandria-relay "dist/alexandria-relay-linux-${{ matrix.arch }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.arch }}
+          path: dist/alexandria-relay-linux-${{ matrix.arch }}
+          if-no-files-found: error
+
+  manifest:
+    name: Publish image tags
+    runs-on: ubuntu-latest
+    needs: [image]
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      ref: ${{ steps.push.outputs.ref }}
+    steps:
+      - name: Image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Tags: the version on `v*` tags (`v1.2.3` -> `1.2.3`), `latest` on tags
+      # without a pre-release suffix, and `sha-<commit>` on every run.
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
+            type=sha,format=long
+      - id: push
+        working-directory: digests
+        env:
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+          SHA_TAG: sha-${{ github.sha }}
+        run: |
+          mapfile -t tag_args < <(jq -r '.tags[] | "--tag", .' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          sources=()
+          for digest in *; do sources+=("$IMAGE@sha256:$digest"); done
+          docker buildx imagetools create "${tag_args[@]}" \
+            --annotation "index:org.opencontainers.image.source=$SOURCE_URL" \
+            --annotation "index:org.opencontainers.image.description=Alexandria P2P relay and bootstrap node" \
+            "${sources[@]}"
+          digest=$(docker buildx imagetools inspect "$IMAGE:$SHA_TAG" --format '{{json .Manifest}}' | jq -r .digest)
+          docker buildx imagetools inspect "$IMAGE@$digest"
+          echo "ref=$IMAGE@$digest" >> "$GITHUB_OUTPUT"
+
+  release:
+    name: GitHub release
+    runs-on: ubuntu-latest
+    needs: [manifest]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: dist
+          merge-multiple: true
+      - name: Create the release and attach the binaries
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          IMAGE_REF: ${{ needs.manifest.outputs.ref }}
+        run: |
+          chmod +x alexandria-relay-linux-*
+          sha256sum alexandria-relay-linux-* > SHA256SUMS
+          cat SHA256SUMS
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" --clobber alexandria-relay-linux-* SHA256SUMS
+          else
+            flags=(--verify-tag --title "$TAG" --generate-notes --notes "Image: $IMAGE_REF")
+            case "$TAG" in *-*) flags+=(--prerelease) ;; esac
+            gh release create "$TAG" "${flags[@]}" alexandria-relay-linux-* SHA256SUMS
+          fi
+
+  # Deploys the image `manifest` published, so both regions run the same
+  # bytes and neither builds on Fly. Release tags and manual runs deploy;
+  # pre-release tags (`v1.2.3-rc.1`) publish without deploying.
   deploy:
     name: Deploy ${{ matrix.region }}
     runs-on: ubuntu-latest
-    needs: [check, clippy, fmt, test, audit, docker]
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    needs: [manifest]
+    if: (github.event_name == 'workflow_dispatch' && inputs.deploy) || (startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-'))
+    permissions:
+      contents: read
+      packages: read
     strategy:
       fail-fast: false
       matrix:
@@ -133,6 +331,26 @@ jobs:
           flyctl volumes list --config ${{ matrix.config }} || true
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-      - run: flyctl deploy --remote-only --config ${{ matrix.config }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Copy the published image into the app's Fly registry, so the deploy
+      # does not depend on the GitHub package being public.
+      - name: Copy the image to the Fly registry
+        id: fly-image
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          CONFIG: ${{ matrix.config }}
+          SOURCE: ${{ needs.manifest.outputs.ref }}
+        run: |
+          app=$(sed -n 's/^app = "\(.*\)"$/\1/p' "$CONFIG")
+          target="registry.fly.io/$app:sha-$GITHUB_SHA"
+          flyctl auth docker
+          docker buildx imagetools create --tag "$target" "$SOURCE"
+          echo "image=$target" >> "$GITHUB_OUTPUT"
+      - run: flyctl deploy --config ${{ matrix.config }} --image ${{ steps.fly-image.outputs.image }}
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
