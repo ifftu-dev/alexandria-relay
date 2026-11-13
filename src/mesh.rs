@@ -84,6 +84,14 @@ pub(crate) enum BootstrapStatus {
 }
 
 impl BootstrapStatus {
+    /// Every state, in the order metrics list them.
+    pub(crate) const ALL: [BootstrapStatus; 4] = [
+        BootstrapStatus::Disabled,
+        BootstrapStatus::Pending,
+        BootstrapStatus::Ok,
+        BootstrapStatus::Failed,
+    ];
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             BootstrapStatus::Disabled => "disabled",

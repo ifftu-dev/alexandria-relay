@@ -39,6 +39,11 @@ cargo run -- --port 4001      # libp2p on TCP + QUIC 4001, HTTP on 9090
 curl localhost:9090/health   # from another shell
 ```
 
+To run a relay of your own (systemd or Docker Compose, TLS, joining the
+mesh, Prometheus, the `doctor` reachability check), follow
+[docs/self-hosting.md](docs/self-hosting.md). Release binaries and the
+`ghcr.io/ifftu-dev/alexandria-relay` image are published on every tag.
+
 ## Configuration
 
 Every flag also reads the matching `RELAY_*` variable; `--help` lists them
@@ -60,6 +65,7 @@ and lookup budgets) are in
 | `--network-profile` / `RELAY_NETWORK_PROFILE` | unset | The app's network profile JSON. With it the relay dials the profile's other relays, redials them with backoff and runs Kademlia bootstrap every 5 minutes; without it, it joins no mesh |
 | `--announce` / `RELAY_ANNOUNCE` | off | Publish this relay under the network's relay-discovery key so app nodes find it. Needs `--network-profile`. Advertises connectivity only; grants no receipt-issuer trust |
 | `--generate-key` | — | Print a keypair seed and exit |
+| `doctor` (subcommand) | — | Start with this configuration, dial every advertised address, report, exit non-zero if none answers |
 | `RELAY_SEED` (env only) | random | 32-byte hex seed for a stable PeerId. Read, then cleared from the environment at startup |
 | `RELAY_ADMIN_TOKEN` (env only) | unset | Bearer token for `/peers`, `/metrics` and `/health/alerts`; at least 16 characters, otherwise those endpoints stay off |
 | `RUST_LOG` (env only) | `info` | Log level |
@@ -77,8 +83,10 @@ serves health, metrics and username lookups. The library's `start`
 runs a whole relay from one configuration value; `src/main.rs` parses flags
 and waits for a signal. Modules: `config` (flags and limits), `swarm`
 (behaviour and event loop), `http` (routes), `store` (SQLite receipts and DHT
-mirror), `username_reg` (receipt wire types and claim verification) and
-`addr` (address helpers). `tests/` drives a relay over loopback.
+mirror), `username_reg` (receipt wire types and claim verification),
+`profile` and `mesh` (network profile and mesh join), `doctor` (the
+reachability check) and `addr` (address helpers). `tests/` drives a relay
+over loopback.
 
 ## Deployed relays
 
@@ -92,7 +100,8 @@ Two Fly.io apps run today: `fly.toml` (Mumbai, `bom`) and `fly-eu.toml`
 
 | Doc | Contents |
 |---|---|
-| [docs/operations.md](docs/operations.md) | Endpoints, alerting, limits, deployment, adding a region |
+| [docs/self-hosting.md](docs/self-hosting.md) | Running your own relay: systemd, Compose, TLS, mesh, `doctor`, Prometheus |
+| [docs/operations.md](docs/operations.md) | Endpoints, metrics, alerting, limits, deployment, adding a region |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Local checks, CI and releases, commit messages |
 | [docs/audits/security-2026-08.md](docs/audits/security-2026-08.md) | Security audit (2026-08, remediated) |
 

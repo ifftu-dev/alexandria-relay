@@ -140,12 +140,28 @@ pub async fn http_get(
     path: &str,
     bearer: Option<&str>,
 ) -> (u16, String) {
+    let (status, _, body) = http_get_with(addr, path, bearer, &[]).await;
+    (status, body)
+}
+
+/// [`http_get`] with extra request headers. Also returns the response's
+/// `Content-Type` (empty when absent).
+pub async fn http_get_with(
+    addr: std::net::SocketAddr,
+    path: &str,
+    bearer: Option<&str>,
+    headers: &[(&str, &str)],
+) -> (u16, String, String) {
     let request = async {
         let mut stream = tokio::net::TcpStream::connect(addr).await?;
-        let auth = bearer
+        let mut extra = bearer
             .map(|t| format!("Authorization: Bearer {t}\r\n"))
             .unwrap_or_default();
-        let req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n{auth}Connection: close\r\n\r\n");
+        for (name, value) in headers {
+            extra.push_str(&format!("{name}: {value}\r\n"));
+        }
+        let req =
+            format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n{extra}Connection: close\r\n\r\n");
         stream.write_all(req.as_bytes()).await?;
         let mut raw = Vec::new();
         stream.read_to_end(&mut raw).await?;
@@ -160,11 +176,16 @@ pub async fn http_get(
         .nth(1)
         .and_then(|s| s.parse().ok())
         .expect("HTTP status line");
-    let body = raw
-        .split_once("\r\n\r\n")
-        .map(|(_, b)| b.to_string())
+    let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
+    let content_type = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-type")
+                .then(|| value.trim().to_string())
+        })
         .unwrap_or_default();
-    (status, body)
+    (status, content_type, body.to_string())
 }
 
 /// The port of the first listen address that uses `protocol`'s transport.

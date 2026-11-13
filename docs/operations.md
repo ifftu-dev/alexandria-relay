@@ -4,7 +4,9 @@ Status: live
 Updated: 2026-11-13
 
 How to run, watch and deploy the relay. Listener and identity settings are
-in the [README](../README.md#configuration); limits are below.
+in the [README](../README.md#configuration); limits are below. To run a
+relay of your own, start with [self-hosting.md](self-hosting.md); this page
+also covers the project's Fly deployment.
 
 ## HTTP endpoints
 
@@ -18,10 +20,10 @@ so a scanner can't tell that they exist.
 
 | Endpoint | Auth | Returns |
 |---|---|---|
-| `GET /health` | public | `{"status":"ok","peer_id":…,"uptime_seconds":…,"connections":…,"profile_relays":…,"reachable_relays":…,"bootstrap_status":…}` |
+| `GET /health` | public | `{"status":"ok","version":…,"peer_id":…,"uptime_seconds":…,"connections":…,"profile_relays":…,"reachable_relays":…,"bootstrap_status":…}`. `connections` is the live count of connected peers |
 | `GET /username/:name` | public | Username availability from the receipt registry. Clients resolve names against it |
 | `GET /health/alerts` | bearer | `200` when healthy, `503` when any alert fires; the body lists firing alerts and rolling 60 s rates |
-| `GET /metrics` | bearer | Connections, circuits, reservations, DHT updates, identify events, listener errors, IP rate limits, rolling-minute denials, mesh state |
+| `GET /metrics` | bearer | Connections, circuits, reservations, receipt requests, DHT updates, identify events, listener errors, IP rate limits, rolling-minute denials, mesh state. JSON, or Prometheus text when `Accept` names `text/plain` ([names](#prometheus)) |
 | `GET /peers` | bearer | `{peer_id, source_prefix, has_reservation}` per peer. `source_prefix` is a `/24` (IPv4) or `/48` (IPv6) network, never a full address |
 
 Mesh state, on both routes: `profile_relays` is how many other relays the
@@ -36,6 +38,27 @@ The `alexandria-monitoring` observer scrapes `/metrics` every 10 seconds
 (and `/peers`, for geo attribution of NATted peers) and shows a relay health
 panel. On the observer, set `RELAY_METRICS_URL` to the relays' `https://…/metrics`
 URLs (comma-separated) and `RELAY_ADMIN_TOKEN` to the relay's token.
+
+### Prometheus
+
+A request whose `Accept` header names `text/plain`, as Prometheus's scraper
+does, gets the text exposition format (0.0.4); anything else gets JSON. Same
+bearer token. Each JSON counter becomes `relay_<field>_total`
+(`relay_circuits_accepted_total`; `total_connections_served` becomes
+`relay_connections_served_total`), each gauge `relay_<field>`
+(`relay_connections`, `relay_reachable_relays`, `relay_uptime_seconds`).
+`relay_bootstrap_status{status="…"}` is 1 for the current state and 0 for
+the others, and `relay_info{peer_id,version}` is always 1. Nothing per peer
+is exported. A scrape configuration is in
+[self-hosting.md](self-hosting.md#prometheus).
+
+### Logs
+
+At the default `info` level the relay logs startup, mesh changes, errors
+and one `HEALTH` line every `--health-log-interval-secs`, with the circuits,
+reservations and receipt requests (accepted and denied) since the previous
+line. Per-connection, per-circuit, per-reservation and per-receipt lines
+are at `debug` (`RUST_LOG=alexandria_relay=debug`).
 
 ## External alerting
 

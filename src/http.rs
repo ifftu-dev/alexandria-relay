@@ -39,6 +39,8 @@ pub(crate) struct RelayMetrics {
     pub(crate) identify_received: u64,
     pub(crate) listener_errors: u64,
     pub(crate) ip_rate_limited: u64,
+    /// Username-receipt requests received, refused ones included.
+    pub(crate) receipt_requests: u64,
 
     /// Other relays named in the network profile (0 without a profile).
     pub(crate) profile_relays: usize,
@@ -78,6 +80,165 @@ pub(crate) struct RelayMetrics {
     /// observer (ad-hoc dialers come and go).
     #[serde(skip)]
     pub(crate) peers_with_reservation: HashSet<PeerId>,
+    /// When the relay started; `uptime_seconds` is computed from it on read.
+    #[serde(skip)]
+    pub(crate) started: Option<Instant>,
+}
+
+impl RelayMetrics {
+    /// A copy with `uptime_seconds` brought up to now.
+    fn snapshot(&self) -> RelayMetrics {
+        let mut m = self.clone();
+        if let Some(started) = self.started {
+            m.uptime_seconds = started.elapsed().as_secs();
+        }
+        m
+    }
+
+    /// Prometheus text exposition (format 0.0.4): every counter and gauge of
+    /// the JSON form, prefixed `relay_`, counters also suffixed `_total`.
+    /// The relay's own PeerId and version are `relay_info` labels. Nothing
+    /// per peer is exported.
+    fn prometheus(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        let counters: [(&str, &str, u64); 11] = [
+            (
+                "connections_served_total",
+                "Connections established since start.",
+                self.total_connections_served,
+            ),
+            (
+                "reservations_accepted_total",
+                "Circuit reservations accepted.",
+                self.reservations_accepted,
+            ),
+            (
+                "reservations_denied_total",
+                "Circuit reservations denied.",
+                self.reservations_denied,
+            ),
+            (
+                "circuits_accepted_total",
+                "Relayed circuits accepted.",
+                self.circuits_accepted,
+            ),
+            (
+                "circuits_denied_total",
+                "Relayed circuits denied.",
+                self.circuits_denied,
+            ),
+            (
+                "circuits_closed_total",
+                "Relayed circuits closed.",
+                self.circuits_closed,
+            ),
+            (
+                "kad_routing_updated_total",
+                "Kademlia routing table updates.",
+                self.kad_routing_updated,
+            ),
+            (
+                "identify_received_total",
+                "Identify messages received.",
+                self.identify_received,
+            ),
+            (
+                "listener_errors_total",
+                "Listener errors since start.",
+                self.listener_errors,
+            ),
+            (
+                "ip_rate_limited_total",
+                "Connections closed by the per-IP limiter.",
+                self.ip_rate_limited,
+            ),
+            (
+                "receipt_requests_total",
+                "Username-receipt requests received.",
+                self.receipt_requests,
+            ),
+        ];
+        let gauges: [(&str, &str, u64); 7] = [
+            (
+                "uptime_seconds",
+                "Seconds since the relay started.",
+                self.uptime_seconds,
+            ),
+            (
+                "connections",
+                "Peers currently connected.",
+                self.connections as u64,
+            ),
+            (
+                "profile_relays",
+                "Other relays the network profile names.",
+                self.profile_relays as u64,
+            ),
+            (
+                "reachable_relays",
+                "Profile relays currently connected.",
+                self.reachable_relays as u64,
+            ),
+            (
+                "circuits_denied_per_min",
+                "Circuits denied in the last full minute.",
+                self.circuits_denied_per_min,
+            ),
+            (
+                "circuits_accepted_per_min",
+                "Circuits accepted in the last full minute.",
+                self.circuits_accepted_per_min,
+            ),
+            (
+                "reservations_denied_per_min",
+                "Reservations denied in the last full minute.",
+                self.reservations_denied_per_min,
+            ),
+        ];
+        let kinds = counters
+            .iter()
+            .map(|c| (c, "counter"))
+            .chain(gauges.iter().map(|g| (g, "gauge")));
+        for ((name, help, value), kind) in kinds {
+            let _ = writeln!(out, "# HELP relay_{name} {help}");
+            let _ = writeln!(out, "# TYPE relay_{name} {kind}");
+            let _ = writeln!(out, "relay_{name} {value}");
+        }
+        let _ = writeln!(
+            out,
+            "# HELP relay_bootstrap_status Kademlia bootstrap state: 1 for the current one."
+        );
+        let _ = writeln!(out, "# TYPE relay_bootstrap_status gauge");
+        for status in crate::mesh::BootstrapStatus::ALL {
+            let status = status.as_str();
+            let value = u8::from(status == self.bootstrap_status);
+            let _ = writeln!(out, "relay_bootstrap_status{{status=\"{status}\"}} {value}");
+        }
+        let _ = writeln!(out, "# HELP relay_info This relay's PeerId and version.");
+        let _ = writeln!(out, "# TYPE relay_info gauge");
+        let _ = writeln!(
+            out,
+            "relay_info{{peer_id=\"{}\",version=\"{}\"}} 1",
+            self.peer_id,
+            env!("CARGO_PKG_VERSION")
+        );
+        out
+    }
+}
+
+/// Content type of [`RelayMetrics::prometheus`].
+const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+
+/// Whether the request asks for the Prometheus text format. Prometheus lists
+/// `text/plain` in its `Accept` header; the monitoring observer and other
+/// JSON clients do not.
+fn wants_prometheus(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(axum::http::header::ACCEPT)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|v| v.to_ascii_lowercase().contains("text/plain"))
 }
 
 /// Wire format for /peers — one entry per connected peer with the WAN
@@ -351,9 +512,10 @@ pub(crate) async fn serve(
             get(move || {
                 let m = health_metrics.clone();
                 async move {
-                    let lock = m.read().await;
+                    let lock = m.read().await.snapshot();
                     Json(serde_json::json!({
                         "status": "ok",
+                        "version": env!("CARGO_PKG_VERSION"),
                         "peer_id": lock.peer_id,
                         "uptime_seconds": lock.uptime_seconds,
                         "connections": lock.connections,
@@ -456,11 +618,20 @@ pub(crate) async fn serve(
                 let m = full_metrics.clone();
                 let token = metrics_token.clone();
                 async move {
+                    use axum::response::IntoResponse;
                     if !admin_authorised(token.as_deref(), &headers) {
-                        return not_found();
+                        return not_found().into_response();
                     }
-                    let lock = m.read().await;
-                    (axum::http::StatusCode::OK, Json(serde_json::json!(*lock)))
+                    let snapshot = m.read().await.snapshot();
+                    if wants_prometheus(&headers) {
+                        (
+                            [(axum::http::header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
+                            snapshot.prometheus(),
+                        )
+                            .into_response()
+                    } else {
+                        Json(serde_json::json!(snapshot)).into_response()
+                    }
                 }
             }),
         );
