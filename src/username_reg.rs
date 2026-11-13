@@ -93,9 +93,23 @@ pub enum ReceiptResponse {
 
 // ── Claim verification (did:key → ed25519) ─────────────────────────
 
+/// Longest `did` string accepted before any decoding.
+///
+/// An Ed25519 `did:key` is fixed-width: the 8-byte `did:key:` prefix, the
+/// multibase `z`, and base58btc of 34 bytes (multicodec `0xed 0x01` plus the
+/// 32-byte key), which is at most 47 characters — 56 in total. The bound
+/// leaves a little slack and exists because base58 decoding is quadratic in
+/// its input: without it, one receipt request carrying a DID near the codec's
+/// size limit pins the swarm's event loop for seconds, and request budgets are
+/// keyed on PeerIds, which cost nothing to mint.
+pub const MAX_DID_KEY_LEN: usize = 64;
+
 /// Extract the Ed25519 verifying key from a `did:key:z6Mk…` string.
 /// Multibase 'z' (base58btc) over multicodec 0xed 0x01 + 32 key bytes.
 fn did_key_to_verifying_key(did: &str) -> Result<ed25519_dalek::VerifyingKey, String> {
+    if did.len() > MAX_DID_KEY_LEN {
+        return Err("did too long for an ed25519 did:key".to_string());
+    }
     let body = did
         .strip_prefix("did:key:z")
         .ok_or("not a did:key with base58btc multibase")?;
@@ -510,6 +524,50 @@ mod tests {
         };
         assert_eq!(r1.received_at, r2.received_at);
         assert_eq!(r1.sig, r2.sig);
+    }
+
+    #[test]
+    fn an_ed25519_did_key_fits_the_length_bound() {
+        // The bound must never refuse a real key. All-0xff key bytes give the
+        // longest base58 encoding a 34-byte payload can have.
+        let mut bytes = vec![0xed, 0x01];
+        bytes.extend_from_slice(&[0xff; 32]);
+        let did = format!("did:key:z{}", bs58::encode(bytes).into_string());
+        assert!(did.len() <= MAX_DID_KEY_LEN, "{} > bound", did.len());
+        let claim = make_claim(1, "ada_99", 1000);
+        assert!(claim.did.len() <= MAX_DID_KEY_LEN);
+    }
+
+    #[test]
+    fn an_oversized_did_is_refused_before_decoding() {
+        // Base58 decoding is quadratic: a 200k-character DID takes seconds to
+        // decode (far longer in a debug build). Refusing it has to be
+        // immediate, so the elapsed-time bound below separates the two paths
+        // by orders of magnitude rather than measuring anything fine-grained.
+        let (mut s, kp, pid) = store();
+        let mut claim = make_claim(1, "ada_99", 1000);
+        claim.did = format!("did:key:z{}", "2".repeat(200_000));
+        let started = std::time::Instant::now();
+        let response = s.handle_receipt(&kp, &pid, &claim);
+        let elapsed = started.elapsed();
+        match response {
+            ReceiptResponse::Refused { reason, .. } => {
+                assert!(reason.starts_with("invalid claim"), "{reason}");
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "oversized DID took {elapsed:?} to refuse"
+        );
+        // The release path decodes the same DID and must be bounded too.
+        assert!(!release_valid(&UsernameClaim {
+            release: Some(Release {
+                released_at: 0,
+                sig: "00".repeat(64),
+            }),
+            ..claim
+        }));
     }
 
     #[test]
