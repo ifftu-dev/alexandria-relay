@@ -74,7 +74,7 @@ use tokio::task::JoinHandle;
 pub use config::{Cli, Limits, RelayConfig};
 
 use crate::http::RelayMetrics;
-use crate::store::RegistryStore;
+use crate::store::{RegistryStore, StoreHandle};
 
 /// Why [`start`] could not bring the relay up.
 pub type StartError = Box<dyn std::error::Error + Send + Sync>;
@@ -87,6 +87,7 @@ pub struct RelayHandle {
     http_addr: SocketAddr,
     shutdown: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
+    store: Option<StoreHandle>,
 }
 
 impl RelayHandle {
@@ -107,11 +108,15 @@ impl RelayHandle {
     }
 
     /// Shut down gracefully — the same path SIGTERM takes in the binary —
-    /// and wait until the event loop and HTTP server have stopped.
+    /// and wait until the event loop and HTTP server have stopped and the
+    /// store has written everything queued to it.
     pub async fn shutdown(self) {
         let _ = self.shutdown.send(true);
         for task in self.tasks {
             let _ = task.await;
+        }
+        if let Some(store) = self.store {
+            store.close().await;
         }
     }
 }
@@ -137,22 +142,25 @@ pub async fn start(config: RelayConfig) -> Result<RelayHandle, StartError> {
     log::info!("Relay PeerId: {peer_id}");
 
     // ── Persistent registry store ────────────────────────────────────
-    // Username receipts + mirrored DHT records.
-    let registry_store = match RegistryStore::open(&config.data_dir) {
-        Ok(s) => {
-            let s = s.with_kad_caps(
-                config.limits.kad_max_records,
-                config.limits.kad_max_record_bytes,
-            );
+    // Username receipts + mirrored DHT records, on the store's own thread.
+    let opened = RegistryStore::open(&config.data_dir).and_then(|s| {
+        let s = s.with_kad_caps(
+            config.limits.kad_max_records,
+            config.limits.kad_max_record_bytes,
+        );
+        StoreHandle::spawn(s, keypair.clone()).map_err(|e| format!("spawn store thread: {e}"))
+    });
+    let registry_store = match opened {
+        Ok(store) => {
             log::info!(
                 "Registry store at {:?} ({} receipts)",
                 config.data_dir,
-                s.receipt_count()
+                store.receipt_count().await.unwrap_or(0)
             );
             // Shared with the HTTP server: /username/:name lets clients
             // check availability over plain HTTPS before they have a
             // P2P identity (signup-time check).
-            Some(Arc::new(std::sync::Mutex::new(s)))
+            Some(store)
         }
         Err(e) => {
             log::error!("Registry store unavailable ({e}) — receipts disabled this run");
@@ -192,16 +200,25 @@ pub async fn start(config: RelayConfig) -> Result<RelayHandle, StartError> {
     };
 
     // ── Swarm ────────────────────────────────────────────────────────
-    let started =
-        match swarm::start_swarm(&config, keypair, registry_store, metrics, http_addr.port()).await
-        {
-            Ok(started) => started,
-            Err(e) => {
-                let _ = shutdown.send(true);
-                let _ = http_task.await;
-                return Err(e);
+    let started = match swarm::start_swarm(
+        &config,
+        keypair,
+        registry_store.clone(),
+        metrics,
+        http_addr.port(),
+    )
+    .await
+    {
+        Ok(started) => started,
+        Err(e) => {
+            let _ = shutdown.send(true);
+            let _ = http_task.await;
+            if let Some(store) = registry_store {
+                store.close().await;
             }
-        };
+            return Err(e);
+        }
+    };
     let swarm_task = tokio::spawn(started.event_loop.run(shutdown_rx));
 
     Ok(RelayHandle {
@@ -210,5 +227,6 @@ pub async fn start(config: RelayConfig) -> Result<RelayHandle, StartError> {
         http_addr,
         shutdown,
         tasks: vec![swarm_task, http_task],
+        store: registry_store,
     })
 }
