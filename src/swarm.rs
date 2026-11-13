@@ -396,6 +396,13 @@ impl EventLoop {
         let mut bootstrap_interval = tokio::time::interval(mesh::BOOTSTRAP_INTERVAL);
         let meshed = self.mesh.is_some();
 
+        // Announce at once, whatever the mesh looks like: a relay alone in
+        // its profile, or whose peers are all down, still holds its own
+        // provider record and serves it to the app nodes that reach it.
+        // Kademlia republishes it on its provider-record interval from here
+        // on, and joining the mesh announces again to reach the new peers.
+        self.announce();
+
         loop {
             tokio::select! {
                 _ = health_interval.tick() => self.on_health_tick().await,

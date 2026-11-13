@@ -383,6 +383,37 @@ async fn an_announcing_relay_is_a_provider_on_its_bootstrap_peer() {
 }
 
 #[tokio::test]
+async fn a_relay_alone_in_its_profile_still_announces() {
+    // The first relay of a network, or one whose peers are all down, has
+    // nobody to connect to. It must still hold its own provider record, so
+    // an app node that reaches it finds it under the discovery key.
+    let dir = TempDir::new();
+    let only = MeshMember::new("localhost");
+    let path = write_profile(
+        dir.path(),
+        &profile("testnet", "/alexandria/testnet", &[only.entry()]),
+    );
+    let relay = only.start(&path, true).await;
+
+    let key = discovery_key("/alexandria/testnet");
+    let mut client = KadClient::new(&relay.tcp_addr());
+    let deadline = tokio::time::Instant::now() + STEP_TIMEOUT;
+    loop {
+        let providers = client.providers(key.clone()).await;
+        if providers.contains(&only.peer_id()) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the lone relay never provided: {providers:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    relay.stop().await;
+}
+
+#[tokio::test]
 async fn a_relay_that_drops_is_dialled_again() {
     let dir = TempDir::new();
     // B leaves and comes back; A is the one that must reconnect.
