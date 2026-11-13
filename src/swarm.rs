@@ -31,6 +31,33 @@ use crate::StartError;
 /// How long startup waits for the IPv4 listeners to report their addresses.
 const LISTEN_TIMEOUT: Duration = Duration::from_secs(10);
 
+// ── Per-event logging ────────────────────────────────────────────────
+
+/// The level of every per-event line: one per connection, Identify,
+/// reservation, circuit, receipt request or Kademlia request. These grow
+/// with traffic, so they stay below the default `info` filter; the counters
+/// and the periodic health line carry their totals.
+const EVENT_LEVEL: log::Level = log::Level::Debug;
+
+/// Targets of the per-event lines, one per kind, all under
+/// `alexandria_relay::event`: `RUST_LOG=alexandria_relay::event=debug` turns
+/// every one on, `RUST_LOG=alexandria_relay::event::receipt=debug` one kind.
+mod event_target {
+    pub(super) const CONNECTION: &str = "alexandria_relay::event::connection";
+    pub(super) const IDENTIFY: &str = "alexandria_relay::event::identify";
+    pub(super) const RESERVATION: &str = "alexandria_relay::event::reservation";
+    pub(super) const CIRCUIT: &str = "alexandria_relay::event::circuit";
+    pub(super) const RECEIPT: &str = "alexandria_relay::event::receipt";
+    pub(super) const KAD: &str = "alexandria_relay::event::kad";
+}
+
+/// Log a per-event line on `target` at [`EVENT_LEVEL`].
+macro_rules! event {
+    ($target:expr, $($arg:tt)+) => {
+        log::log!(target: $target, EVENT_LEVEL, $($arg)+)
+    };
+}
+
 type RelaySwarm = libp2p::Swarm<RelayBehaviour>;
 
 // ── Network Behaviour ────────────────────────────────────────────────
@@ -571,7 +598,8 @@ impl EventLoop {
             } => {
                 self.total_connections_served += 1;
                 let remote_addr = endpoint.get_remote_address();
-                log::debug!(
+                event!(
+                    event_target::CONNECTION,
                     "CONNECT peer:{pid} endpoint:{remote_addr} total_served:{}",
                     self.total_connections_served
                 );
@@ -662,7 +690,10 @@ impl EventLoop {
                     }
                 }
 
-                log::debug!("DISCONNECT peer:{pid} remaining_for_peer:{num_established}");
+                event!(
+                    event_target::CONNECTION,
+                    "DISCONNECT peer:{pid} remaining_for_peer:{num_established}"
+                );
             }
 
             // ── Identify ─────────────────────────────────────
@@ -671,7 +702,8 @@ impl EventLoop {
                 info,
                 ..
             })) => {
-                log::debug!(
+                event!(
+                    event_target::IDENTIFY,
                     "IDENTIFY peer:{pid} proto:{} agent:{}",
                     info.protocol_version,
                     info.agent_version
@@ -700,7 +732,10 @@ impl EventLoop {
             // ── Relay Events ─────────────────────────────────
             SwarmEvent::Behaviour(RelayBehaviourEvent::Relay(event)) => match &event {
                 relay::Event::ReservationReqAccepted { src_peer_id, .. } => {
-                    log::debug!("RELAY reservation accepted for {src_peer_id}");
+                    event!(
+                        event_target::RESERVATION,
+                        "RELAY reservation accepted for {src_peer_id}"
+                    );
                     let mut m = self.metrics.write().await;
                     m.reservations_accepted += 1;
                     m.peers_with_reservation.insert(*src_peer_id);
@@ -710,7 +745,10 @@ impl EventLoop {
                     dst_peer_id,
                     ..
                 } => {
-                    log::debug!("RELAY circuit {src_peer_id} → {dst_peer_id}");
+                    event!(
+                        event_target::CIRCUIT,
+                        "RELAY circuit {src_peer_id} → {dst_peer_id}"
+                    );
                     let mut m = self.metrics.write().await;
                     m.circuits_accepted += 1;
                 }
@@ -719,12 +757,18 @@ impl EventLoop {
                     dst_peer_id,
                     ..
                 } => {
-                    log::debug!("RELAY circuit closed {src_peer_id} → {dst_peer_id}");
+                    event!(
+                        event_target::CIRCUIT,
+                        "RELAY circuit closed {src_peer_id} → {dst_peer_id}"
+                    );
                     let mut m = self.metrics.write().await;
                     m.circuits_closed += 1;
                 }
                 relay::Event::ReservationReqDenied { src_peer_id, .. } => {
-                    log::debug!("RELAY reservation denied for {src_peer_id}");
+                    event!(
+                        event_target::RESERVATION,
+                        "RELAY reservation denied for {src_peer_id}"
+                    );
                     let mut m = self.metrics.write().await;
                     m.reservations_denied += 1;
                 }
@@ -733,12 +777,15 @@ impl EventLoop {
                     dst_peer_id,
                     ..
                 } => {
-                    log::debug!("RELAY circuit denied {src_peer_id} → {dst_peer_id}");
+                    event!(
+                        event_target::CIRCUIT,
+                        "RELAY circuit denied {src_peer_id} → {dst_peer_id}"
+                    );
                     let mut m = self.metrics.write().await;
                     m.circuits_denied += 1;
                 }
                 _ => {
-                    log::debug!("RELAY event: {event:?}");
+                    event!(event_target::CIRCUIT, "RELAY event: {event:?}");
                 }
             },
 
@@ -763,7 +810,11 @@ impl EventLoop {
                     kad::Event::RoutingUpdated {
                         peer, addresses, ..
                     } => {
-                        log::debug!("KAD routing updated peer:{peer} addrs:{}", addresses.len());
+                        event!(
+                            event_target::KAD,
+                            "KAD routing updated peer:{peer} addrs:{}",
+                            addresses.len()
+                        );
                         let mut m = self.metrics.write().await;
                         m.kad_routing_updated += 1;
                     }
@@ -806,7 +857,7 @@ impl EventLoop {
                         }
                     }
                     kad::Event::InboundRequest { request } => {
-                        log::debug!("KAD inbound request: {request:?}");
+                        event!(event_target::KAD, "KAD inbound request: {request:?}");
                     }
                     _ => {
                         log::trace!("KAD event: {event:?}");
@@ -825,7 +876,8 @@ impl EventLoop {
                     ..
                 },
             )) => {
-                log::debug!(
+                event!(
+                    event_target::RECEIPT,
                     "username-reg: receipt request from {peer} for @{}",
                     request.claim.username
                 );
@@ -844,7 +896,10 @@ impl EventLoop {
                 *count += 1;
                 let rate_limited = *count > self.limits.receipt_limit;
                 if rate_limited {
-                    log::debug!("username-reg: rate limiting {peer} ({count} requests in window)");
+                    event!(
+                        event_target::RECEIPT,
+                        "username-reg: rate limiting {peer} ({count} requests in window)"
+                    );
                 }
 
                 // The store thread answers; the event loop sends the
@@ -879,7 +934,7 @@ impl EventLoop {
                 }
             }
             SwarmEvent::Behaviour(RelayBehaviourEvent::UsernameReg(event)) => {
-                log::debug!("username-reg event: {event:?}");
+                event!(event_target::RECEIPT, "username-reg event: {event:?}");
             }
 
             SwarmEvent::OutgoingConnectionError {

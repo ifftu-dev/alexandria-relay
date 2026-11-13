@@ -1,6 +1,7 @@
-//! Log volume: with the default `info` filter, serving clients must not add
-//! a log line per reservation or receipt request. Checked by the level of
-//! the records the relay emits, not by their text.
+//! Log volume: serving clients logs one line per reservation and per receipt
+//! request, at debug on a per-kind target under `alexandria_relay::event`,
+//! and nothing per event at the default `info` level. Checked by the target
+//! and level of the records the relay emits, never by their text.
 //!
 //! One test per binary: the logger is process-global.
 
@@ -10,37 +11,45 @@ use std::sync::Mutex;
 
 use common::{signed_claim, TestClient, TestRelay};
 
-/// Records the level of every relay record at `info` or above.
-struct LevelRecorder {
-    records: Mutex<Vec<log::Level>>,
+/// The targets operators filter on, written out as the contract.
+const RESERVATION_TARGET: &str = "alexandria_relay::event::reservation";
+const RECEIPT_TARGET: &str = "alexandria_relay::event::receipt";
+const EVENT_TARGETS: &str = "alexandria_relay::event::";
+
+/// Records the target and level of every record from the relay's crate.
+struct Recorder {
+    records: Mutex<Vec<(String, log::Level)>>,
 }
 
-impl log::Log for LevelRecorder {
+impl log::Log for Recorder {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() <= log::Level::Info
+        metadata.target().starts_with("alexandria_relay")
     }
 
     fn log(&self, record: &log::Record) {
-        if self.enabled(record.metadata()) && record.target().starts_with("alexandria_relay") {
-            self.records.lock().unwrap().push(record.level());
+        if self.enabled(record.metadata()) {
+            self.records
+                .lock()
+                .unwrap()
+                .push((record.target().to_string(), record.level()));
         }
     }
 
     fn flush(&self) {}
 }
 
-static RECORDER: LevelRecorder = LevelRecorder {
+static RECORDER: Recorder = Recorder {
     records: Mutex::new(Vec::new()),
 };
 
-fn records_since(mark: usize) -> Vec<log::Level> {
+fn records_since(mark: usize) -> Vec<(String, log::Level)> {
     RECORDER.records.lock().unwrap()[mark..].to_vec()
 }
 
 #[tokio::test]
-async fn serving_clients_logs_nothing_per_event_at_the_default_level() {
+async fn per_event_lines_are_emitted_at_debug_and_none_at_info() {
     log::set_logger(&RECORDER).expect("first logger in this binary");
-    log::set_max_level(log::LevelFilter::Info);
+    log::set_max_level(log::LevelFilter::Trace);
 
     let relay = TestRelay::start_with(|c| c.public_host = Some("localhost".to_string())).await;
     let relay_addr = relay.tcp_addr();
@@ -57,9 +66,31 @@ async fn serving_clients_logs_nothing_per_event_at_the_default_level() {
     }
 
     let during = records_since(mark);
+    let loud: Vec<_> = during
+        .iter()
+        .filter(|(_, level)| *level <= log::Level::Info)
+        .collect();
     assert!(
-        during.is_empty(),
-        "per-event records at info or above: {during:?}"
+        loud.is_empty(),
+        "records at info or above while serving: {loud:?}"
+    );
+
+    let count = |target: &str| during.iter().filter(|(t, _)| t == target).count();
+    assert!(
+        count(RESERVATION_TARGET) >= 1,
+        "no reservation line on {RESERVATION_TARGET}: {during:?}"
+    );
+    assert!(
+        count(RECEIPT_TARGET) >= 3,
+        "fewer than three receipt lines on {RECEIPT_TARGET}: {during:?}"
+    );
+    let off_level: Vec<_> = during
+        .iter()
+        .filter(|(t, level)| t.starts_with(EVENT_TARGETS) && *level != log::Level::Debug)
+        .collect();
+    assert!(
+        off_level.is_empty(),
+        "per-event lines not at debug: {off_level:?}"
     );
 
     relay.stop().await;
