@@ -20,6 +20,15 @@ use zeroize::Zeroizing;
 
 // ── Defaults ─────────────────────────────────────────────────────────
 
+/// The libp2p TCP listen port, and the QUIC (UDP) one.
+pub const DEFAULT_PORT: u16 = 4001;
+
+/// The HTTP health, metrics and lookup port.
+pub const DEFAULT_METRICS_PORT: u16 = 9090;
+
+/// Where the receipt store and DHT record mirror live.
+pub const DEFAULT_DATA_DIR: &str = "./relay-data";
+
 /// Maximum total concurrent connections the relay will accept.
 pub const DEFAULT_MAX_CONNECTIONS: u32 = 1024;
 
@@ -288,12 +297,12 @@ impl Default for RelayConfig {
             keypair: None,
             listen_ip4: Ipv4Addr::UNSPECIFIED,
             listen_ip6: Some(Ipv6Addr::UNSPECIFIED),
-            tcp_port: 4001,
-            quic_port: 4001,
+            tcp_port: DEFAULT_PORT,
+            quic_port: DEFAULT_PORT,
             metrics_bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            metrics_port: 9090,
+            metrics_port: DEFAULT_METRICS_PORT,
             public_host: None,
-            data_dir: PathBuf::from("./relay-data"),
+            data_dir: PathBuf::from(DEFAULT_DATA_DIR),
             admin_token: None,
             trusted_proxy_header: None,
             network_profile: None,
@@ -346,11 +355,11 @@ pub struct Cli {
     pub generate_key: bool,
 
     /// TCP listen port (0 = ephemeral)
-    #[arg(long, global = true, env = "RELAY_PORT", default_value_t = 4001)]
+    #[arg(long, global = true, env = "RELAY_PORT", default_value_t = DEFAULT_PORT)]
     pub port: u16,
 
     /// QUIC (UDP) listen port (0 = ephemeral)
-    #[arg(long, global = true, env = "RELAY_QUIC_PORT", default_value_t = 4001)]
+    #[arg(long, global = true, env = "RELAY_QUIC_PORT", default_value_t = DEFAULT_PORT)]
     pub quic_port: u16,
 
     /// IPv4 address the libp2p TCP and QUIC listeners bind
@@ -366,7 +375,7 @@ pub struct Cli {
         long,
         global = true,
         env = "RELAY_METRICS_PORT",
-        default_value_t = 9090
+        default_value_t = DEFAULT_METRICS_PORT
     )]
     pub metrics_port: u16,
 
@@ -389,7 +398,7 @@ pub struct Cli {
         long,
         global = true,
         env = "RELAY_DATA_DIR",
-        default_value = "./relay-data"
+        default_value = DEFAULT_DATA_DIR
     )]
     pub data_dir: PathBuf,
 
@@ -685,6 +694,13 @@ mod tests {
         );
         assert_eq!(config.limits, Limits::default());
         assert_eq!(config.trusted_proxy_header, None);
+        // The library default and the parser agree.
+        let library = RelayConfig::default();
+        assert_eq!(
+            (config.tcp_port, config.quic_port, config.metrics_port),
+            (library.tcp_port, library.quic_port, library.metrics_port)
+        );
+        assert_eq!(config.data_dir, library.data_dir);
     }
 
     #[test]
