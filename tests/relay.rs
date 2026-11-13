@@ -5,6 +5,8 @@
 
 mod common;
 
+use std::time::{Duration, Instant};
+
 use alexandria_relay::username_reg::ReceiptResponse;
 use common::{port_of, signed_claim, TestClient, TestRelay, ADMIN_TOKEN};
 use libp2p::multiaddr::Protocol;
@@ -150,6 +152,51 @@ async fn receipts_follow_first_seen_order() {
 
     relay.stop().await;
 }
+
+#[tokio::test]
+async fn an_oversized_did_is_refused_over_the_wire_without_delay() {
+    // Base58 decoding is quadratic. A DID that fills the request size cap
+    // must be refused before any decoding, or one request pins the event
+    // loop for as long as the decode takes.
+    // Lift the per-peer receipt budget: this test is about decoding, not the
+    // limiter.
+    let relay = TestRelay::start_with(|c| c.limits.receipt_limit = usize::MAX).await;
+    let relay_addr = relay.tcp_addr();
+    let mut client = TestClient::new();
+    // Connect first, so the timing below covers the requests alone.
+    client
+        .request_receipt(&relay_addr, &signed_claim(1, "ada_99", 1_700_000_000))
+        .await;
+
+    // Just under the request size cap, so the codec reads it whole.
+    let mut claim = signed_claim(2, "bob_99", 1_700_000_000);
+    claim.did = format!("did:key:z{}", "2".repeat(7_500));
+    let started = Instant::now();
+    for _ in 0..OVERSIZED_DID_REQUESTS {
+        match client.request_receipt(&relay_addr, &claim).await {
+            ReceiptResponse::Refused { reason, .. } => {
+                assert!(reason.starts_with("invalid claim"), "{reason}");
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < OVERSIZED_DID_BOUND,
+        "{OVERSIZED_DID_REQUESTS} oversized DIDs took {elapsed:?} to refuse"
+    );
+
+    relay.stop().await;
+}
+
+/// Oversized-DID requests sent in a row, so a per-request decode adds up to
+/// far more than loopback round trips do.
+const OVERSIZED_DID_REQUESTS: u32 = 20;
+
+/// How long refusing them all may take. Twenty loopback round trips take
+/// tens of milliseconds even in a debug build; decoding each DID takes
+/// around a hundred.
+const OVERSIZED_DID_BOUND: Duration = Duration::from_millis(600);
 
 #[tokio::test]
 async fn admin_routes_stay_off_without_a_configured_token() {
