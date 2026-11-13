@@ -17,7 +17,7 @@ use tokio::sync::{watch, RwLock, Semaphore};
 use tower::ServiceExt;
 
 use crate::addr::{client_bucket, truncate_ip};
-use crate::config::Limits;
+use crate::config::{Limits, ADMIN_TOKEN_MIN_LEN};
 #[cfg(test)]
 use crate::config::{DEFAULT_LOOKUP_LIMIT, DEFAULT_LOOKUP_MAX_TRACKED};
 use crate::rate::RateWindows;
@@ -377,9 +377,9 @@ fn validated_admin_token(raw: Option<&str>) -> Option<String> {
     if token.is_empty() {
         return None;
     }
-    if token.len() < 16 {
+    if token.len() < ADMIN_TOKEN_MIN_LEN {
         log::error!(
-            "RELAY_ADMIN_TOKEN is shorter than 16 characters — refusing it. \
+            "RELAY_ADMIN_TOKEN is shorter than {ADMIN_TOKEN_MIN_LEN} characters — refusing it. \
              Operational routes stay disabled. Generate one with `openssl rand -base64 32`."
         );
         return None;
@@ -431,10 +431,7 @@ pub(crate) async fn serve(
     }
 
     let health_metrics = metrics.clone();
-    let alerts_metrics = metrics.clone();
-    let peers_metrics = metrics.clone();
-    let full_metrics = metrics;
-    let max_connections = limits.max_connections;
+    let admin_metrics = metrics;
 
     // Operational routes (`/peers`, `/metrics`, `/health/alerts`) require a
     // bearer token. Unconfigured means off — this listener is published to the
@@ -447,10 +444,6 @@ pub(crate) async fn serve(
              will answer 404. Set it to enable operational endpoints."
         );
     }
-    let peers_token = admin_token.clone();
-    let metrics_token = admin_token.clone();
-    let alerts_token = admin_token;
-
     let lookup_limiter = Arc::new(LookupLimiter::new(limits));
 
     let app = Router::new()
@@ -531,115 +524,11 @@ pub(crate) async fn serve(
                 }
             }),
         )
-        .route(
-            "/health/alerts",
-            get(move |headers: axum::http::HeaderMap| {
-                let m = alerts_metrics.clone();
-                let token = alerts_token.clone();
-                async move {
-                    if !admin_authorised(token.as_deref(), &headers) {
-                        return not_found();
-                    }
-                    let lock = m.read().await;
-                    // Thresholds chosen so a healthy relay sits at "ok"
-                    // and a saturated one trips before clients notice.
-                    let connections_ratio = lock.connections as f64 / f64::from(max_connections);
-                    let denial_rate = lock.circuits_denied_per_min;
-                    let accept_rate = lock.circuits_accepted_per_min;
-                    let denial_share = if accept_rate + denial_rate == 0 {
-                        0.0
-                    } else {
-                        denial_rate as f64 / (accept_rate + denial_rate) as f64
-                    };
-
-                    let mut alerts: Vec<&str> = Vec::new();
-                    if connections_ratio > 0.8 {
-                        alerts.push("connections_near_cap");
-                    }
-                    if denial_rate > 100 {
-                        alerts.push("circuits_denied_per_min_high");
-                    }
-                    if denial_share > 0.5 && (denial_rate + accept_rate) > 20 {
-                        alerts.push("circuit_denial_majority");
-                    }
-                    if lock.reservations_denied_per_min > 10 {
-                        alerts.push("reservations_denied_per_min_high");
-                    }
-                    if lock.listener_errors > 0 {
-                        alerts.push("listener_errors_observed");
-                    }
-
-                    let level = if alerts.is_empty() { "ok" } else { "warn" };
-                    let status_code = if alerts.is_empty() {
-                        axum::http::StatusCode::OK
-                    } else {
-                        // 503 makes most healthcheckers (UptimeRobot,
-                        // healthchecks.io, Fly's own checks) flag the
-                        // relay without manually parsing JSON.
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE
-                    };
-                    (
-                        status_code,
-                        Json(serde_json::json!({
-                            "level": level,
-                            "alerts": alerts,
-                            "circuits_denied_per_min": denial_rate,
-                            "circuits_accepted_per_min": accept_rate,
-                            "circuit_denial_share": denial_share,
-                            "reservations_denied_per_min": lock.reservations_denied_per_min,
-                            "connections_ratio": connections_ratio,
-                            "max_connections": max_connections,
-                        })),
-                    )
-                }
-            }),
-        )
-        .route(
-            "/peers",
-            get(move |headers: axum::http::HeaderMap| {
-                let m = peers_metrics.clone();
-                let token = peers_token.clone();
-                async move {
-                    if !admin_authorised(token.as_deref(), &headers) {
-                        return not_found();
-                    }
-                    let lock = m.read().await;
-                    let entries: Vec<PeerSourceEntry> = lock
-                        .peer_source_ips
-                        .iter()
-                        .map(|(pid, ip)| PeerSourceEntry {
-                            peer_id: pid.to_string(),
-                            source_prefix: truncate_ip(ip),
-                            has_reservation: lock.peers_with_reservation.contains(pid),
-                        })
-                        .collect();
-                    (axum::http::StatusCode::OK, Json(serde_json::json!(entries)))
-                }
-            }),
-        )
-        .route(
-            "/metrics",
-            get(move |headers: axum::http::HeaderMap| {
-                let m = full_metrics.clone();
-                let token = metrics_token.clone();
-                async move {
-                    use axum::response::IntoResponse;
-                    if !admin_authorised(token.as_deref(), &headers) {
-                        return not_found().into_response();
-                    }
-                    let snapshot = m.read().await.snapshot();
-                    if wants_prometheus(&headers) {
-                        (
-                            [(axum::http::header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
-                            snapshot.prometheus(),
-                        )
-                            .into_response()
-                    } else {
-                        Json(serde_json::json!(snapshot)).into_response()
-                    }
-                }
-            }),
-        );
+        .merge(admin_routes(
+            admin_metrics,
+            limits.max_connections,
+            admin_token,
+        ));
 
     match listener.local_addr() {
         Ok(addr) => log::info!("Metrics server listening on {addr}"),
@@ -726,6 +615,135 @@ pub(crate) async fn serve(
     // connection holds a slot, so holding all of them means all are closed.
     drop(listener);
     let _ = slots.acquire_many(max_connections as u32).await;
+}
+
+/// The operational routes, `/health/alerts`, `/peers` and `/metrics`, behind
+/// one bearer-token check (see [`admin_authorised`]).
+fn admin_routes(
+    metrics: Arc<RwLock<RelayMetrics>>,
+    max_connections: u32,
+    admin_token: Option<String>,
+) -> Router {
+    let admin_token: Option<Arc<str>> = admin_token.map(Arc::from);
+    let alerts_metrics = metrics.clone();
+    let peers_metrics = metrics.clone();
+    let full_metrics = metrics;
+    Router::new()
+        .route(
+            "/health/alerts",
+            get(move || {
+                let m = alerts_metrics.clone();
+                async move {
+                    let lock = m.read().await;
+                    // Thresholds chosen so a healthy relay sits at "ok"
+                    // and a saturated one trips before clients notice.
+                    let connections_ratio = lock.connections as f64 / f64::from(max_connections);
+                    let denial_rate = lock.circuits_denied_per_min;
+                    let accept_rate = lock.circuits_accepted_per_min;
+                    let denial_share = if accept_rate + denial_rate == 0 {
+                        0.0
+                    } else {
+                        denial_rate as f64 / (accept_rate + denial_rate) as f64
+                    };
+
+                    let mut alerts: Vec<&str> = Vec::new();
+                    if connections_ratio > 0.8 {
+                        alerts.push("connections_near_cap");
+                    }
+                    if denial_rate > 100 {
+                        alerts.push("circuits_denied_per_min_high");
+                    }
+                    if denial_share > 0.5 && (denial_rate + accept_rate) > 20 {
+                        alerts.push("circuit_denial_majority");
+                    }
+                    if lock.reservations_denied_per_min > 10 {
+                        alerts.push("reservations_denied_per_min_high");
+                    }
+                    if lock.listener_errors > 0 {
+                        alerts.push("listener_errors_observed");
+                    }
+
+                    let level = if alerts.is_empty() { "ok" } else { "warn" };
+                    let status_code = if alerts.is_empty() {
+                        axum::http::StatusCode::OK
+                    } else {
+                        // 503 makes most healthcheckers (UptimeRobot,
+                        // healthchecks.io, Fly's own checks) flag the
+                        // relay without manually parsing JSON.
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    };
+                    (
+                        status_code,
+                        Json(serde_json::json!({
+                            "level": level,
+                            "alerts": alerts,
+                            "circuits_denied_per_min": denial_rate,
+                            "circuits_accepted_per_min": accept_rate,
+                            "circuit_denial_share": denial_share,
+                            "reservations_denied_per_min": lock.reservations_denied_per_min,
+                            "connections_ratio": connections_ratio,
+                            "max_connections": max_connections,
+                        })),
+                    )
+                }
+            }),
+        )
+        .route(
+            "/peers",
+            get(move || {
+                let m = peers_metrics.clone();
+                async move {
+                    let lock = m.read().await;
+                    let entries: Vec<PeerSourceEntry> = lock
+                        .peer_source_ips
+                        .iter()
+                        .map(|(pid, ip)| PeerSourceEntry {
+                            peer_id: pid.to_string(),
+                            source_prefix: truncate_ip(ip),
+                            has_reservation: lock.peers_with_reservation.contains(pid),
+                        })
+                        .collect();
+                    Json(serde_json::json!(entries))
+                }
+            }),
+        )
+        .route(
+            "/metrics",
+            get(move |headers: axum::http::HeaderMap| {
+                let m = full_metrics.clone();
+                async move {
+                    use axum::response::IntoResponse;
+                    let snapshot = m.read().await.snapshot();
+                    if wants_prometheus(&headers) {
+                        (
+                            [(axum::http::header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
+                            snapshot.prometheus(),
+                        )
+                            .into_response()
+                    } else {
+                        Json(serde_json::json!(snapshot)).into_response()
+                    }
+                }
+            }),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            admin_token,
+            require_admin,
+        ))
+}
+
+/// Pass the request on only when it carries the admin token; answer 404
+/// otherwise (see [`admin_authorised`] for why not 401).
+async fn require_admin(
+    axum::extract::State(token): axum::extract::State<Option<Arc<str>>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if !admin_authorised(token.as_deref(), request.headers()) {
+        return not_found().into_response();
+    }
+    next.run(request).await
 }
 
 #[cfg(test)]

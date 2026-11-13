@@ -24,6 +24,7 @@ use libp2p::swarm::{dummy, SwarmEvent};
 use libp2p::{noise, relay, tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::config::ADMIN_TOKEN_MIN_LEN;
 use crate::{start, RelayConfig};
 
 /// How long one dial, reservation or HTTP request may take.
@@ -139,9 +140,10 @@ pub async fn run(config: RelayConfig) -> DoctorReport {
             "admin token: not configured (/metrics, /peers and /health/alerts answer 404)"
                 .to_string()
         }
-        Some(token) if token.len() < 16 => {
-            "FAIL  admin token: configured, but shorter than 16 characters, so refused".to_string()
-        }
+        Some(token) if token.len() < ADMIN_TOKEN_MIN_LEN => format!(
+            "FAIL  admin token: configured, but shorter than {ADMIN_TOKEN_MIN_LEN} characters, \
+             so refused"
+        ),
         Some(token) => {
             match http_status(http, "/metrics", token).await {
                 Ok(200) => format!("admin token: configured, accepted by http://{http}/metrics"),

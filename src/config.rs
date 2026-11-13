@@ -93,6 +93,11 @@ pub const DEFAULT_HTTP_MAX_CONNECTIONS: usize = 256;
 /// `--trusted-proxy-header` takes when given without one.
 pub const FLY_CLIENT_IP_HEADER: &str = "fly-client-ip";
 
+/// Shortest `RELAY_ADMIN_TOKEN` the relay accepts. A shorter one is refused
+/// and the operational routes stay off, since a guessable token reads as
+/// protection without giving any.
+pub const ADMIN_TOKEN_MIN_LEN: usize = 16;
+
 /// How long an idle connection stays open before being reaped, in seconds.
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 600;
 
