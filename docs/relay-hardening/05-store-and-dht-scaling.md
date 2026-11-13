@@ -1,6 +1,7 @@
 # Move the store off the event loop and let the DHT mirror expire
 
-Triage: ready-for-agent
+Status: implemented
+Triage: done
 Repos: alexandria-relay
 Part of: alexandria-relay/docs/relay-hardening-spec.md
 Blocked by: alexandria-relay/docs/relay-hardening/03-runtime-config-and-black-box-seam.md
@@ -45,3 +46,35 @@ black-box seam from ticket 03 and the existing store unit seam. Branch from
 the tip containing 03; confirm ancestry. Return commits, red/green evidence
 and unresolved blockers. Tracker updates are authorized by the invoked
 implement-spec workflow.
+
+## Notes
+
+- 2026-11-13: Done. `RegistryStore` runs on a dedicated `relay-store`
+  thread behind `StoreHandle`, a cloneable handle over a bounded channel.
+  The event loop queues mirror writes and receipt requests without waiting
+  and sends each receipt response when the store answers; HTTP lookups
+  await their reply; startup warm-loads through the same handle, and
+  shutdown waits for the queue to drain. The database opens in WAL mode
+  with `synchronous=NORMAL` and a busy timeout, keeps a cached mirror row
+  count, and carries a schema version: any other version is recreated
+  empty. Mirrored records keep their absolute expiry and publisher;
+  expired rows are skipped on load, pruned at startup and every ten
+  minutes, and evicted first, then the soonest-expiring, then the
+  oldest-inserted. `docs/operations.md` describes the store, restates the
+  memory budget from the size of real username-claim records, and states
+  the per-key provider cap of 20.
+- Red: against the pre-ticket source, the restart test got the record back
+  without its publisher or expiry, and the expiry test got the expired
+  record back after the restart. Green: three loopback tests in
+  `tests/store.rs` (restart keeps expiry and publisher, expired record
+  absent after restart, lookups answer within one second during a burst
+  of 2,000 puts) and unit tests for eviction order, the cached count,
+  expiry on load, WAL mode and schema recreation. The eviction and count
+  tests were checked by mutation (insertion-order eviction, counting
+  upserts) and failed as expected.
+- Deviations: the record cap was already configuration from ticket 03. The
+  burst test also passes against the old store on a developer laptop,
+  where an fsync is cheap; it guards bounded latency rather than
+  reproducing the stall. The prune interval is a constant, not a flag. A
+  full store queue drops the mirror write and refuses the receipt with
+  "relay busy" rather than blocking the event loop.
