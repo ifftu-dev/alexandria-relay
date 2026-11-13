@@ -1,8 +1,8 @@
 # Relay hardening and self-hosting
 
-Status: draft
-Updated: 2026-11-12
-Triage: ready-for-agent
+Status: implemented
+Updated: 2026-11-13
+Triage: done
 Repos: alexandria-relay
 
 Parent spec. Work is split into numbered sub-tickets under
@@ -336,3 +336,15 @@ self-hosting guide with a reachability check built into the binary.
 - Hosting on a plain VPS with a public address is the configuration under
   which every limiter works as designed, and it is the configuration the
   self-hosting guide describes first.
+
+## Notes
+
+- 2026-11-13: Implemented. All seven tickets are done; ticket 01 shipped
+  first on its own, the rest landed together after a two-axis code review
+  (standards and spec) whose findings were fixed in the same series. 89
+  tests pass, 34 of them black-box tests over loopback. Still open, and
+  listed in tickets 04 and 07: the first real tag run (multi-arch image,
+  release binaries, image-based deploy) and the guide commands that need
+  the published image and release URL. Before the first image-based deploy
+  to the region with a volume, the volume's owner must change to the
+  container's non-root user (see ticket 04).
