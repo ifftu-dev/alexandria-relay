@@ -178,6 +178,7 @@ pub async fn start(config: RelayConfig) -> Result<RelayHandle, StartError> {
         let metrics = metrics.clone();
         let registry = registry_store.clone();
         let admin_token = config.admin_token.clone();
+        let trusted_proxy_header = config.trusted_proxy_header.clone();
         let limits = config.limits.clone();
         let shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
@@ -186,6 +187,7 @@ pub async fn start(config: RelayConfig) -> Result<RelayHandle, StartError> {
                 metrics,
                 registry,
                 admin_token.as_deref(),
+                trusted_proxy_header,
                 &limits,
                 shutdown_rx,
             )

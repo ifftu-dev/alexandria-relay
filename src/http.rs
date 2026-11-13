@@ -1,17 +1,22 @@
-//! HTTP router: health, metrics, peers and the public username lookup.
+//! HTTP router: health, metrics, peers and the public username lookup, and
+//! the server loop that bounds slow and surplus connections.
 
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::extract::ConnectInfo;
+use axum::http::{HeaderMap, HeaderName};
 use axum::routing::get;
 use axum::{Json, Router};
+use hyper_util::rt::{TokioIo, TokioTimer};
 use libp2p::PeerId;
 use serde::Serialize;
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{watch, RwLock, Semaphore};
+use tower::ServiceExt;
 
-use crate::addr::truncate_ip;
+use crate::addr::{client_bucket, truncate_ip};
 use crate::config::Limits;
 #[cfg(test)]
 use crate::config::{DEFAULT_LOOKUP_LIMIT, DEFAULT_LOOKUP_MAX_TRACKED};
@@ -50,8 +55,9 @@ pub(crate) struct RelayMetrics {
     pub(crate) circuits_accepted_per_min: u64,
     pub(crate) reservations_denied_per_min: u64,
 
-    /// Source IPs of currently-connected peers, captured from the
-    /// connection's remote address at ConnectionEstablished. Surfaced
+    /// Client buckets (see [`client_bucket`]) of currently-connected peers,
+    /// captured from the connection's remote address at
+    /// ConnectionEstablished; an IPv6 peer is held as its /64. Surfaced
     /// via /peers so the observer can attribute geo to NATted peers
     /// (whose own listen_addrs only include private LAN + circuit
     /// addrs and so never reveal their WAN IP through libp2p Identify).
@@ -137,9 +143,11 @@ impl LookupLimiter {
         }
     }
 
-    /// True when `ip` is over its lookup budget. Prunes stale windows on the
-    /// way through so the map stays bounded without a separate sweeper.
+    /// True when `ip`'s client bucket is over its lookup budget. Prunes
+    /// stale windows on the way through so the map stays bounded without a
+    /// separate sweeper.
     fn is_limited(&self, ip: IpAddr) -> bool {
+        let ip = client_bucket(ip);
         let Ok(mut map) = self.windows.lock() else {
             // A poisoned lock means a panic mid-update. Refusing is the safe
             // direction: a caller can retry, and allowing would silently
@@ -161,6 +169,31 @@ impl LookupLimiter {
         *count += 1;
         *count > self.limit
     }
+}
+
+/// The address an HTTP request came from.
+///
+/// With no trusted header configured this is the socket peer address, and
+/// whatever headers the client sent are ignored: a client that reaches the
+/// listener directly must not be able to choose its own address. With one
+/// configured, the address is read from the last instance of that header,
+/// and from its last comma-separated entry, which is the one the nearest
+/// proxy wrote (`X-Forwarded-For` style headers append). A missing or
+/// unparsable header falls back to the socket address, which behind a proxy
+/// charges the request to the proxy's shared budget: the strict direction.
+fn client_ip(socket: IpAddr, headers: &HeaderMap, trusted: Option<&HeaderName>) -> IpAddr {
+    trusted
+        .and_then(|name| headers.get_all(name).iter().next_back())
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.rsplit(',').next())
+        .map(str::trim)
+        .and_then(|entry| {
+            entry
+                .parse::<IpAddr>()
+                .ok()
+                .or_else(|| entry.parse::<SocketAddr>().ok().map(|s| s.ip()))
+        })
+        .unwrap_or(socket)
 }
 
 /// The answer for an operational route that was not authorised.
@@ -200,6 +233,7 @@ pub(crate) async fn serve(
     metrics: Arc<RwLock<RelayMetrics>>,
     registry: Option<SharedStore>,
     admin_token: Option<&str>,
+    trusted_proxy_header: Option<HeaderName>,
     limits: &Limits,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -261,13 +295,13 @@ pub(crate) async fn serve(
             "/username/:name",
             get(
                 move |axum::extract::Path(name): axum::extract::Path<String>,
-                      axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<
-                    std::net::SocketAddr,
-                >| {
+                      ConnectInfo(addr): ConnectInfo<SocketAddr>,
+                      headers: HeaderMap| {
                     let registry = registry.clone();
                     let limiter = lookup_limiter.clone();
+                    let client = client_ip(addr.ip(), &headers, trusted_proxy_header.as_ref());
                     async move {
-                        if limiter.is_limited(addr.ip()) {
+                        if limiter.is_limited(client) {
                             return (
                                 axum::http::StatusCode::TOO_MANY_REQUESTS,
                                 Json(serde_json::json!({
@@ -421,17 +455,87 @@ pub(crate) async fn serve(
         Ok(addr) => log::info!("Metrics server listening on {addr}"),
         Err(e) => log::warn!("Metrics server listening on an unknown address: {e}"),
     }
-    if let Err(e) = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
-        let _ = shutdown.changed().await;
-    })
-    .await
-    {
-        log::error!("Metrics server error: {e}");
+
+    // ── Connection loop ─────────────────────────────────────────────
+    // Served through hyper directly rather than `axum::serve`, which has
+    // no header-read timeout and no connection bound. A connection takes a
+    // slot before it is accepted, so past the limit new connections wait in
+    // the kernel's listen backlog instead of costing memory here. HTTP/1.1
+    // only: every client of this listener (health checkers, the app's
+    // lookup, the observer) speaks it, and HTTP/2 would add surface for
+    // nothing.
+    let max_connections = limits
+        .http_max_connections
+        .clamp(1, Semaphore::MAX_PERMITS.min(u32::MAX as usize));
+    let slots = Arc::new(Semaphore::new(max_connections));
+    let request_timeout = limits.http_request_timeout;
+    let mut http1 = hyper::server::conn::http1::Builder::new();
+    http1
+        .timer(TokioTimer::new())
+        .header_read_timeout(limits.http_header_read_timeout);
+
+    loop {
+        let slot = tokio::select! {
+            slot = slots.clone().acquire_owned() => match slot {
+                Ok(slot) => slot,
+                Err(_) => break, // never closed; unreachable in practice
+            },
+            _ = shutdown.changed() => break,
+        };
+        let (stream, remote) = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    // Usually descriptor exhaustion. Back off instead of
+                    // spinning on an accept that keeps failing.
+                    log::warn!("HTTP accept failed: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            },
+            _ = shutdown.changed() => break,
+        };
+
+        let app = app.clone();
+        let service =
+            hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
+                req.extensions_mut().insert(ConnectInfo(remote));
+                let app = app.clone();
+                async move {
+                    match tokio::time::timeout(request_timeout, app.oneshot(req)).await {
+                        Ok(response) => response,
+                        Err(_) => {
+                            log::warn!("HTTP request from {remote} exceeded {request_timeout:?}");
+                            Ok(axum::response::IntoResponse::into_response((
+                                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                                Json(serde_json::json!({ "error": "request timed out" })),
+                            )))
+                        }
+                    }
+                }
+            });
+        let connection = http1.serve_connection(TokioIo::new(stream), service);
+        let mut conn_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let _slot = slot;
+            tokio::pin!(connection);
+            let result = tokio::select! {
+                result = connection.as_mut() => result,
+                _ = conn_shutdown.changed() => {
+                    connection.as_mut().graceful_shutdown();
+                    connection.await
+                }
+            };
+            if let Err(e) = result {
+                log::debug!("HTTP connection from {remote} ended: {e}");
+            }
+        });
     }
+
+    // Stop accepting, then let in-flight requests finish: every open
+    // connection holds a slot, so holding all of them means all are closed.
+    drop(listener);
+    let _ = slots.acquire_many(max_connections as u32).await;
 }
 
 #[cfg(test)]
@@ -446,6 +550,49 @@ mod tests {
             HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
         );
         h
+    }
+
+    fn with_header(name: &str, values: &[&str]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for v in values {
+            h.append(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn the_client_address_comes_from_the_trusted_header_only() {
+        let socket: IpAddr = "10.0.0.1".parse().unwrap();
+        let fly = HeaderName::from_static("fly-client-ip");
+        let headers = with_header("fly-client-ip", &["198.51.100.7"]);
+        assert_eq!(client_ip(socket, &headers, None), socket);
+        assert_eq!(
+            client_ip(socket, &headers, Some(&fly)),
+            "198.51.100.7".parse::<IpAddr>().unwrap()
+        );
+        // Configured but absent or garbage: the socket address.
+        assert_eq!(client_ip(socket, &HeaderMap::new(), Some(&fly)), socket);
+        let garbage = with_header("fly-client-ip", &["not-an-address"]);
+        assert_eq!(client_ip(socket, &garbage, Some(&fly)), socket);
+    }
+
+    #[test]
+    fn an_appending_header_is_read_from_its_last_entry() {
+        // A client can prepend anything to X-Forwarded-For; only the entry
+        // the nearest proxy appended is trustworthy.
+        let socket: IpAddr = "10.0.0.1".parse().unwrap();
+        let xff = HeaderName::from_static("x-forwarded-for");
+        let headers = with_header(
+            "x-forwarded-for",
+            &["203.0.113.1", "203.0.113.2, [2001:db8::1]:443"],
+        );
+        assert_eq!(
+            client_ip(socket, &headers, Some(&xff)),
+            "2001:db8::1".parse::<IpAddr>().unwrap()
+        );
     }
 
     #[test]

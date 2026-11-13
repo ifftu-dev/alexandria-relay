@@ -16,7 +16,7 @@ use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{identify, kad, noise, relay, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder};
 use tokio::sync::{watch, RwLock};
 
-use crate::addr::{extract_ip, is_globally_routable};
+use crate::addr::{client_bucket, extract_ip, is_globally_routable};
 use crate::config::{Limits, RelayConfig, USERNAME_REQUEST_MAX_BYTES};
 use crate::http::RelayMetrics;
 use crate::store::RegistryStore;
@@ -361,15 +361,17 @@ impl EventLoop {
                     self.total_connections_served
                 );
 
-                // Record peer's WAN IP so /peers can publish it.
-                // We capture on every Established and overwrite on
-                // reconnect — last-known address wins.
-                if let Some(ip) = extract_ip(remote_addr) {
+                // Record the peer's client bucket so /peers can publish its
+                // truncated prefix. Captured on every Established and
+                // overwritten on reconnect — last-known address wins.
+                let bucket = extract_ip(remote_addr).map(client_bucket);
+                if let Some(ip) = bucket {
                     self.metrics.write().await.peer_source_ips.insert(pid, ip);
                 }
 
-                // IP-level rate limiting
-                if let Some(ip) = extract_ip(remote_addr) {
+                // IP-level rate limiting, keyed on the client bucket so one
+                // IPv6 subscriber cannot rotate through its /64.
+                if let Some(ip) = bucket {
                     let active = self.ip_active_connections.entry(ip).or_insert(0);
                     *active += 1;
 
@@ -409,7 +411,7 @@ impl EventLoop {
                 ..
             } => {
                 // Decrement IP active connection count
-                if let Some(ip) = extract_ip(endpoint.get_remote_address()) {
+                if let Some(ip) = extract_ip(endpoint.get_remote_address()).map(client_bucket) {
                     if let Some(active) = self.ip_active_connections.get_mut(&ip) {
                         *active = active.saturating_sub(1);
                         if *active == 0 {

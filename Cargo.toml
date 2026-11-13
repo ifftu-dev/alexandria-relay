@@ -28,6 +28,12 @@ hex = "0.4"
 rand = "0.8"
 zeroize = "1"
 axum = { version = "0.7", features = ["json"] }
+# The HTTP listener is served through hyper directly (not `axum::serve`) for
+# its header-read timeout and a per-connection concurrency bound. All three are
+# already axum dependencies; no new crates.
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = { version = "0.5", features = ["util"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

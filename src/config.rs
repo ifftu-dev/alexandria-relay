@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
+use axum::http::HeaderName;
 use clap::Parser;
 use libp2p::identity::Keypair;
 use zeroize::Zeroizing;
@@ -70,6 +71,27 @@ pub const DEFAULT_LOOKUP_WINDOW_SECS: u64 = 60;
 /// Cap on tracked client IPs for the lookup limiter, so the map cannot
 /// itself become the memory leak.
 pub const DEFAULT_LOOKUP_MAX_TRACKED: usize = 10_000;
+
+/// How long the HTTP listener waits for a request's headers, in seconds.
+///
+/// Counted from when the server starts reading a request, including on an
+/// idle keep-alive connection, so a client that opens a socket and sends
+/// nothing (or trickles bytes) holds a connection slot for at most this long.
+pub const DEFAULT_HTTP_HEADER_READ_TIMEOUT_SECS: u64 = 10;
+
+/// How long an HTTP request may take from headers received to response, in
+/// seconds. Every route is a map read or a single-row SQLite query, so this
+/// only fires when something is badly wrong; the client gets a 503.
+pub const DEFAULT_HTTP_REQUEST_TIMEOUT_SECS: u64 = 15;
+
+/// Maximum concurrent HTTP connections. Further connections wait in the
+/// listen backlog until one closes, so a flood of slow clients cannot grow
+/// memory or file descriptors without bound.
+pub const DEFAULT_HTTP_MAX_CONNECTIONS: usize = 256;
+
+/// The header the Fly proxy writes the client address into. The value
+/// `--trusted-proxy-header` takes when given without one.
+pub const FLY_CLIENT_IP_HEADER: &str = "fly-client-ip";
 
 /// How long an idle connection stays open before being reaped, in seconds.
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 600;
@@ -163,6 +185,9 @@ pub struct Limits {
     pub lookup_limit: usize,
     pub lookup_window: Duration,
     pub lookup_max_tracked: usize,
+    pub http_header_read_timeout: Duration,
+    pub http_request_timeout: Duration,
+    pub http_max_connections: usize,
     pub health_log_interval: Duration,
 }
 
@@ -194,6 +219,9 @@ impl Default for Limits {
             lookup_limit: DEFAULT_LOOKUP_LIMIT,
             lookup_window: Duration::from_secs(DEFAULT_LOOKUP_WINDOW_SECS),
             lookup_max_tracked: DEFAULT_LOOKUP_MAX_TRACKED,
+            http_header_read_timeout: Duration::from_secs(DEFAULT_HTTP_HEADER_READ_TIMEOUT_SECS),
+            http_request_timeout: Duration::from_secs(DEFAULT_HTTP_REQUEST_TIMEOUT_SECS),
+            http_max_connections: DEFAULT_HTTP_MAX_CONNECTIONS,
             health_log_interval: Duration::from_secs(DEFAULT_HEALTH_LOG_INTERVAL_SECS),
         }
     }
@@ -228,6 +256,11 @@ pub struct RelayConfig {
     /// Bearer token for the operational HTTP routes. `None`, empty or shorter
     /// than 16 characters leaves those routes answering 404.
     pub admin_token: Option<String>,
+    /// Header the HTTP handlers read the client address from. `None` uses
+    /// the socket peer address and ignores any such header. Set it only
+    /// when every request reaches the listener through a proxy that
+    /// overwrites the header; otherwise clients choose their own address.
+    pub trusted_proxy_header: Option<HeaderName>,
     pub limits: Limits,
 }
 
@@ -244,6 +277,7 @@ impl Default for RelayConfig {
             public_host: None,
             data_dir: PathBuf::from("./relay-data"),
             admin_token: None,
+            trusted_proxy_header: None,
             limits: Limits::default(),
         }
     }
@@ -325,6 +359,15 @@ pub struct Cli {
     /// records). On a container host, point this at a mounted volume
     #[arg(long, env = "RELAY_DATA_DIR", default_value = "./relay-data")]
     pub data_dir: PathBuf,
+
+    /// Read the HTTP client address from this request header instead of the
+    /// socket address. Given without a value it is `Fly-Client-IP`. Only
+    /// for a listener that every request reaches through a proxy that
+    /// overwrites the header: on a directly reachable listener any client
+    /// can write a fresh address into it and dodge the per-client lookup
+    /// limit. Unset, the header is ignored
+    #[arg(long, env = "RELAY_TRUSTED_PROXY_HEADER", num_args = 0..=1, default_missing_value = FLY_CLIENT_IP_HEADER, value_name = "HEADER")]
+    pub trusted_proxy_header: Option<HeaderName>,
 
     /// Maximum concurrent connections in total
     #[arg(long, env = "RELAY_MAX_CONNECTIONS", default_value_t = DEFAULT_MAX_CONNECTIONS, help_heading = "Connection limits")]
@@ -422,6 +465,18 @@ pub struct Cli {
     #[arg(long, env = "RELAY_LOOKUP_MAX_TRACKED", default_value_t = DEFAULT_LOOKUP_MAX_TRACKED, help_heading = "Username registry limits")]
     pub lookup_max_tracked: usize,
 
+    /// Time allowed for an HTTP request's headers to arrive, in seconds
+    #[arg(long, env = "RELAY_HTTP_HEADER_READ_TIMEOUT_SECS", default_value_t = DEFAULT_HTTP_HEADER_READ_TIMEOUT_SECS, value_parser = clap::value_parser!(u64).range(1..), help_heading = "HTTP limits")]
+    pub http_header_read_timeout_secs: u64,
+
+    /// Time allowed from an HTTP request's headers to its response, in seconds
+    #[arg(long, env = "RELAY_HTTP_REQUEST_TIMEOUT_SECS", default_value_t = DEFAULT_HTTP_REQUEST_TIMEOUT_SECS, value_parser = clap::value_parser!(u64).range(1..), help_heading = "HTTP limits")]
+    pub http_request_timeout_secs: u64,
+
+    /// Maximum concurrent HTTP connections; more wait in the listen backlog
+    #[arg(long, env = "RELAY_HTTP_MAX_CONNECTIONS", default_value_t = DEFAULT_HTTP_MAX_CONNECTIONS, value_parser = clap::builder::TypedValueParser::map(clap::value_parser!(u32).range(1..), |n| n as usize), help_heading = "HTTP limits")]
+    pub http_max_connections: usize,
+
     /// Interval between health log lines, in seconds
     #[arg(long, env = "RELAY_HEALTH_LOG_INTERVAL_SECS", default_value_t = DEFAULT_HEALTH_LOG_INTERVAL_SECS, value_parser = clap::value_parser!(u64).range(1..))]
     pub health_log_interval_secs: u64,
@@ -443,6 +498,7 @@ impl Cli {
             public_host: self.public_host,
             data_dir: self.data_dir,
             admin_token: None,
+            trusted_proxy_header: self.trusted_proxy_header,
             limits: Limits {
                 max_connections: self.max_connections,
                 max_connections_per_peer: self.max_connections_per_peer,
@@ -468,6 +524,9 @@ impl Cli {
                 lookup_limit: self.lookup_limit,
                 lookup_window: Duration::from_secs(self.lookup_window_secs),
                 lookup_max_tracked: self.lookup_max_tracked,
+                http_header_read_timeout: Duration::from_secs(self.http_header_read_timeout_secs),
+                http_request_timeout: Duration::from_secs(self.http_request_timeout_secs),
+                http_max_connections: self.http_max_connections,
                 health_log_interval: Duration::from_secs(self.health_log_interval_secs),
             },
         }
@@ -545,10 +604,39 @@ mod tests {
                 lookup_limit: 30,
                 lookup_window: secs(60),
                 lookup_max_tracked: 10_000,
+                http_header_read_timeout: secs(10),
+                http_request_timeout: secs(15),
+                http_max_connections: 256,
                 health_log_interval: secs(300),
             }
         );
         assert_eq!(config.limits, Limits::default());
+        assert_eq!(config.trusted_proxy_header, None);
+    }
+
+    #[test]
+    fn the_trusted_proxy_header_is_opt_in_and_defaults_to_fly() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("alexandria-relay").chain(args.iter().copied()))
+                .expect("flags parse")
+                .into_config()
+                .trusted_proxy_header
+        };
+        assert_eq!(parse(&[]), None, "unset means the socket address");
+        assert_eq!(
+            parse(&["--trusted-proxy-header"]),
+            Some(HeaderName::from_static("fly-client-ip"))
+        );
+        assert_eq!(
+            parse(&["--trusted-proxy-header", "X-Real-IP"]),
+            Some(HeaderName::from_static("x-real-ip"))
+        );
+        assert!(Cli::try_parse_from([
+            "alexandria-relay",
+            "--trusted-proxy-header",
+            "not a header"
+        ])
+        .is_err());
     }
 
     #[test]
@@ -597,6 +685,10 @@ mod tests {
             "RELAY_LOOKUP_MAX_TRACKED",
             "RELAY_HEALTH_LOG_INTERVAL_SECS",
             "RELAY_METRICS_BIND",
+            "RELAY_TRUSTED_PROXY_HEADER",
+            "RELAY_HTTP_HEADER_READ_TIMEOUT_SECS",
+            "RELAY_HTTP_REQUEST_TIMEOUT_SECS",
+            "RELAY_HTTP_MAX_CONNECTIONS",
             "RELAY_SEED",
             "RELAY_ADMIN_TOKEN",
         ] {
