@@ -38,17 +38,25 @@ curl localhost:9090/health   # from another shell
 
 ## Configuration
 
-| Parameter | Kind | Default | Description |
-|---|---|---|---|
-| `--port` | flag | `4001` | TCP listen port |
-| `--quic-port` | flag | `4001` | QUIC (UDP) listen port |
-| `--metrics-port` | flag | `9090` | HTTP health and metrics port |
-| `--generate-key` | flag | — | Print a keypair seed and exit |
-| `--public-host` / `RELAY_PUBLIC_HOST` | flag or env | unset | Public hostname. Advertised (with its resolved IPs) in reservation responses; without it clients reject reservations |
-| `--data-dir` / `RELAY_DATA_DIR` | flag or env | `./relay-data` | Receipts database and DHT record mirror |
-| `RELAY_SEED` | env | random | 32-byte hex seed for a stable PeerId. Read, then cleared from the environment at startup |
-| `RELAY_ADMIN_TOKEN` | env | unset | Bearer token for `/peers`, `/metrics` and `/health/alerts`; at least 16 characters, otherwise those endpoints stay off |
-| `RUST_LOG` | env | `info` | Log level |
+Every flag also reads the matching `RELAY_*` variable; `--help` lists them
+all with their defaults. Limits (connections, circuits, DHT records, receipt
+and lookup budgets) are in
+[docs/operations.md](docs/operations.md#limits-and-hardening).
+
+| Flag / variable | Default | Description |
+|---|---|---|
+| `--port` / `RELAY_PORT` | `4001` | TCP listen port (`0` = ephemeral) |
+| `--quic-port` / `RELAY_QUIC_PORT` | `4001` | QUIC (UDP) listen port |
+| `--listen-ip4` / `RELAY_LISTEN_IP4` | `0.0.0.0` | IPv4 address the libp2p listeners bind |
+| `--listen-ip6` / `RELAY_LISTEN_IP6` | `::` | IPv6 address the libp2p listeners also bind (best-effort), or `off` |
+| `--metrics-port` / `RELAY_METRICS_PORT` | `9090` | HTTP health, metrics and lookup port |
+| `--metrics-bind` / `RELAY_METRICS_BIND` | `0.0.0.0` | HTTP listen address; `127.0.0.1` keeps it behind a local reverse proxy |
+| `--public-host` / `RELAY_PUBLIC_HOST` | unset | Public hostname. Advertised (with its resolved IPs) in reservation responses; without it clients reject reservations |
+| `--data-dir` / `RELAY_DATA_DIR` | `./relay-data` | Receipts database and DHT record mirror |
+| `--generate-key` | — | Print a keypair seed and exit |
+| `RELAY_SEED` (env only) | random | 32-byte hex seed for a stable PeerId. Read, then cleared from the environment at startup |
+| `RELAY_ADMIN_TOKEN` (env only) | unset | Bearer token for `/peers`, `/metrics` and `/health/alerts`; at least 16 characters, otherwise those endpoints stay off |
+| `RUST_LOG` (env only) | `info` | Log level |
 
 Set `RELAY_SEED` and `RELAY_PUBLIC_HOST` in production. Generate an admin
 token with `openssl rand -base64 32`; the monitoring observer needs the same
@@ -58,9 +66,12 @@ value.
 
 TCP (Noise + Yamux) and QUIC transports carry Circuit Relay v2, Kademlia and
 Identify, plus the username-receipt request/response protocol. An Axum HTTP
-server serves health, metrics and username lookups. Code lives in
-`src/main.rs` (swarm, limits, HTTP) and `src/username_reg.rs` (receipts,
-SQLite store, DHT mirror).
+server serves health, metrics and username lookups. The library's `start`
+runs a whole relay from one configuration value; `src/main.rs` parses flags
+and waits for a signal. Modules: `config` (flags and limits), `swarm`
+(behaviour and event loop), `http` (routes), `store` (SQLite receipts and DHT
+mirror), `username_reg` (receipt wire types and claim verification) and
+`addr` (address helpers). `tests/` drives a relay over loopback.
 
 ## Deployed relays
 

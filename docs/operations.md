@@ -1,15 +1,16 @@
 # Relay operations
 
 Status: live
-Updated: 2026-11-12
+Updated: 2026-11-13
 
-How to run, watch and deploy the relay. Configuration flags and env vars are
-in the [README](../README.md#configuration).
+How to run, watch and deploy the relay. Listener and identity settings are
+in the [README](../README.md#configuration); limits are below.
 
 ## HTTP endpoints
 
-The HTTP server listens on the metrics port (default `9090`). On Fly it is
-also served over TLS on `443`; `9090` is kept for the platform healthcheck.
+The HTTP server listens on `--metrics-bind` and `--metrics-port` (default
+`0.0.0.0:9090`). On Fly it is also served over TLS on `443`; `9090` is kept
+for the platform healthcheck.
 
 Operational endpoints need `Authorization: Bearer $RELAY_ADMIN_TOKEN`. They
 answer `404`, not `401`, when the token is missing, wrong or not configured,
@@ -38,7 +39,7 @@ Point an HTTP monitor (UptimeRobot, healthchecks.io) at
 
 | Alert | Fires when |
 |---|---|
-| `connections_near_cap` | connections > 80% of the 1,024 cap |
+| `connections_near_cap` | connections > 80% of `--max-connections` (default 1,024) |
 | `circuits_denied_per_min_high` | > 100 circuit denials in the last minute |
 | `circuit_denial_majority` | denials > accepts in the last minute, with > 20 total |
 | `reservations_denied_per_min_high` | > 10 reservation denials in the last minute |
@@ -46,20 +47,40 @@ Point an HTTP monitor (UptimeRobot, healthchecks.io) at
 
 ## Limits and hardening
 
-Values are constants in `src/main.rs` and `src/username_reg.rs`.
+Every limit is a flag with a matching environment variable, read at
+startup; `alexandria-relay --help` lists them with their defaults. Durations
+are in seconds.
 
-| Limit | Value |
-|---|---|
-| Connections | 1,024 total, 8 per PeerId |
-| Connections still in the handshake | 256 incoming |
-| Connections per IP | 32 concurrent, 32 new per minute |
-| Relay reservations | 1,024 total, 16 per peer, 1 h each |
-| Relay circuits | 2,048 total, 128 per peer, 128 MB and 15 min each |
-| DHT records | 16,384 (memory store and disk mirror), 64 KB each |
-| Username receipt requests | 5 per PeerId per minute, 8 KiB each, DID at most 64 characters |
-| Username lookups (`/username/:name`) | 30 per minute per client IP |
-| Idle connection timeout | 10 min |
-| Health log interval | 5 min |
+| Limit | Flag | Variable | Default |
+|---|---|---|---|
+| Connections in total | `--max-connections` | `RELAY_MAX_CONNECTIONS` | 1024 |
+| Connections per PeerId | `--max-connections-per-peer` | `RELAY_MAX_CONNECTIONS_PER_PEER` | 8 |
+| Incoming connections still in the handshake | `--max-pending-incoming` | `RELAY_MAX_PENDING_INCOMING` | 256 |
+| Concurrent connections per IP | `--max-connections-per-ip` | `RELAY_MAX_CONNECTIONS_PER_IP` | 32 |
+| New connections per IP per window | `--max-new-connections-per-ip` | `RELAY_MAX_NEW_CONNECTIONS_PER_IP` | 32 |
+| Per-IP connection window | `--ip-rate-window-secs` | `RELAY_IP_RATE_WINDOW_SECS` | 60 |
+| Idle connection timeout | `--idle-timeout-secs` | `RELAY_IDLE_TIMEOUT_SECS` | 600 |
+| Identify addresses added per peer | `--max-identify-addrs` | `RELAY_MAX_IDENTIFY_ADDRS` | 16 |
+| Kademlia query timeout | `--kad-query-timeout-secs` | `RELAY_KAD_QUERY_TIMEOUT_SECS` | 60 |
+| Kademlia replication factor | `--kad-replication-factor` | `RELAY_KAD_REPLICATION_FACTOR` | 20 |
+| DHT records (memory store and disk mirror) | `--kad-max-records` | `RELAY_KAD_MAX_RECORDS` | 16384 |
+| DHT record size, bytes | `--kad-max-record-bytes` | `RELAY_KAD_MAX_RECORD_BYTES` | 65536 |
+| Reservations in total | `--max-reservations` | `RELAY_MAX_RESERVATIONS` | 1024 |
+| Reservations per peer | `--max-reservations-per-peer` | `RELAY_MAX_RESERVATIONS_PER_PEER` | 16 |
+| Reservation lifetime | `--reservation-duration-secs` | `RELAY_RESERVATION_DURATION_SECS` | 3600 |
+| Circuits in total | `--max-circuits` | `RELAY_MAX_CIRCUITS` | 2048 |
+| Circuits per peer | `--max-circuits-per-peer` | `RELAY_MAX_CIRCUITS_PER_PEER` | 128 |
+| Bytes per circuit | `--max-circuit-bytes` | `RELAY_MAX_CIRCUIT_BYTES` | 134217728 (128 MiB) |
+| Circuit lifetime | `--max-circuit-duration-secs` | `RELAY_MAX_CIRCUIT_DURATION_SECS` | 900 |
+| Username receipt requests per PeerId per window | `--receipt-limit` | `RELAY_RECEIPT_LIMIT` | 5 |
+| Receipt window | `--receipt-window-secs` | `RELAY_RECEIPT_WINDOW_SECS` | 60 |
+| Username lookups per client IP per window | `--lookup-limit` | `RELAY_LOOKUP_LIMIT` | 30 |
+| Lookup window | `--lookup-window-secs` | `RELAY_LOOKUP_WINDOW_SECS` | 60 |
+| Client IPs the lookup limiter tracks | `--lookup-max-tracked` | `RELAY_LOOKUP_MAX_TRACKED` | 10000 |
+| Health log interval | `--health-log-interval-secs` | `RELAY_HEALTH_LOG_INTERVAL_SECS` | 300 |
+
+Two bounds are part of the wire format and are not configurable: a username
+receipt request is at most 8 KiB, and its DID at most 64 characters.
 
 Other hardening:
 - Private, CGNAT, link-local, ULA, IPv4-mapped, multicast and site-local
@@ -70,11 +91,12 @@ Other hardening:
 
 Tuning notes:
 - The per-IP limits suit residential and mobile NATs. Load tests from one IP
-  (CI runners, dev clusters) will hit them; raise them for the test.
-- The per-peer circuit cap (128) is the first limit to raise if you add
-  observers that fan-dial peers through circuits, since each counts as the
-  source peer. With several high-frequency observers, try 256–512 before the
-  global circuit cap becomes the bottleneck.
+  (CI runners, dev clusters) will hit them; start the relay under test with
+  higher `--max-connections-per-ip` and `--max-new-connections-per-ip`.
+- The per-peer circuit cap (`--max-circuits-per-peer`) is the first limit to
+  raise if you add observers that fan-dial peers through circuits, since
+  each counts as the source peer. With several high-frequency observers, try
+  256–512 before the global circuit cap becomes the bottleneck.
 
 ## Deployment (Fly.io)
 
