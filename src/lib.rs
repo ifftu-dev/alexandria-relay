@@ -7,8 +7,10 @@
 //!    can relay traffic through this node to reach each other.
 //!
 //! 2. **Kademlia DHT** — Uses the private `/alexandria/kad/1.0` protocol.
-//!    Peers register in the DHT on connect. The relay always runs in
-//!    Kademlia server mode (publicly reachable bootstrap node).
+//!    Peers enter the routing table from the routable addresses they report
+//!    through Identify, never from a connection's source address. The relay
+//!    always runs in Kademlia server mode (publicly reachable bootstrap
+//!    node).
 //!
 //! 3. **Identify** — Exchanges peer metadata (listen addresses, protocols)
 //!    so Kademlia can function correctly.
@@ -176,6 +178,7 @@ pub async fn start(config: RelayConfig) -> Result<RelayHandle, StartError> {
         let metrics = metrics.clone();
         let registry = registry_store.clone();
         let admin_token = config.admin_token.clone();
+        let trusted_proxy_header = config.trusted_proxy_header.clone();
         let limits = config.limits.clone();
         let shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
@@ -184,6 +187,7 @@ pub async fn start(config: RelayConfig) -> Result<RelayHandle, StartError> {
                 metrics,
                 registry,
                 admin_token.as_deref(),
+                trusted_proxy_header,
                 &limits,
                 shutdown_rx,
             )

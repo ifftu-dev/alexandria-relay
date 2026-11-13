@@ -51,6 +51,7 @@ and lookup budgets) are in
 | `--listen-ip6` / `RELAY_LISTEN_IP6` | `::` | IPv6 address the libp2p listeners also bind (best-effort), or `off` |
 | `--metrics-port` / `RELAY_METRICS_PORT` | `9090` | HTTP health, metrics and lookup port |
 | `--metrics-bind` / `RELAY_METRICS_BIND` | `0.0.0.0` | HTTP listen address; `127.0.0.1` keeps it behind a local reverse proxy |
+| `--trusted-proxy-header` / `RELAY_TRUSTED_PROXY_HEADER` | unset | Read the HTTP client address from this header (`Fly-Client-IP` when given without a value). Only behind a proxy that overwrites it; see [client addresses](docs/operations.md#client-addresses-behind-a-proxy) |
 | `--public-host` / `RELAY_PUBLIC_HOST` | unset | Public hostname. Advertised (with its resolved IPs) in reservation responses; without it clients reject reservations |
 | `--data-dir` / `RELAY_DATA_DIR` | `./relay-data` | Receipts database and DHT record mirror |
 | `--generate-key` | — | Print a keypair seed and exit |
@@ -65,8 +66,9 @@ value.
 ## Architecture
 
 TCP (Noise + Yamux) and QUIC transports carry Circuit Relay v2, Kademlia and
-Identify, plus the username-receipt request/response protocol. An Axum HTTP
-server serves health, metrics and username lookups. The library's `start`
+Identify, plus the username-receipt request/response protocol. An Axum
+router, served over HTTP/1.1 by hyper with header and request timeouts,
+serves health, metrics and username lookups. The library's `start`
 runs a whole relay from one configuration value; `src/main.rs` parses flags
 and waits for a signal. Modules: `config` (flags and limits), `swarm`
 (behaviour and event loop), `http` (routes), `store` (SQLite receipts and DHT
