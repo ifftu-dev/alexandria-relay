@@ -515,8 +515,14 @@ impl EventLoop {
                 // truncated prefix. Captured on every Established and
                 // overwritten on reconnect — last-known address wins.
                 let bucket = extract_ip(remote_addr).map(client_bucket);
-                if let Some(ip) = bucket {
-                    self.metrics.write().await.peer_source_ips.insert(pid, ip);
+                {
+                    let connections = self.swarm.connected_peers().count();
+                    let mut m = self.metrics.write().await;
+                    m.connections = connections;
+                    m.total_connections_served = self.total_connections_served;
+                    if let Some(ip) = bucket {
+                        m.peer_source_ips.insert(pid, ip);
+                    }
                 }
 
                 // IP-level rate limiting, keyed on the client bucket so one
@@ -579,7 +585,9 @@ impl EventLoop {
                 // forget the peer's WAN IP and reservation flag.
                 // (libp2p delivers `num_established` post-decrement.)
                 if num_established == 0 {
+                    let connections = self.swarm.connected_peers().count();
                     let mut m = self.metrics.write().await;
+                    m.connections = connections;
                     m.peer_source_ips.remove(&pid);
                     m.peers_with_reservation.remove(&pid);
                     if let Some(mesh) = self.mesh.as_mut().filter(|m| m.is_member(&pid)) {

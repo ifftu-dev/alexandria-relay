@@ -193,6 +193,7 @@ pub async fn start(config: RelayConfig) -> Result<RelayHandle, StartError> {
             mesh::BootstrapStatus::Disabled
         }
         .as_str(),
+        started: Some(std::time::Instant::now()),
         ..RelayMetrics::default()
     }));
     let (shutdown, shutdown_rx) = watch::channel(false);
