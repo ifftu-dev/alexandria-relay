@@ -63,6 +63,7 @@
 
 mod addr;
 pub mod config;
+pub mod doctor;
 mod http;
 mod mesh;
 pub mod profile;
@@ -91,6 +92,7 @@ pub type StartError = Box<dyn std::error::Error + Send + Sync>;
 pub struct RelayHandle {
     peer_id: PeerId,
     listen_addrs: Vec<Multiaddr>,
+    external_addrs: Vec<Multiaddr>,
     http_addr: SocketAddr,
     shutdown: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
@@ -107,6 +109,13 @@ impl RelayHandle {
     /// real ports where port zero was configured.
     pub fn listen_addrs(&self) -> &[Multiaddr] {
         &self.listen_addrs
+    }
+
+    /// The external addresses registered from `--public-host` (DNS forms
+    /// and the IPs the name resolved to at startup): the set reservation
+    /// responses carry. Empty without a public host.
+    pub fn external_addrs(&self) -> &[Multiaddr] {
+        &self.external_addrs
     }
 
     /// The address the HTTP listener is bound to.
@@ -251,6 +260,7 @@ pub async fn start(config: RelayConfig) -> Result<RelayHandle, StartError> {
     Ok(RelayHandle {
         peer_id,
         listen_addrs: started.listen_addrs,
+        external_addrs: started.external_addrs,
         http_addr,
         shutdown,
         tasks: vec![swarm_task, http_task],

@@ -333,33 +333,41 @@ Environment-only settings (kept off the command line because they are secrets):
     after_help = ENV_ONLY_HELP
 )]
 pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Generate a new keypair seed and exit
     #[arg(long)]
     pub generate_key: bool,
 
     /// TCP listen port (0 = ephemeral)
-    #[arg(long, env = "RELAY_PORT", default_value_t = 4001)]
+    #[arg(long, global = true, env = "RELAY_PORT", default_value_t = 4001)]
     pub port: u16,
 
     /// QUIC (UDP) listen port (0 = ephemeral)
-    #[arg(long, env = "RELAY_QUIC_PORT", default_value_t = 4001)]
+    #[arg(long, global = true, env = "RELAY_QUIC_PORT", default_value_t = 4001)]
     pub quic_port: u16,
 
     /// IPv4 address the libp2p TCP and QUIC listeners bind
-    #[arg(long, env = "RELAY_LISTEN_IP4", default_value_t = Ipv4Addr::UNSPECIFIED)]
+    #[arg(long, global = true, env = "RELAY_LISTEN_IP4", default_value_t = Ipv4Addr::UNSPECIFIED)]
     pub listen_ip4: Ipv4Addr,
 
     /// IPv6 address the libp2p listeners also bind (best-effort), or `off`
-    #[arg(long, env = "RELAY_LISTEN_IP6", default_value = "::")]
+    #[arg(long, global = true, env = "RELAY_LISTEN_IP6", default_value = "::")]
     pub listen_ip6: Ipv6Listen,
 
     /// HTTP health, metrics and lookup port (0 = ephemeral)
-    #[arg(long, env = "RELAY_METRICS_PORT", default_value_t = 9090)]
+    #[arg(
+        long,
+        global = true,
+        env = "RELAY_METRICS_PORT",
+        default_value_t = 9090
+    )]
     pub metrics_port: u16,
 
     /// Address the HTTP listener binds. Use 127.0.0.1 to keep it behind a
     /// local reverse proxy
-    #[arg(long, env = "RELAY_METRICS_BIND", default_value_t = IpAddr::V4(Ipv4Addr::UNSPECIFIED))]
+    #[arg(long, global = true, env = "RELAY_METRICS_BIND", default_value_t = IpAddr::V4(Ipv4Addr::UNSPECIFIED))]
     pub metrics_bind: IpAddr,
 
     /// Publicly resolvable hostname this relay is reachable at. Registered,
@@ -367,12 +375,17 @@ pub struct Cli {
     /// address so reservation responses include a dialable multiaddr.
     /// Without it, clients reject reservations with
     /// `NoAddressesInReservation`
-    #[arg(long, env = "RELAY_PUBLIC_HOST")]
+    #[arg(long, global = true, env = "RELAY_PUBLIC_HOST")]
     pub public_host: Option<String>,
 
     /// Directory for persistent state (username receipts and mirrored DHT
     /// records). On a container host, point this at a mounted volume
-    #[arg(long, env = "RELAY_DATA_DIR", default_value = "./relay-data")]
+    #[arg(
+        long,
+        global = true,
+        env = "RELAY_DATA_DIR",
+        default_value = "./relay-data"
+    )]
     pub data_dir: PathBuf,
 
     /// Read the HTTP client address from this request header instead of the
@@ -381,14 +394,19 @@ pub struct Cli {
     /// overwrites the header: on a directly reachable listener any client
     /// can write a fresh address into it and dodge the per-client lookup
     /// limit. Unset, the header is ignored
-    #[arg(long, env = "RELAY_TRUSTED_PROXY_HEADER", num_args = 0..=1, default_missing_value = FLY_CLIENT_IP_HEADER, value_name = "HEADER")]
+    #[arg(long, global = true, env = "RELAY_TRUSTED_PROXY_HEADER", num_args = 0..=1, default_missing_value = FLY_CLIENT_IP_HEADER, value_name = "HEADER")]
     pub trusted_proxy_header: Option<HeaderName>,
 
     /// Network profile JSON (the app's `resources/networks/<network>.json`).
     /// With it, the relay dials the profile's other relays at startup,
     /// reconnects when they drop and runs Kademlia bootstrap periodically.
     /// Without it, the relay joins no mesh
-    #[arg(long, env = "RELAY_NETWORK_PROFILE", help_heading = "Mesh")]
+    #[arg(
+        long,
+        global = true,
+        env = "RELAY_NETWORK_PROFILE",
+        help_heading = "Mesh"
+    )]
     pub network_profile: Option<PathBuf>,
 
     /// Publish this relay as a provider under the network's relay-discovery
@@ -397,6 +415,7 @@ pub struct Cli {
     /// no receipt-issuer trust: that comes from the profile's issuer list
     #[arg(
         long,
+        global = true,
         env = "RELAY_ANNOUNCE",
         requires = "network_profile",
         help_heading = "Mesh"
@@ -404,116 +423,127 @@ pub struct Cli {
     pub announce: bool,
 
     /// Maximum concurrent connections in total
-    #[arg(long, env = "RELAY_MAX_CONNECTIONS", default_value_t = DEFAULT_MAX_CONNECTIONS, help_heading = "Connection limits")]
+    #[arg(long, global = true, env = "RELAY_MAX_CONNECTIONS", default_value_t = DEFAULT_MAX_CONNECTIONS, help_heading = "Connection limits")]
     pub max_connections: u32,
 
     /// Maximum concurrent connections per PeerId
-    #[arg(long, env = "RELAY_MAX_CONNECTIONS_PER_PEER", default_value_t = DEFAULT_MAX_CONNECTIONS_PER_PEER, help_heading = "Connection limits")]
+    #[arg(long, global = true, env = "RELAY_MAX_CONNECTIONS_PER_PEER", default_value_t = DEFAULT_MAX_CONNECTIONS_PER_PEER, help_heading = "Connection limits")]
     pub max_connections_per_peer: u32,
 
     /// Maximum incoming connections still in the transport handshake
-    #[arg(long, env = "RELAY_MAX_PENDING_INCOMING", default_value_t = DEFAULT_MAX_PENDING_INCOMING, help_heading = "Connection limits")]
+    #[arg(long, global = true, env = "RELAY_MAX_PENDING_INCOMING", default_value_t = DEFAULT_MAX_PENDING_INCOMING, help_heading = "Connection limits")]
     pub max_pending_incoming: u32,
 
     /// Maximum concurrent connections per client IP
-    #[arg(long, env = "RELAY_MAX_CONNECTIONS_PER_IP", default_value_t = DEFAULT_MAX_CONNECTIONS_PER_IP, help_heading = "Connection limits")]
+    #[arg(long, global = true, env = "RELAY_MAX_CONNECTIONS_PER_IP", default_value_t = DEFAULT_MAX_CONNECTIONS_PER_IP, help_heading = "Connection limits")]
     pub max_connections_per_ip: usize,
 
     /// Maximum new connections per client IP per rate window
-    #[arg(long, env = "RELAY_MAX_NEW_CONNECTIONS_PER_IP", default_value_t = DEFAULT_MAX_NEW_CONNECTIONS_PER_IP, help_heading = "Connection limits")]
+    #[arg(long, global = true, env = "RELAY_MAX_NEW_CONNECTIONS_PER_IP", default_value_t = DEFAULT_MAX_NEW_CONNECTIONS_PER_IP, help_heading = "Connection limits")]
     pub max_new_connections_per_ip: usize,
 
     /// Per-IP connection rate window, in seconds
-    #[arg(long, env = "RELAY_IP_RATE_WINDOW_SECS", default_value_t = DEFAULT_IP_RATE_WINDOW_SECS, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Connection limits")]
+    #[arg(long, global = true, env = "RELAY_IP_RATE_WINDOW_SECS", default_value_t = DEFAULT_IP_RATE_WINDOW_SECS, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Connection limits")]
     pub ip_rate_window_secs: u64,
 
     /// Idle connection timeout, in seconds
-    #[arg(long, env = "RELAY_IDLE_TIMEOUT_SECS", default_value_t = DEFAULT_IDLE_TIMEOUT_SECS, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Connection limits")]
+    #[arg(long, global = true, env = "RELAY_IDLE_TIMEOUT_SECS", default_value_t = DEFAULT_IDLE_TIMEOUT_SECS, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Connection limits")]
     pub idle_timeout_secs: u64,
 
     /// Maximum Identify-reported addresses added to the routing table per peer
-    #[arg(long, env = "RELAY_MAX_IDENTIFY_ADDRS", default_value_t = DEFAULT_MAX_IDENTIFY_ADDRS, help_heading = "Connection limits")]
+    #[arg(long, global = true, env = "RELAY_MAX_IDENTIFY_ADDRS", default_value_t = DEFAULT_MAX_IDENTIFY_ADDRS, help_heading = "Connection limits")]
     pub max_identify_addrs: usize,
 
     /// Kademlia query timeout, in seconds
-    #[arg(long, env = "RELAY_KAD_QUERY_TIMEOUT_SECS", default_value_t = DEFAULT_KAD_QUERY_TIMEOUT_SECS, value_parser = clap::value_parser!(u64).range(1..), help_heading = "DHT limits")]
+    #[arg(long, global = true, env = "RELAY_KAD_QUERY_TIMEOUT_SECS", default_value_t = DEFAULT_KAD_QUERY_TIMEOUT_SECS, value_parser = clap::value_parser!(u64).range(1..), help_heading = "DHT limits")]
     pub kad_query_timeout_secs: u64,
 
     /// Kademlia replication factor
-    #[arg(long, env = "RELAY_KAD_REPLICATION_FACTOR", default_value_t = NonZeroUsize::new(DEFAULT_KAD_REPLICATION_FACTOR).expect("non-zero default"), help_heading = "DHT limits")]
+    #[arg(long, global = true, env = "RELAY_KAD_REPLICATION_FACTOR", default_value_t = NonZeroUsize::new(DEFAULT_KAD_REPLICATION_FACTOR).expect("non-zero default"), help_heading = "DHT limits")]
     pub kad_replication_factor: NonZeroUsize,
 
     /// Maximum DHT records held in memory and mirrored to disk
-    #[arg(long, env = "RELAY_KAD_MAX_RECORDS", default_value_t = DEFAULT_KAD_MAX_RECORDS, help_heading = "DHT limits")]
+    #[arg(long, global = true, env = "RELAY_KAD_MAX_RECORDS", default_value_t = DEFAULT_KAD_MAX_RECORDS, help_heading = "DHT limits")]
     pub kad_max_records: usize,
 
     /// Maximum size of one DHT record value, in bytes
-    #[arg(long, env = "RELAY_KAD_MAX_RECORD_BYTES", default_value_t = DEFAULT_KAD_MAX_RECORD_BYTES, help_heading = "DHT limits")]
+    #[arg(long, global = true, env = "RELAY_KAD_MAX_RECORD_BYTES", default_value_t = DEFAULT_KAD_MAX_RECORD_BYTES, help_heading = "DHT limits")]
     pub kad_max_record_bytes: usize,
 
     /// Maximum active circuit reservations in total
-    #[arg(long, env = "RELAY_MAX_RESERVATIONS", default_value_t = DEFAULT_MAX_RESERVATIONS, help_heading = "Circuit relay limits")]
+    #[arg(long, global = true, env = "RELAY_MAX_RESERVATIONS", default_value_t = DEFAULT_MAX_RESERVATIONS, help_heading = "Circuit relay limits")]
     pub max_reservations: usize,
 
     /// Maximum circuit reservations per peer
-    #[arg(long, env = "RELAY_MAX_RESERVATIONS_PER_PEER", default_value_t = DEFAULT_MAX_RESERVATIONS_PER_PEER, help_heading = "Circuit relay limits")]
+    #[arg(long, global = true, env = "RELAY_MAX_RESERVATIONS_PER_PEER", default_value_t = DEFAULT_MAX_RESERVATIONS_PER_PEER, help_heading = "Circuit relay limits")]
     pub max_reservations_per_peer: usize,
 
     /// How long a reservation lasts, in seconds
-    #[arg(long, env = "RELAY_RESERVATION_DURATION_SECS", default_value_t = DEFAULT_RESERVATION_DURATION_SECS, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Circuit relay limits")]
+    #[arg(long, global = true, env = "RELAY_RESERVATION_DURATION_SECS", default_value_t = DEFAULT_RESERVATION_DURATION_SECS, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Circuit relay limits")]
     pub reservation_duration_secs: u64,
 
     /// Maximum active circuits in total
-    #[arg(long, env = "RELAY_MAX_CIRCUITS", default_value_t = DEFAULT_MAX_CIRCUITS, help_heading = "Circuit relay limits")]
+    #[arg(long, global = true, env = "RELAY_MAX_CIRCUITS", default_value_t = DEFAULT_MAX_CIRCUITS, help_heading = "Circuit relay limits")]
     pub max_circuits: usize,
 
     /// Maximum active circuits per peer
-    #[arg(long, env = "RELAY_MAX_CIRCUITS_PER_PEER", default_value_t = DEFAULT_MAX_CIRCUITS_PER_PEER, help_heading = "Circuit relay limits")]
+    #[arg(long, global = true, env = "RELAY_MAX_CIRCUITS_PER_PEER", default_value_t = DEFAULT_MAX_CIRCUITS_PER_PEER, help_heading = "Circuit relay limits")]
     pub max_circuits_per_peer: usize,
 
     /// Maximum bytes relayed per circuit
-    #[arg(long, env = "RELAY_MAX_CIRCUIT_BYTES", default_value_t = DEFAULT_MAX_CIRCUIT_BYTES, help_heading = "Circuit relay limits")]
+    #[arg(long, global = true, env = "RELAY_MAX_CIRCUIT_BYTES", default_value_t = DEFAULT_MAX_CIRCUIT_BYTES, help_heading = "Circuit relay limits")]
     pub max_circuit_bytes: u64,
 
     /// Maximum circuit lifetime, in seconds
-    #[arg(long, env = "RELAY_MAX_CIRCUIT_DURATION_SECS", default_value_t = DEFAULT_MAX_CIRCUIT_DURATION_SECS, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Circuit relay limits")]
+    #[arg(long, global = true, env = "RELAY_MAX_CIRCUIT_DURATION_SECS", default_value_t = DEFAULT_MAX_CIRCUIT_DURATION_SECS, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Circuit relay limits")]
     pub max_circuit_duration_secs: u64,
 
     /// Username-receipt requests allowed per PeerId per receipt window
-    #[arg(long, env = "RELAY_RECEIPT_LIMIT", default_value_t = DEFAULT_RECEIPT_LIMIT, help_heading = "Username registry limits")]
+    #[arg(long, global = true, env = "RELAY_RECEIPT_LIMIT", default_value_t = DEFAULT_RECEIPT_LIMIT, help_heading = "Username registry limits")]
     pub receipt_limit: usize,
 
     /// Username-receipt rate window, in seconds
-    #[arg(long, env = "RELAY_RECEIPT_WINDOW_SECS", default_value_t = DEFAULT_RECEIPT_WINDOW_SECS, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Username registry limits")]
+    #[arg(long, global = true, env = "RELAY_RECEIPT_WINDOW_SECS", default_value_t = DEFAULT_RECEIPT_WINDOW_SECS, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Username registry limits")]
     pub receipt_window_secs: u64,
 
     /// `/username/:name` lookups allowed per client IP per lookup window
-    #[arg(long, env = "RELAY_LOOKUP_LIMIT", default_value_t = DEFAULT_LOOKUP_LIMIT, help_heading = "Username registry limits")]
+    #[arg(long, global = true, env = "RELAY_LOOKUP_LIMIT", default_value_t = DEFAULT_LOOKUP_LIMIT, help_heading = "Username registry limits")]
     pub lookup_limit: usize,
 
     /// Username lookup rate window, in seconds
-    #[arg(long, env = "RELAY_LOOKUP_WINDOW_SECS", default_value_t = DEFAULT_LOOKUP_WINDOW_SECS, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Username registry limits")]
+    #[arg(long, global = true, env = "RELAY_LOOKUP_WINDOW_SECS", default_value_t = DEFAULT_LOOKUP_WINDOW_SECS, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Username registry limits")]
     pub lookup_window_secs: u64,
 
     /// Client IPs the lookup limiter tracks before it prunes
-    #[arg(long, env = "RELAY_LOOKUP_MAX_TRACKED", default_value_t = DEFAULT_LOOKUP_MAX_TRACKED, help_heading = "Username registry limits")]
+    #[arg(long, global = true, env = "RELAY_LOOKUP_MAX_TRACKED", default_value_t = DEFAULT_LOOKUP_MAX_TRACKED, help_heading = "Username registry limits")]
     pub lookup_max_tracked: usize,
 
     /// Time allowed for an HTTP request's headers to arrive, in seconds
-    #[arg(long, env = "RELAY_HTTP_HEADER_READ_TIMEOUT_SECS", default_value_t = DEFAULT_HTTP_HEADER_READ_TIMEOUT_SECS, value_parser = clap::value_parser!(u64).range(1..), help_heading = "HTTP limits")]
+    #[arg(long, global = true, env = "RELAY_HTTP_HEADER_READ_TIMEOUT_SECS", default_value_t = DEFAULT_HTTP_HEADER_READ_TIMEOUT_SECS, value_parser = clap::value_parser!(u64).range(1..), help_heading = "HTTP limits")]
     pub http_header_read_timeout_secs: u64,
 
     /// Time allowed from an HTTP request's headers to its response, in seconds
-    #[arg(long, env = "RELAY_HTTP_REQUEST_TIMEOUT_SECS", default_value_t = DEFAULT_HTTP_REQUEST_TIMEOUT_SECS, value_parser = clap::value_parser!(u64).range(1..), help_heading = "HTTP limits")]
+    #[arg(long, global = true, env = "RELAY_HTTP_REQUEST_TIMEOUT_SECS", default_value_t = DEFAULT_HTTP_REQUEST_TIMEOUT_SECS, value_parser = clap::value_parser!(u64).range(1..), help_heading = "HTTP limits")]
     pub http_request_timeout_secs: u64,
 
     /// Maximum concurrent HTTP connections; more wait in the listen backlog
-    #[arg(long, env = "RELAY_HTTP_MAX_CONNECTIONS", default_value_t = DEFAULT_HTTP_MAX_CONNECTIONS, value_parser = clap::builder::TypedValueParser::map(clap::value_parser!(u32).range(1..), |n| n as usize), help_heading = "HTTP limits")]
+    #[arg(long, global = true, env = "RELAY_HTTP_MAX_CONNECTIONS", default_value_t = DEFAULT_HTTP_MAX_CONNECTIONS, value_parser = clap::builder::TypedValueParser::map(clap::value_parser!(u32).range(1..), |n| n as usize), help_heading = "HTTP limits")]
     pub http_max_connections: usize,
 
     /// Interval between health log lines, in seconds
-    #[arg(long, env = "RELAY_HEALTH_LOG_INTERVAL_SECS", default_value_t = DEFAULT_HEALTH_LOG_INTERVAL_SECS, value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(long, global = true, env = "RELAY_HEALTH_LOG_INTERVAL_SECS", default_value_t = DEFAULT_HEALTH_LOG_INTERVAL_SECS, value_parser = clap::value_parser!(u64).range(1..))]
     pub health_log_interval_secs: u64,
+}
+
+/// Subcommands. Without one, the binary runs the relay.
+#[derive(clap::Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Command {
+    /// Start the relay with this configuration, dial each advertised
+    /// address over TCP and QUIC from a second swarm, make a reservation,
+    /// check the data directory and admin token, then exit: 0 when at least
+    /// one advertised address answers. Binds the configured ports, so stop
+    /// a running relay first
+    Doctor,
 }
 
 impl Cli {

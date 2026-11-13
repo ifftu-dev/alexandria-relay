@@ -57,6 +57,9 @@ pub(crate) struct RelayBehaviour {
 pub(crate) struct Started {
     pub(crate) event_loop: EventLoop,
     pub(crate) listen_addrs: Vec<Multiaddr>,
+    /// The external addresses registered from `--public-host`: what
+    /// reservation responses carry.
+    pub(crate) external_addrs: Vec<Multiaddr>,
 }
 
 /// Build the swarm, warm-load the DHT mirror, bind the listeners and register
@@ -161,7 +164,7 @@ pub(crate) async fn start_swarm(
     // unless those were zero.
     let tcp_port = first_port(&listen_addrs, false).unwrap_or(config.tcp_port);
     let quic_port = first_port(&listen_addrs, true).unwrap_or(config.quic_port);
-    let mut external_registered: Vec<String> = Vec::new();
+    let mut external_registered: Vec<Multiaddr> = Vec::new();
     if let Some(host) = &config.public_host {
         // DNS forms. These survive re-provisioning since DNS tracks the
         // current IP.
@@ -170,7 +173,7 @@ pub(crate) async fn start_swarm(
             format!("/dns4/{host}/udp/{quic_port}/quic-v1"),
         ] {
             if let Ok(addr) = tmpl.parse::<Multiaddr>() {
-                external_registered.push(addr.to_string());
+                external_registered.push(addr.clone());
                 event_loop.swarm.add_external_address(addr);
             }
         }
@@ -191,7 +194,7 @@ pub(crate) async fn start_swarm(
                         base.clone().with(Protocol::Tcp(tcp_port)),
                         base.with(Protocol::Udp(quic_port)).with(Protocol::QuicV1),
                     ] {
-                        external_registered.push(addr.to_string());
+                        external_registered.push(addr.clone());
                         event_loop.swarm.add_external_address(addr);
                     }
                 }
@@ -245,6 +248,7 @@ pub(crate) async fn start_swarm(
     Ok(Started {
         event_loop,
         listen_addrs,
+        external_addrs: external_registered,
     })
 }
 
@@ -359,7 +363,9 @@ impl EventLoop {
                 SwarmEvent::NewListenAddr {
                     listener_id,
                     address,
-                } => {
+                } if ids.contains(listener_id) => {
+                    // Only the listeners asked about: an IPv6 listener on
+                    // port zero gets a port of its own.
                     pending.remove(listener_id);
                     addrs.push(address.clone());
                 }
