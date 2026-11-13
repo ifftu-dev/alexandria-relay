@@ -148,6 +148,7 @@ pub(crate) async fn start_swarm(
         ip_rate_windows: HashMap::new(),
         username_rate_windows: HashMap::new(),
         pending_receipts: FuturesUnordered::new(),
+        health_baseline: HealthCounts::default(),
     };
     let listen_addrs = event_loop.await_listeners(&[tcp4, quic4]).await?;
 
@@ -289,6 +290,48 @@ pub(crate) struct EventLoop {
     /// Receipt requests the store thread is still answering, each paired
     /// with the channel its response goes back on.
     pending_receipts: FuturesUnordered<PendingReceipt>,
+    /// Counters as of the previous health line.
+    health_baseline: HealthCounts,
+}
+
+/// The per-event counters the periodic health line reports deltas of.
+#[derive(Debug, Default, Clone, Copy)]
+struct HealthCounts {
+    circuits_accepted: u64,
+    circuits_denied: u64,
+    reservations_accepted: u64,
+    reservations_denied: u64,
+    receipt_requests: u64,
+}
+
+impl HealthCounts {
+    fn of(m: &RelayMetrics) -> Self {
+        HealthCounts {
+            circuits_accepted: m.circuits_accepted,
+            circuits_denied: m.circuits_denied,
+            reservations_accepted: m.reservations_accepted,
+            reservations_denied: m.reservations_denied,
+            receipt_requests: m.receipt_requests,
+        }
+    }
+
+    fn since(&self, earlier: &HealthCounts) -> Self {
+        HealthCounts {
+            circuits_accepted: self
+                .circuits_accepted
+                .saturating_sub(earlier.circuits_accepted),
+            circuits_denied: self.circuits_denied.saturating_sub(earlier.circuits_denied),
+            reservations_accepted: self
+                .reservations_accepted
+                .saturating_sub(earlier.reservations_accepted),
+            reservations_denied: self
+                .reservations_denied
+                .saturating_sub(earlier.reservations_denied),
+            receipt_requests: self
+                .receipt_requests
+                .saturating_sub(earlier.receipt_requests),
+        }
+    }
 }
 
 /// A receipt response on its way back from the store thread.
@@ -389,20 +432,29 @@ impl EventLoop {
         let hours = uptime.as_secs() / 3600;
         let minutes = (uptime.as_secs() % 3600) / 60;
         let connections = self.swarm.connected_peers().count();
-        log::info!(
-            "HEALTH — uptime:{hours}h{minutes}m connections:{connections} \
-             total_served:{} peer_id:{}",
-            self.total_connections_served,
-            self.local_peer_id
-        );
 
-        // Update metrics
-        {
+        // Update metrics, and take the counts this line reports deltas of.
+        let now_counts = {
             let mut m = self.metrics.write().await;
             m.uptime_seconds = uptime.as_secs();
             m.connections = connections;
             m.total_connections_served = self.total_connections_served;
-        }
+            HealthCounts::of(&m)
+        };
+        let delta = now_counts.since(&self.health_baseline);
+        self.health_baseline = now_counts;
+        log::info!(
+            "HEALTH — uptime:{hours}h{minutes}m connections:{connections} \
+             total_served:{} since last: circuits +{} denied +{}, reservations +{} \
+             denied +{}, receipt requests +{} peer_id:{}",
+            self.total_connections_served,
+            delta.circuits_accepted,
+            delta.circuits_denied,
+            delta.reservations_accepted,
+            delta.reservations_denied,
+            delta.receipt_requests,
+            self.local_peer_id
+        );
 
         // Prune stale rate window entries
         let now = Instant::now();
@@ -635,7 +687,7 @@ impl EventLoop {
             // ── Relay Events ─────────────────────────────────
             SwarmEvent::Behaviour(RelayBehaviourEvent::Relay(event)) => match &event {
                 relay::Event::ReservationReqAccepted { src_peer_id, .. } => {
-                    log::info!("RELAY reservation accepted for {src_peer_id}");
+                    log::debug!("RELAY reservation accepted for {src_peer_id}");
                     let mut m = self.metrics.write().await;
                     m.reservations_accepted += 1;
                     m.peers_with_reservation.insert(*src_peer_id);
@@ -645,7 +697,7 @@ impl EventLoop {
                     dst_peer_id,
                     ..
                 } => {
-                    log::info!("RELAY circuit {src_peer_id} → {dst_peer_id}");
+                    log::debug!("RELAY circuit {src_peer_id} → {dst_peer_id}");
                     let mut m = self.metrics.write().await;
                     m.circuits_accepted += 1;
                 }
@@ -659,7 +711,7 @@ impl EventLoop {
                     m.circuits_closed += 1;
                 }
                 relay::Event::ReservationReqDenied { src_peer_id, .. } => {
-                    log::warn!("RELAY reservation denied for {src_peer_id}");
+                    log::debug!("RELAY reservation denied for {src_peer_id}");
                     let mut m = self.metrics.write().await;
                     m.reservations_denied += 1;
                 }
@@ -668,7 +720,7 @@ impl EventLoop {
                     dst_peer_id,
                     ..
                 } => {
-                    log::warn!("RELAY circuit denied {src_peer_id} → {dst_peer_id}");
+                    log::debug!("RELAY circuit denied {src_peer_id} → {dst_peer_id}");
                     let mut m = self.metrics.write().await;
                     m.circuits_denied += 1;
                 }
@@ -760,10 +812,11 @@ impl EventLoop {
                     ..
                 },
             )) => {
-                log::info!(
+                log::debug!(
                     "username-reg: receipt request from {peer} for @{}",
                     request.claim.username
                 );
+                self.metrics.write().await.receipt_requests += 1;
                 // Per-peer budget. Claim signatures are free to mint
                 // offline, so without this one connection can receipt
                 // the whole namespace.
@@ -778,7 +831,7 @@ impl EventLoop {
                 *count += 1;
                 let rate_limited = *count > self.limits.receipt_limit;
                 if rate_limited {
-                    log::warn!("username-reg: rate limiting {peer} ({count} requests in window)");
+                    log::debug!("username-reg: rate limiting {peer} ({count} requests in window)");
                 }
 
                 // The store thread answers; the event loop sends the
