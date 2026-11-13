@@ -226,6 +226,9 @@ fn reject_placeholder(value: &str) -> Result<(), ProfileError> {
     Ok(())
 }
 
+/// The app's fallback-IP rule. Not the routing-table filter
+/// (`addr::is_globally_routable`): this one follows the app exactly and is
+/// stricter, also refusing documentation, benchmarking and reserved ranges.
 fn is_public_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => is_public_ipv4(*ip),
