@@ -18,11 +18,17 @@ so a scanner can't tell that they exist.
 
 | Endpoint | Auth | Returns |
 |---|---|---|
-| `GET /health` | public | `{"status":"ok","peer_id":…,"uptime_seconds":…,"connections":…}` |
+| `GET /health` | public | `{"status":"ok","peer_id":…,"uptime_seconds":…,"connections":…,"profile_relays":…,"reachable_relays":…,"bootstrap_status":…}` |
 | `GET /username/:name` | public | Username availability from the receipt registry. Clients resolve names against it |
 | `GET /health/alerts` | bearer | `200` when healthy, `503` when any alert fires; the body lists firing alerts and rolling 60 s rates |
-| `GET /metrics` | bearer | Connections, circuits, reservations, DHT updates, identify events, listener errors, IP rate limits, rolling-minute denials |
+| `GET /metrics` | bearer | Connections, circuits, reservations, DHT updates, identify events, listener errors, IP rate limits, rolling-minute denials, mesh state |
 | `GET /peers` | bearer | `{peer_id, source_prefix, has_reservation}` per peer. `source_prefix` is a `/24` (IPv4) or `/48` (IPv6) network, never a full address |
+
+Mesh state, on both routes: `profile_relays` is how many other relays the
+network profile names (0 without `--network-profile`), `reachable_relays` how
+many of them this relay is connected to, and `bootstrap_status` is
+`disabled` (no profile), `pending` (no bootstrap finished yet), `ok` or
+`failed` (the last bootstrap timed out).
 
 ## Monitoring
 

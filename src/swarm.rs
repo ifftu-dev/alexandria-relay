@@ -14,13 +14,16 @@ use libp2p::identity::Keypair;
 use libp2p::kad::store::MemoryStore;
 use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{self, ProtocolSupport};
+use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{identify, kad, noise, relay, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder};
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{mpsc, watch, RwLock};
 
 use crate::addr::{client_bucket, extract_ip, is_globally_routable};
 use crate::config::{Limits, RelayConfig, USERNAME_REQUEST_MAX_BYTES};
 use crate::http::RelayMetrics;
+use crate::mesh::{self, Mesh, Resolved};
+use crate::profile::NetworkProfile;
 use crate::store::{MirroredRecord, StoreHandle, MIRROR_PRUNE_INTERVAL};
 use crate::username_reg::{self, ReceiptRequest, ReceiptResponse};
 use crate::StartError;
@@ -59,12 +62,15 @@ pub(crate) struct Started {
 /// Build the swarm, warm-load the DHT mirror, bind the listeners and register
 /// external addresses. Returns once the IPv4 TCP and QUIC listeners have
 /// reported their bound addresses (so port zero resolves to the real port).
+/// With a `profile`, the event loop dials the profile's other relays as soon
+/// as it runs.
 pub(crate) async fn start_swarm(
     config: &RelayConfig,
     keypair: Keypair,
     registry_store: Option<StoreHandle>,
     metrics: Arc<RwLock<RelayMetrics>>,
     http_port: u16,
+    profile: Option<NetworkProfile>,
 ) -> Result<Started, StartError> {
     let local_peer_id = keypair.public().to_peer_id();
     let limits = config.limits.clone();
@@ -125,8 +131,13 @@ pub(crate) async fn start_swarm(
         );
     }
 
+    let (resolved_tx, resolved_rx) = mpsc::unbounded_channel();
+    let mesh = profile.map(|p| Mesh::new(&p, local_peer_id, config.announce, resolved_tx));
+
     let mut event_loop = EventLoop {
         swarm,
+        mesh,
+        resolved_rx,
         local_peer_id,
         registry_store,
         metrics,
@@ -211,6 +222,24 @@ pub(crate) async fn start_swarm(
         l.max_circuits,
     );
     log::debug!("All limits: {l:?}");
+    if let Some(mesh) = &event_loop.mesh {
+        log::info!(
+            "Mesh — joining through the network profile: {} other relay(s) to dial, \
+             Kademlia bootstrap every {:?}",
+            mesh.configured(),
+            mesh::BOOTSTRAP_INTERVAL
+        );
+        event_loop.metrics.write().await.profile_relays = mesh.configured();
+        if mesh.announce_key().is_some() {
+            log::info!("{}", crate::config::ANNOUNCE_SCOPE);
+            if config.public_host.is_none() {
+                log::warn!(
+                    "--announce without --public-host: the provider record carries no \
+                     address, so app nodes learn only this relay's PeerId"
+                );
+            }
+        }
+    }
 
     Ok(Started {
         event_loop,
@@ -239,6 +268,10 @@ fn first_port(addrs: &[Multiaddr], quic: bool) -> Option<u16> {
 /// The relay's swarm and the state its event handlers keep.
 pub(crate) struct EventLoop {
     swarm: RelaySwarm,
+    /// Mesh membership from the network profile; `None` without one.
+    mesh: Option<Mesh>,
+    /// Finished DNS lookups of profile relays.
+    resolved_rx: mpsc::UnboundedReceiver<Resolved>,
     local_peer_id: PeerId,
     registry_store: Option<StoreHandle>,
     metrics: Arc<RwLock<RelayMetrics>>,
@@ -309,6 +342,11 @@ impl EventLoop {
                                       // relay was down.
         let mut prune_interval = tokio::time::interval(MIRROR_PRUNE_INTERVAL);
 
+        // Both fire immediately: the first lookups are the startup dials.
+        let mut redial_interval = tokio::time::interval(mesh::REDIAL_CHECK_INTERVAL);
+        let mut bootstrap_interval = tokio::time::interval(mesh::BOOTSTRAP_INTERVAL);
+        let meshed = self.mesh.is_some();
+
         loop {
             tokio::select! {
                 _ = health_interval.tick() => self.on_health_tick().await,
@@ -316,6 +354,15 @@ impl EventLoop {
                     if let Some(store) = &self.registry_store {
                         store.prune_expired();
                     }
+                }
+                _ = redial_interval.tick(), if meshed => {
+                    if let Some(mesh) = self.mesh.as_mut() {
+                        mesh.start_due_lookups();
+                    }
+                }
+                _ = bootstrap_interval.tick(), if meshed => self.bootstrap("periodic"),
+                Some((peer, addrs)) = self.resolved_rx.recv(), if meshed => {
+                    self.on_resolved(peer, addrs).await;
                 }
                 _ = shutdown.changed() => break,
                 Some((channel, response)) = self.pending_receipts.next(),
@@ -365,6 +412,83 @@ impl EventLoop {
             .retain(|_, (_, started)| now.duration_since(*started) < ip_window * 2);
         self.username_rate_windows
             .retain(|_, (_, started)| now.duration_since(*started) < receipt_window * 2);
+    }
+
+    /// A lookup of profile relay `peer` finished: dial it unless it is
+    /// already connected, in which case only its addresses are refreshed.
+    async fn on_resolved(&mut self, peer: PeerId, addrs: Vec<Multiaddr>) {
+        let Some(mesh) = self.mesh.as_mut() else {
+            return;
+        };
+        if !mesh.on_resolved(peer, addrs.clone()) {
+            for addr in addrs {
+                self.swarm.behaviour_mut().kademlia.add_address(&peer, addr);
+            }
+            return;
+        }
+        let opts = DialOpts::peer_id(peer)
+            .addresses(addrs)
+            .condition(PeerCondition::DisconnectedAndNotDialing)
+            .build();
+        match self.swarm.dial(opts) {
+            Ok(()) => log::debug!("MESH dialling profile relay {peer}"),
+            // Connected or being dialled already: its own events follow.
+            Err(libp2p::swarm::DialError::DialPeerConditionFalse(_)) => {}
+            Err(e) => {
+                log::warn!("MESH cannot dial profile relay {peer}: {e}");
+                mesh.on_dial_failed(&peer);
+            }
+        }
+    }
+
+    /// Profile relay `peer` opened a connection (`dialed` is the address
+    /// when this relay dialled it). Puts its profile addresses in the routing
+    /// table and, if this ends isolation, bootstraps and announces at once.
+    async fn on_mesh_connected(&mut self, peer: PeerId, dialed: Option<Multiaddr>) {
+        let Some(mesh) = self.mesh.as_mut() else {
+            return;
+        };
+        let joined = mesh.on_connected(&peer);
+        let mut addrs = mesh.addrs(&peer).to_vec();
+        if addrs.is_empty() {
+            // It reached us before our own lookup finished.
+            addrs.extend(dialed);
+            mesh.refresh_addrs(peer);
+        }
+        self.metrics.write().await.reachable_relays = mesh.reachable();
+        log::info!("MESH connected to profile relay {peer}");
+        for addr in addrs {
+            self.swarm.behaviour_mut().kademlia.add_address(&peer, addr);
+        }
+        if joined {
+            self.bootstrap("joined the mesh");
+            self.announce();
+        }
+    }
+
+    /// Start a Kademlia bootstrap. With no known peer there is nothing to
+    /// bootstrap from yet; the status stays as it is.
+    fn bootstrap(&mut self, reason: &str) {
+        if self.mesh.is_none() {
+            return;
+        }
+        match self.swarm.behaviour_mut().kademlia.bootstrap() {
+            Ok(_) => log::debug!("MESH bootstrap started ({reason})"),
+            Err(e) => log::debug!("MESH bootstrap skipped ({reason}): {e}"),
+        }
+    }
+
+    /// Publish the provider record under the relay-discovery key, when
+    /// announcing. Kademlia then republishes it on its provider-record
+    /// publication interval.
+    fn announce(&mut self) {
+        let Some(key) = self.mesh.as_ref().and_then(|m| m.announce_key()).cloned() else {
+            return;
+        };
+        match self.swarm.behaviour_mut().kademlia.start_providing(key) {
+            Ok(_) => log::info!("MESH announced this relay under the relay-discovery key"),
+            Err(e) => log::warn!("MESH announcement rejected by the local store: {e}"),
+        }
     }
 
     async fn on_event(&mut self, event: SwarmEvent<RelayBehaviourEvent>) {
@@ -429,6 +553,11 @@ impl EventLoop {
                 // ephemeral source port, often a NAT mapping, which other
                 // peers cannot dial. The peer enters the table from its
                 // Identify-reported addresses (see the Identify arm).
+
+                if self.mesh.as_ref().is_some_and(|m| m.is_member(&pid)) {
+                    let dialed = endpoint.is_dialer().then(|| remote_addr.clone());
+                    self.on_mesh_connected(pid, dialed).await;
+                }
             }
             SwarmEvent::ConnectionClosed {
                 peer_id: pid,
@@ -453,6 +582,11 @@ impl EventLoop {
                     let mut m = self.metrics.write().await;
                     m.peer_source_ips.remove(&pid);
                     m.peers_with_reservation.remove(&pid);
+                    if let Some(mesh) = self.mesh.as_mut().filter(|m| m.is_member(&pid)) {
+                        mesh.on_unreachable(&pid);
+                        m.reachable_relays = mesh.reachable();
+                        log::info!("MESH lost profile relay {pid}; redialling with backoff");
+                    }
                 }
 
                 log::debug!("DISCONNECT peer:{pid} remaining_for_peer:{num_established}");
@@ -539,6 +673,20 @@ impl EventLoop {
             SwarmEvent::Behaviour(RelayBehaviourEvent::Kademlia(event)) => {
                 accept_provider_announcement(&mut self.swarm.behaviour_mut().kademlia, &event);
                 match &event {
+                    kad::Event::OutboundQueryProgressed {
+                        result: kad::QueryResult::Bootstrap(result),
+                        step,
+                        ..
+                    } if step.last => {
+                        if let Some(mesh) = self.mesh.as_mut() {
+                            match result {
+                                Ok(_) => log::debug!("MESH bootstrap complete"),
+                                Err(e) => log::warn!("MESH bootstrap failed: {e}"),
+                            }
+                            mesh.on_bootstrap_finished(result.is_ok());
+                            self.metrics.write().await.bootstrap_status = mesh.status().as_str();
+                        }
+                    }
                     kad::Event::RoutingUpdated {
                         peer, addresses, ..
                     } => {
@@ -658,6 +806,17 @@ impl EventLoop {
             }
             SwarmEvent::Behaviour(RelayBehaviourEvent::UsernameReg(event)) => {
                 log::debug!("username-reg event: {event:?}");
+            }
+
+            SwarmEvent::OutgoingConnectionError {
+                peer_id: Some(pid),
+                error,
+                ..
+            } => {
+                if let Some(mesh) = self.mesh.as_mut().filter(|m| m.is_member(&pid)) {
+                    log::debug!("MESH dial to profile relay {pid} failed: {error}");
+                    mesh.on_dial_failed(&pid);
+                }
             }
 
             // ── Other Events ─────────────────────────────────
