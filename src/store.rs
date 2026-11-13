@@ -20,8 +20,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::config::{DEFAULT_KAD_MAX_RECORDS, DEFAULT_KAD_MAX_RECORD_BYTES};
 use crate::username_reg::{
-    canonical_receipt_bytes, countersign, release_valid, verify_claim, ReceiptResponse,
-    RelayReceipt, UsernameClaim, RELEASE_GRACE_SECS,
+    canonical_receipt_bytes, countersign, release_frees_at, release_valid, verify_claim,
+    ReceiptResponse, RelayReceipt, UsernameClaim,
 };
 
 /// Schema version, kept in SQLite's `user_version`. A database with any
@@ -227,7 +227,7 @@ impl RegistryStore {
         if let Some((did, claim_sig, received_at, receipt_sig, released_at)) = existing {
             // A grace-elapsed release frees the row for new claimants.
             if let Some(rel) = released_at {
-                if did != claim.did && now >= rel + RELEASE_GRACE_SECS {
+                if did != claim.did && now >= release_frees_at(rel) {
                     let _ = self.conn.execute(
                         "DELETE FROM receipts WHERE username = ?1",
                         [&claim.username],
@@ -460,7 +460,7 @@ impl RegistryStore {
             .optional()?;
         Ok(row
             .filter(|(_, _, rel)| match rel {
-                Some(rel_at) => now < rel_at + RELEASE_GRACE_SECS,
+                Some(rel_at) => now < release_frees_at(*rel_at),
                 None => true,
             })
             .map(|(did, received_at, _)| (did, received_at)))
@@ -807,6 +807,38 @@ mod tests {
             s.lookup_username("ada_99").unwrap().map(|(did, _)| did),
             Some(newcomer.did)
         );
+    }
+
+    #[test]
+    fn a_release_dated_near_the_end_of_time_never_frees_the_name() {
+        // `released_at` is whatever the owner signed. Adding the grace
+        // window to a value near i64::MAX must not overflow: in a debug
+        // build that panics the store thread, and in a release build it
+        // wraps negative and frees the name at once.
+        let (mut s, kp, pid) = store();
+        let key1 = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+        let mut claim = make_claim(1, "ada_99", 1000);
+        assert!(matches!(
+            s.handle_receipt(&kp, &pid, &claim),
+            ReceiptResponse::Granted(_)
+        ));
+        let rel_at = i64::MAX - 10;
+        let sig = key1.sign(&canonical_release_bytes(&claim.username, &claim.did, rel_at));
+        claim.release = Some(Release {
+            released_at: rel_at,
+            sig: hex::encode(sig.to_bytes()),
+        });
+        assert!(matches!(
+            s.handle_receipt(&kp, &pid, &claim),
+            ReceiptResponse::Granted(_)
+        ));
+
+        assert!(s.lookup_username("ada_99").unwrap().is_some());
+        let other = make_claim(2, "ada_99", 2000);
+        assert!(matches!(
+            s.handle_receipt(&kp, &pid, &other),
+            ReceiptResponse::Refused { .. }
+        ));
     }
 
     #[test]

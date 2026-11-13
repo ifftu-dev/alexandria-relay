@@ -26,6 +26,13 @@ pub const PROTOCOL: &str = "/alexandria/username-reg/1.0";
 /// app's `RELEASE_GRACE_SECS`).
 pub const RELEASE_GRACE_SECS: i64 = 30 * 24 * 3600;
 
+/// When a name released at `released_at` frees up. The release time is
+/// owner-signed and unchecked, so the sum saturates: a release dated near
+/// the end of time keeps the name held rather than wrapping into the past.
+pub(crate) fn release_frees_at(released_at: i64) -> i64 {
+    released_at.saturating_add(RELEASE_GRACE_SECS)
+}
+
 // ── Wire types (mirror the main app's domain::username_claim) ──────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
