@@ -77,14 +77,27 @@ are in seconds.
 | Username lookups per client IP per window | `--lookup-limit` | `RELAY_LOOKUP_LIMIT` | 30 |
 | Lookup window | `--lookup-window-secs` | `RELAY_LOOKUP_WINDOW_SECS` | 60 |
 | Client IPs the lookup limiter tracks | `--lookup-max-tracked` | `RELAY_LOOKUP_MAX_TRACKED` | 10000 |
+| Time for an HTTP request's headers to arrive | `--http-header-read-timeout-secs` | `RELAY_HTTP_HEADER_READ_TIMEOUT_SECS` | 10 |
+| Time from HTTP request headers to response (then `503`) | `--http-request-timeout-secs` | `RELAY_HTTP_REQUEST_TIMEOUT_SECS` | 15 |
+| Concurrent HTTP connections (more wait in the listen backlog) | `--http-max-connections` | `RELAY_HTTP_MAX_CONNECTIONS` | 256 |
 | Health log interval | `--health-log-interval-secs` | `RELAY_HEALTH_LOG_INTERVAL_SECS` | 300 |
 
 Two bounds are part of the wire format and are not configurable: a username
 receipt request is at most 8 KiB, and its DID at most 64 characters.
 
+"Per IP" means per client bucket: the full IPv4 address, or the /64 an IPv6
+address belongs to, since one subscriber holds a whole /64. The relay's
+connection limiter, the lookup limiter and the source prefixes behind
+`/peers` all use it.
+
 Other hardening:
-- Private, CGNAT, link-local, ULA, IPv4-mapped, multicast and site-local
-  addresses are kept out of the DHT routing table.
+- A peer enters the DHT routing table only from the addresses it reports
+  through Identify, never from the address its connection came from.
+  Private, CGNAT, link-local, ULA, IPv4-mapped, multicast and site-local
+  addresses are kept out.
+- The HTTP listener speaks HTTP/1.1 only and closes connections whose
+  headers do not arrive within the header timeout, idle keep-alive
+  connections included.
 - `RELAY_SEED` is cleared from the environment before the async runtime
   starts, and the seed buffer is zeroed after use.
 - SIGTERM and SIGINT shut down gracefully.
@@ -97,6 +110,46 @@ Tuning notes:
   raise if you add observers that fan-dial peers through circuits, since
   each counts as the source peer. With several high-frequency observers, try
   256–512 before the global circuit cap becomes the bottleneck.
+
+## Client addresses behind a proxy
+
+Every per-address limit keys on the address a connection comes from. When a
+proxy sits in front of the relay, that is the proxy's address, and the limit
+then either throttles every user as one client or, with a high ceiling,
+protects nothing.
+
+**libp2p listener.** Per-address limits on the libp2p port work only on a
+host that delivers connections with their original source address: a VM or
+bare-metal host with a public IP, or a load balancer in pass-through mode.
+The relay cannot read PROXY protocol on this listener. Fly's TCP and HTTP
+services do not preserve source addresses, so on Fly these limiters see the
+proxy:
+
+- the relay's per-IP connection limiter (`--max-connections-per-ip`,
+  `--max-new-connections-per-ip`);
+- libp2p's built-in per-IP reservation and circuit rate limiters, which are
+  not configurable and key on the full address;
+- the username lookup limiter, unless `--trusted-proxy-header` is set.
+
+Per-PeerId limits and the global caps are unaffected.
+
+**HTTP listener.** Set `--trusted-proxy-header` (`RELAY_TRUSTED_PROXY_HEADER`)
+when every request reaches the listener through a proxy that writes the
+client address into a header, overwriting anything the client sent. Given
+without a value it reads `Fly-Client-IP`, which Fly's `http` handler sets;
+behind nginx or Caddy, name the header the proxy sets (for example
+`X-Real-IP`). For an appending header such as `X-Forwarded-For`, the relay
+reads the last entry. A request without the header is charged to the socket
+address. Leave the flag unset on a listener that clients can reach directly:
+any client could then write a new address into the header for every request
+and never hit the lookup limit. Behind a local reverse proxy, bind the
+listener to loopback with `--metrics-bind 127.0.0.1`.
+
+**QUIC on Fly.** Fly documents that a UDP service must bind the
+`fly-global-services` address, and that a socket bound to the wildcard
+address replies from the wrong source. The relay binds `--listen-ip4`
+(default `0.0.0.0`), not that address, so QUIC reachability on Fly is
+unverified.
 
 ## Deployment (Fly.io)
 
