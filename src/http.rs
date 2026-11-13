@@ -9,17 +9,17 @@ use axum::routing::get;
 use axum::{Json, Router};
 use libp2p::PeerId;
 use serde::Serialize;
-use tokio::sync::RwLock;
+use tokio::sync::{watch, RwLock};
 
 use crate::addr::truncate_ip;
-use crate::config::{
-    MAX_CONNECTIONS, USERNAME_LOOKUP_LIMIT, USERNAME_LOOKUP_MAX_TRACKED, USERNAME_LOOKUP_WINDOW,
-};
-use crate::store::RegistryStore;
+use crate::config::Limits;
+#[cfg(test)]
+use crate::config::{DEFAULT_LOOKUP_LIMIT, DEFAULT_LOOKUP_MAX_TRACKED};
+use crate::swarm::SharedStore;
 
 // ── Metrics ──────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub(crate) struct RelayMetrics {
     pub(crate) peer_id: String,
     pub(crate) uptime_seconds: u64,
@@ -120,31 +120,47 @@ fn admin_authorised(expected: Option<&str>, headers: &axum::http::HeaderMap) -> 
 ///
 /// `std::sync::Mutex` rather than tokio's: the critical section is a map
 /// lookup and an integer bump, never held across an await.
-type LookupLimiter = Arc<std::sync::Mutex<HashMap<IpAddr, (usize, Instant)>>>;
+pub(crate) struct LookupLimiter {
+    windows: std::sync::Mutex<HashMap<IpAddr, (usize, Instant)>>,
+    limit: usize,
+    window: Duration,
+    max_tracked: usize,
+}
 
-/// True when `ip` is over its lookup budget. Prunes stale windows on the way
-/// through so the map stays bounded without a separate sweeper.
-fn lookup_rate_limited(limiter: &LookupLimiter, ip: IpAddr) -> bool {
-    let Ok(mut map) = limiter.lock() else {
-        // A poisoned lock means a panic mid-update. Refusing is the safe
-        // direction: a caller can retry, and allowing would silently disable
-        // the limiter for the process's life.
-        return true;
-    };
-    let now = Instant::now();
-    if map.len() >= USERNAME_LOOKUP_MAX_TRACKED {
-        map.retain(|_, (_, started)| now.duration_since(*started) < USERNAME_LOOKUP_WINDOW);
-        if map.len() >= USERNAME_LOOKUP_MAX_TRACKED {
-            map.clear();
+impl LookupLimiter {
+    pub(crate) fn new(limits: &Limits) -> Self {
+        LookupLimiter {
+            windows: std::sync::Mutex::new(HashMap::new()),
+            limit: limits.lookup_limit,
+            window: limits.lookup_window,
+            max_tracked: limits.lookup_max_tracked,
         }
     }
-    let (count, started) = map.entry(ip).or_insert((0, now));
-    if now.duration_since(*started) >= USERNAME_LOOKUP_WINDOW {
-        *count = 0;
-        *started = now;
+
+    /// True when `ip` is over its lookup budget. Prunes stale windows on the
+    /// way through so the map stays bounded without a separate sweeper.
+    fn is_limited(&self, ip: IpAddr) -> bool {
+        let Ok(mut map) = self.windows.lock() else {
+            // A poisoned lock means a panic mid-update. Refusing is the safe
+            // direction: a caller can retry, and allowing would silently
+            // disable the limiter for the process's life.
+            return true;
+        };
+        let now = Instant::now();
+        if map.len() >= self.max_tracked {
+            map.retain(|_, (_, started)| now.duration_since(*started) < self.window);
+            if map.len() >= self.max_tracked {
+                map.clear();
+            }
+        }
+        let (count, started) = map.entry(ip).or_insert((0, now));
+        if now.duration_since(*started) >= self.window {
+            *count = 0;
+            *started = now;
+        }
+        *count += 1;
+        *count > self.limit
     }
-    *count += 1;
-    *count > USERNAME_LOOKUP_LIMIT
 }
 
 /// The answer for an operational route that was not authorised.
@@ -155,14 +171,13 @@ fn not_found() -> (axum::http::StatusCode, Json<serde_json::Value>) {
     )
 }
 
-/// Read `RELAY_ADMIN_TOKEN`, refusing one short enough to guess.
+/// The configured admin token, refusing one short enough to guess.
 ///
 /// A token that reads as protection but is brute-forceable is worse than an
 /// endpoint that is simply switched off, so a short value is rejected at
 /// startup rather than accepted quietly.
-fn admin_token_from_env() -> Option<String> {
-    let token = std::env::var("RELAY_ADMIN_TOKEN").ok()?;
-    let token = token.trim().to_string();
+fn validated_admin_token(raw: Option<&str>) -> Option<String> {
+    let token = raw?.trim();
     if token.is_empty() {
         return None;
     }
@@ -173,24 +188,34 @@ fn admin_token_from_env() -> Option<String> {
         );
         return None;
     }
-    Some(token)
+    Some(token.to_string())
 }
+
 // ── Metrics HTTP Server ─────────────────────────────────────────────
 
-pub(crate) async fn run_metrics_server(
+/// Serve the HTTP routes on `listener` until `shutdown` fires, then finish
+/// in-flight requests and return.
+pub(crate) async fn serve(
+    listener: tokio::net::TcpListener,
     metrics: Arc<RwLock<RelayMetrics>>,
-    registry: Option<std::sync::Arc<std::sync::Mutex<RegistryStore>>>,
-    port: u16,
+    registry: Option<SharedStore>,
+    admin_token: Option<&str>,
+    limits: &Limits,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     // Sample rolling-minute deltas in the background. Lets /health/alerts
     // serve a denial-rate without external alerters doing delta math.
     {
         let metrics = metrics.clone();
+        let mut shutdown = shutdown.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(60));
             tick.tick().await; // consume immediate tick
             loop {
-                tick.tick().await;
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = shutdown.changed() => break,
+                }
                 let mut m = metrics.write().await;
                 m.circuits_denied_per_min = m
                     .circuits_denied
@@ -212,12 +237,13 @@ pub(crate) async fn run_metrics_server(
     let alerts_metrics = metrics.clone();
     let peers_metrics = metrics.clone();
     let full_metrics = metrics;
+    let max_connections = limits.max_connections;
 
     // Operational routes (`/peers`, `/metrics`, `/health/alerts`) require a
     // bearer token. Unconfigured means off — this listener is published to the
     // public internet by `fly.toml`, so anything on it that is not `/health` or
     // the public username registry has to prove it was asked for.
-    let admin_token = admin_token_from_env();
+    let admin_token = validated_admin_token(admin_token);
     if admin_token.is_none() {
         log::warn!(
             "RELAY_ADMIN_TOKEN is not set — /peers, /metrics and /health/alerts \
@@ -228,7 +254,7 @@ pub(crate) async fn run_metrics_server(
     let metrics_token = admin_token.clone();
     let alerts_token = admin_token;
 
-    let lookup_limiter: LookupLimiter = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let lookup_limiter = Arc::new(LookupLimiter::new(limits));
 
     let app = Router::new()
         .route(
@@ -241,7 +267,7 @@ pub(crate) async fn run_metrics_server(
                     let registry = registry.clone();
                     let limiter = lookup_limiter.clone();
                     async move {
-                        if lookup_rate_limited(&limiter, addr.ip()) {
+                        if limiter.is_limited(addr.ip()) {
                             return (
                                 axum::http::StatusCode::TOO_MANY_REQUESTS,
                                 Json(serde_json::json!({
@@ -302,7 +328,7 @@ pub(crate) async fn run_metrics_server(
                     let lock = m.read().await;
                     // Thresholds chosen so a healthy relay sits at "ok"
                     // and a saturated one trips before clients notice.
-                    let connections_ratio = lock.connections as f64 / MAX_CONNECTIONS as f64;
+                    let connections_ratio = lock.connections as f64 / f64::from(max_connections);
                     let denial_rate = lock.circuits_denied_per_min;
                     let accept_rate = lock.circuits_accepted_per_min;
                     let denial_share = if accept_rate + denial_rate == 0 {
@@ -347,7 +373,7 @@ pub(crate) async fn run_metrics_server(
                             "circuit_denial_share": denial_share,
                             "reservations_denied_per_min": lock.reservations_denied_per_min,
                             "connections_ratio": connections_ratio,
-                            "max_connections": MAX_CONNECTIONS,
+                            "max_connections": max_connections,
                         })),
                     )
                 }
@@ -391,14 +417,17 @@ pub(crate) async fn run_metrics_server(
             }),
         );
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
-        .await
-        .expect("bind metrics server");
-    log::info!("Metrics server listening on 0.0.0.0:{port}");
+    match listener.local_addr() {
+        Ok(addr) => log::info!("Metrics server listening on {addr}"),
+        Err(e) => log::warn!("Metrics server listening on an unknown address: {e}"),
+    }
     if let Err(e) = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
+    .with_graceful_shutdown(async move {
+        let _ = shutdown.changed().await;
+    })
     .await
     {
         log::error!("Metrics server error: {e}");
@@ -455,7 +484,7 @@ mod lookup_limiter_tests {
     use std::net::Ipv4Addr;
 
     fn fresh() -> LookupLimiter {
-        Arc::new(std::sync::Mutex::new(HashMap::new()))
+        LookupLimiter::new(&Limits::default())
     }
 
     /// The public username oracle used to be unthrottled: the whole registry
@@ -465,16 +494,10 @@ mod lookup_limiter_tests {
     fn a_client_is_refused_past_its_lookup_budget() {
         let l = fresh();
         let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
-        for _ in 0..USERNAME_LOOKUP_LIMIT {
-            assert!(
-                !lookup_rate_limited(&l, ip),
-                "within budget must be allowed"
-            );
+        for _ in 0..DEFAULT_LOOKUP_LIMIT {
+            assert!(!l.is_limited(ip), "within budget must be allowed");
         }
-        assert!(
-            lookup_rate_limited(&l, ip),
-            "one past the budget must be refused"
-        );
+        assert!(l.is_limited(ip), "one past the budget must be refused");
     }
 
     /// One client exhausting its budget must not affect another.
@@ -483,21 +506,34 @@ mod lookup_limiter_tests {
         let l = fresh();
         let a = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
         let b = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2));
-        for _ in 0..=USERNAME_LOOKUP_LIMIT {
-            let _ = lookup_rate_limited(&l, a);
+        for _ in 0..=DEFAULT_LOOKUP_LIMIT {
+            let _ = l.is_limited(a);
         }
-        assert!(lookup_rate_limited(&l, a));
-        assert!(!lookup_rate_limited(&l, b));
+        assert!(l.is_limited(a));
+        assert!(!l.is_limited(b));
+    }
+
+    /// The budget is the configured one, not a constant.
+    #[test]
+    fn the_budget_follows_the_configuration() {
+        let l = LookupLimiter::new(&Limits {
+            lookup_limit: 2,
+            ..Limits::default()
+        });
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+        assert!(!l.is_limited(ip));
+        assert!(!l.is_limited(ip));
+        assert!(l.is_limited(ip));
     }
 
     /// The map cannot itself become the memory leak.
     #[test]
     fn the_tracked_set_stays_bounded() {
         let l = fresh();
-        for i in 0..(USERNAME_LOOKUP_MAX_TRACKED + 500) {
+        for i in 0..(DEFAULT_LOOKUP_MAX_TRACKED + 500) {
             let ip = IpAddr::V4(Ipv4Addr::from((i as u32).wrapping_add(0x0100_0000)));
-            let _ = lookup_rate_limited(&l, ip);
+            let _ = l.is_limited(ip);
         }
-        assert!(l.lock().unwrap().len() <= USERNAME_LOOKUP_MAX_TRACKED);
+        assert!(l.windows.lock().unwrap().len() <= DEFAULT_LOOKUP_MAX_TRACKED);
     }
 }

@@ -10,28 +10,34 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 
+use crate::config::{DEFAULT_KAD_MAX_RECORDS, DEFAULT_KAD_MAX_RECORD_BYTES};
 use crate::username_reg::{
     canonical_receipt_bytes, countersign, release_valid, verify_claim, ReceiptResponse,
     RelayReceipt, UsernameClaim, RELEASE_GRACE_SECS,
 };
 
-/// Ceiling on the on-disk Kademlia mirror. Matches the default
-/// `kad_max_records` limit; duplicated rather than shared because the store
-/// must be able to bound itself without reaching back into the swarm's
-/// configuration.
-const KAD_MIRROR_MAX_RECORDS: i64 = 16_384;
-
-/// Ceiling on a single mirrored value, matching the default
-/// `kad_max_record_bytes` limit. The caller checks this too; checked again
-/// here so the storage layer cannot be made to write an unbounded blob by a
-/// future caller that forgets.
-const KAD_MIRROR_MAX_VALUE_BYTES: usize = 65_536;
-
 pub struct RegistryStore {
     conn: Connection,
+    /// Ceiling on the on-disk Kademlia mirror, the same cap as the memory
+    /// store's. Held here so the store bounds itself without reaching back
+    /// into the swarm.
+    kad_max_records: i64,
+    /// Ceiling on a single mirrored value. The caller checks this too;
+    /// checked again here so the storage layer cannot be made to write an
+    /// unbounded blob by a future caller that forgets.
+    kad_max_value_bytes: usize,
 }
 
 impl RegistryStore {
+    /// Bound the Kademlia mirror to `max_records` records of at most
+    /// `max_value_bytes` each. [`RegistryStore::open`] starts with the
+    /// default limits.
+    pub fn with_kad_caps(mut self, max_records: usize, max_value_bytes: usize) -> Self {
+        self.kad_max_records = i64::try_from(max_records).unwrap_or(i64::MAX);
+        self.kad_max_value_bytes = max_value_bytes;
+        self
+    }
+
     pub fn open(data_dir: &Path) -> Result<Self, String> {
         std::fs::create_dir_all(data_dir).map_err(|e| format!("create data dir: {e}"))?;
         let conn = Connection::open(data_dir.join("username_registry.db"))
@@ -52,7 +58,11 @@ impl RegistryStore {
         .map_err(|e| format!("init registry schema: {e}"))?;
         // Older stores predate releases — guarded ALTER.
         let _ = conn.execute("ALTER TABLE receipts ADD COLUMN released_at INTEGER", []);
-        Ok(RegistryStore { conn })
+        Ok(RegistryStore {
+            conn,
+            kad_max_records: DEFAULT_KAD_MAX_RECORDS as i64,
+            kad_max_value_bytes: DEFAULT_KAD_MAX_RECORD_BYTES,
+        })
     }
 
     /// Handle a receipt request: verify, apply first-seen semantics,
@@ -180,7 +190,7 @@ impl RegistryStore {
 
     /// Mirror a kad record for restart persistence.
     pub fn save_kad_record(&self, key: &[u8], value: &[u8]) {
-        if value.len() > KAD_MIRROR_MAX_VALUE_BYTES {
+        if value.len() > self.kad_max_value_bytes {
             return;
         }
         let _ = self.conn.execute(
@@ -191,7 +201,7 @@ impl RegistryStore {
         self.trim_kad_records();
     }
 
-    /// Hold the mirror to `KAD_MIRROR_MAX_RECORDS`, evicting oldest-first.
+    /// Hold the mirror to its record cap, evicting oldest-first.
     ///
     /// The in-memory Kademlia store has its own ceiling, but it is emptied on
     /// every restart and refilled from here — so without a ceiling on the table
@@ -204,7 +214,7 @@ impl RegistryStore {
             .conn
             .query_row("SELECT COUNT(*) FROM kad_records", [], |r| r.get(0))
             .unwrap_or(0);
-        let excess = count - KAD_MIRROR_MAX_RECORDS;
+        let excess = count - self.kad_max_records;
         if excess <= 0 {
             return;
         }
@@ -496,5 +506,20 @@ mod tests {
                 (b"k2".to_vec(), b"v3".to_vec())
             ]
         );
+    }
+
+    #[test]
+    fn the_mirror_holds_the_configured_caps() {
+        // The record cap and value size are configuration; the mirror must
+        // follow them, not the defaults.
+        let (s, _, _) = store();
+        let s = s.with_kad_caps(2, 8);
+        s.save_kad_record(b"k1", b"v");
+        s.save_kad_record(b"k2", b"v");
+        s.save_kad_record(b"k3", b"v");
+        s.save_kad_record(b"big", &[0u8; 9]);
+        let mut keys: Vec<Vec<u8>> = s.load_kad_records().into_iter().map(|(k, _)| k).collect();
+        keys.sort();
+        assert_eq!(keys, vec![b"k2".to_vec(), b"k3".to_vec()]);
     }
 }
