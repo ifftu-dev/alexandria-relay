@@ -1020,7 +1020,11 @@ fn build_behaviour(
         reservation_duration: limits.reservation_duration,
         ..Default::default()
     };
-    let relay = relay::Behaviour::new(local_peer_id, relay_config);
+    let mut relay = relay::Behaviour::new(local_peer_id, relay_config);
+    // Since libp2p-relay 0.22 the server advertises HOP only once it has a
+    // confirmed external address. Relaying is this binary's job, so pin it
+    // on regardless of what external addresses get registered at startup.
+    relay.set_status(Some(relay::Status::Enable));
 
     // ── Kademlia DHT ─────────────────────────────────────────────────
     // Private Alexandria DHT (`/alexandria/kad/1.0`).

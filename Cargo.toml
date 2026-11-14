@@ -13,12 +13,12 @@ path = "src/main.rs"
 [dependencies]
 # P2P — same libp2p version as the main app
 # Only the protocols the relay needs: relay, kad, identify, transports
-libp2p = { version = "0.56.0", features = [
+libp2p = { version = "0.57.1", features = [
     "kad", "tcp", "quic", "noise", "yamux",
     "identify", "relay", "tokio", "ed25519", "macros",
     "request-response", "cbor",
 ] }
-libp2p-connection-limits = "0.6"
+libp2p-connection-limits = "0.7"
 futures = "0.3"
 tokio = { version = "1", features = ["full"] }
 log = "0.4"
