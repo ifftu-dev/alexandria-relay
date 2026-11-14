@@ -69,18 +69,18 @@ jobs:
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      checks: write
     steps:
       - uses: actions/checkout@v4
       # Ignores live in .cargo/audit.toml, each with the reason it is not
       # reachable. This node is public infrastructure with no authentication
       # in front of it, so an unreviewed advisory in its tree is a live one.
-      # The action caches the cargo-audit binary between runs.
-      - uses: rustsec/audit-check@v2.0.0
+      # Plain `cargo audit` rather than rustsec/audit-check: the action fails
+      # the job when it cannot update its own check run, even on a clean audit.
+      # install-action fetches a prebuilt binary, so nothing compiles here.
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+      - run: cargo audit
 
   deny:
     name: Licences and bans
