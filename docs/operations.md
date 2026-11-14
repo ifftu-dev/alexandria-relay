@@ -58,7 +58,9 @@ At the default `info` level the relay logs startup, mesh changes, errors
 and one `HEALTH` line every `--health-log-interval-secs`, with the circuits,
 reservations and receipt requests (accepted and denied) since the previous
 line. Per-connection, per-circuit, per-reservation and per-receipt lines
-are at `debug` (`RUST_LOG=alexandria_relay=debug`).
+are at `debug` (`RUST_LOG=alexandria_relay=debug`). Each kind has its own
+target, so `RUST_LOG=alexandria_relay::event::<kind>=debug` turns on one kind
+alone: `connection`, `identify`, `reservation`, `circuit`, `receipt` or `kad`.
 
 ## External alerting
 
