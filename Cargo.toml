@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Alexandria P2P relay + bootstrap node"
 edition = "2021"
 rust-version = "1.89.0"
+publish = false
 
 [[bin]]
 name = "alexandria-relay"
@@ -27,8 +28,18 @@ hex = "0.4"
 rand = "0.8"
 zeroize = "1"
 axum = { version = "0.7", features = ["json"] }
+# The HTTP listener is served through hyper directly (not `axum::serve`) for
+# its header-read timeout and a per-connection concurrency bound. All three are
+# already axum dependencies; no new crates.
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = { version = "0.5", features = ["util"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Error types; already in the tree through libp2p.
+thiserror = "2"
+# Relay-discovery key: SHA-256 of the profile's namespace, as the app derives it
+sha2 = "0.10"
 
 # Username registry receipts: claim verification + first-seen store
 ed25519-dalek = "2"

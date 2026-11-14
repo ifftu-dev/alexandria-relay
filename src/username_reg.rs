@@ -14,13 +14,10 @@
 //!   - Different DID → refused, with the existing holder's first-seen
 //!     time so the client can explain the conflict.
 //!
-//! The store also mirrors Kademlia records so the DHT survives relay
-//! restarts (the kad store itself is in-memory).
+//! Receipts persist in [`crate::store::RegistryStore`], which also mirrors
+//! Kademlia records so the DHT survives relay restarts (the kad store itself
+//! is in-memory).
 
-use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL: &str = "/alexandria/username-reg/1.0";
@@ -29,15 +26,12 @@ pub const PROTOCOL: &str = "/alexandria/username-reg/1.0";
 /// app's `RELEASE_GRACE_SECS`).
 pub const RELEASE_GRACE_SECS: i64 = 30 * 24 * 3600;
 
-/// Ceiling on the on-disk Kademlia mirror. Matches `KAD_MAX_RECORDS` in
-/// `main.rs`; duplicated rather than shared because the store must be able to
-/// bound itself without reaching back into the swarm's configuration.
-const KAD_MIRROR_MAX_RECORDS: i64 = 16_384;
-
-/// Ceiling on a single mirrored value, matching `KAD_MAX_RECORD_SIZE`. The
-/// caller checks this too; checked again here so the storage layer cannot be
-/// made to write an unbounded blob by a future caller that forgets.
-const KAD_MIRROR_MAX_VALUE_BYTES: usize = 65_536;
+/// When a name released at `released_at` frees up. The release time is
+/// owner-signed and unchecked, so the sum saturates: a release dated near
+/// the end of time keeps the name held rather than wrapping into the past.
+pub(crate) fn release_frees_at(released_at: i64) -> i64 {
+    released_at.saturating_add(RELEASE_GRACE_SECS)
+}
 
 // ── Wire types (mirror the main app's domain::username_claim) ──────
 
@@ -91,6 +85,17 @@ pub enum ReceiptResponse {
     },
 }
 
+impl ReceiptResponse {
+    /// A refusal that names no existing holder.
+    pub fn refused(reason: impl Into<String>) -> Self {
+        ReceiptResponse::Refused {
+            reason: reason.into(),
+            existing_did: None,
+            existing_received_at: None,
+        }
+    }
+}
+
 // ── Claim verification (did:key → ed25519) ─────────────────────────
 
 /// Longest `did` string accepted before any decoding.
@@ -123,7 +128,7 @@ fn did_key_to_verifying_key(did: &str) -> Result<ed25519_dalek::VerifyingKey, St
     ed25519_dalek::VerifyingKey::from_bytes(&key).map_err(|e| format!("bad key: {e}"))
 }
 
-fn canonical_release_bytes(username: &str, did: &str, released_at: i64) -> Vec<u8> {
+pub(crate) fn canonical_release_bytes(username: &str, did: &str, released_at: i64) -> Vec<u8> {
     format!("alexandria-username-release-v1|{username}|{did}|{released_at}").into_bytes()
 }
 
@@ -149,7 +154,7 @@ pub fn release_valid(claim: &UsernameClaim) -> bool {
     .is_ok()
 }
 
-fn canonical_claim_bytes(username: &str, did: &str, claimed_at: i64) -> Vec<u8> {
+pub(crate) fn canonical_claim_bytes(username: &str, did: &str, claimed_at: i64) -> Vec<u8> {
     format!("alexandria-username-claim-v1|{username}|{did}|{claimed_at}").into_bytes()
 }
 
@@ -189,7 +194,7 @@ pub fn verify_claim(claim: &UsernameClaim) -> Result<(), String> {
 /// receipt that reads as granted and carries no signature at all. Any client
 /// that treats `Granted` as the trust signal, rather than verifying the
 /// countersignature, would have accepted it.
-fn countersign(keypair: &libp2p::identity::Keypair, bytes: &[u8]) -> Option<String> {
+pub(crate) fn countersign(keypair: &libp2p::identity::Keypair, bytes: &[u8]) -> Option<String> {
     match keypair.sign(bytes) {
         Ok(sig) if !sig.is_empty() => Some(hex::encode(sig)),
         Ok(_) => {
@@ -207,475 +212,4 @@ fn countersign(keypair: &libp2p::identity::Keypair, bytes: &[u8]) -> Option<Stri
 /// receipt to this exact claim), the first-seen time, and the relay id.
 pub fn canonical_receipt_bytes(claim_sig: &str, received_at: i64, relay_peer_id: &str) -> Vec<u8> {
     format!("alexandria-username-receipt-v1|{claim_sig}|{received_at}|{relay_peer_id}").into_bytes()
-}
-
-// ── Persistent store ────────────────────────────────────────────────
-
-pub struct RegistryStore {
-    conn: Connection,
-}
-
-impl RegistryStore {
-    pub fn open(data_dir: &Path) -> Result<Self, String> {
-        std::fs::create_dir_all(data_dir).map_err(|e| format!("create data dir: {e}"))?;
-        let conn = Connection::open(data_dir.join("username_registry.db"))
-            .map_err(|e| format!("open registry db: {e}"))?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS receipts (
-                 username    TEXT PRIMARY KEY,
-                 did         TEXT NOT NULL,
-                 claim_sig   TEXT NOT NULL,
-                 received_at INTEGER NOT NULL,
-                 receipt_sig TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS kad_records (
-                 key   BLOB PRIMARY KEY,
-                 value BLOB NOT NULL
-             );",
-        )
-        .map_err(|e| format!("init registry schema: {e}"))?;
-        // Older stores predate releases — guarded ALTER.
-        let _ = conn.execute("ALTER TABLE receipts ADD COLUMN released_at INTEGER", []);
-        Ok(RegistryStore { conn })
-    }
-
-    /// Handle a receipt request: verify, apply first-seen semantics,
-    /// countersign with the relay key.
-    pub fn handle_receipt(
-        &mut self,
-        keypair: &libp2p::identity::Keypair,
-        relay_peer_id: &str,
-        claim: &UsernameClaim,
-    ) -> ReceiptResponse {
-        if let Err(e) = verify_claim(claim) {
-            return ReceiptResponse::Refused {
-                reason: format!("invalid claim: {e}"),
-                existing_did: None,
-                existing_received_at: None,
-            };
-        }
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-
-        let existing: Option<(String, String, i64, String, Option<i64>)> = self
-            .conn
-            .query_row(
-                "SELECT did, claim_sig, received_at, receipt_sig, released_at
-                 FROM receipts WHERE username = ?1",
-                [&claim.username],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )
-            .ok();
-
-        if let Some((did, claim_sig, received_at, receipt_sig, released_at)) = existing {
-            // A grace-elapsed release frees the row for new claimants.
-            if let Some(rel) = released_at {
-                if did != claim.did && now >= rel + RELEASE_GRACE_SECS {
-                    let _ = self.conn.execute(
-                        "DELETE FROM receipts WHERE username = ?1",
-                        [&claim.username],
-                    );
-                    return self.handle_receipt(keypair, relay_peer_id, claim);
-                }
-            }
-            if did == claim.did {
-                // Owner submitting a tombstone: record the release.
-                if claim.release.is_some() && release_valid(claim) {
-                    let rel_at = claim.release.as_ref().map(|r| r.released_at).unwrap_or(now);
-                    let _ = self.conn.execute(
-                        "UPDATE receipts SET released_at = ?2 WHERE username = ?1",
-                        rusqlite::params![claim.username, rel_at],
-                    );
-                } else if released_at.is_some() && claim.release.is_none() {
-                    // Owner re-claiming within grace — undo the release.
-                    let _ = self.conn.execute(
-                        "UPDATE receipts SET released_at = NULL WHERE username = ?1",
-                        [&claim.username],
-                    );
-                }
-                // Same owner refreshing — re-issue the original receipt
-                // if the claim is byte-identical; otherwise countersign
-                // the new claim sig at the ORIGINAL first-seen time so
-                // priority is preserved.
-                let sig = if claim_sig == claim.sig {
-                    receipt_sig
-                } else {
-                    let bytes = canonical_receipt_bytes(&claim.sig, received_at, relay_peer_id);
-                    let Some(sig) = countersign(keypair, &bytes) else {
-                        return ReceiptResponse::Refused {
-                            reason: "relay signing failed".to_string(),
-                            existing_did: None,
-                            existing_received_at: None,
-                        };
-                    };
-                    let _ = self.conn.execute(
-                        "UPDATE receipts SET claim_sig = ?2, receipt_sig = ?3 WHERE username = ?1",
-                        rusqlite::params![claim.username, claim.sig, sig],
-                    );
-                    sig
-                };
-                return ReceiptResponse::Granted(RelayReceipt {
-                    relay_peer_id: relay_peer_id.to_string(),
-                    received_at,
-                    sig,
-                });
-            }
-            return ReceiptResponse::Refused {
-                reason: "username already receipted to another DID".to_string(),
-                existing_did: Some(did),
-                existing_received_at: Some(received_at),
-            };
-        }
-
-        let received_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let bytes = canonical_receipt_bytes(&claim.sig, received_at, relay_peer_id);
-        let Some(sig) = countersign(keypair, &bytes) else {
-            return ReceiptResponse::Refused {
-                reason: "relay signing failed".to_string(),
-                existing_did: None,
-                existing_received_at: None,
-            };
-        };
-
-        if let Err(e) = self.conn.execute(
-            "INSERT INTO receipts (username, did, claim_sig, received_at, receipt_sig)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![claim.username, claim.did, claim.sig, received_at, sig],
-        ) {
-            return ReceiptResponse::Refused {
-                reason: format!("store error: {e}"),
-                existing_did: None,
-                existing_received_at: None,
-            };
-        }
-
-        ReceiptResponse::Granted(RelayReceipt {
-            relay_peer_id: relay_peer_id.to_string(),
-            received_at,
-            sig,
-        })
-    }
-
-    /// Mirror a kad record for restart persistence.
-    pub fn save_kad_record(&self, key: &[u8], value: &[u8]) {
-        if value.len() > KAD_MIRROR_MAX_VALUE_BYTES {
-            return;
-        }
-        let _ = self.conn.execute(
-            "INSERT INTO kad_records (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            rusqlite::params![key, value],
-        );
-        self.trim_kad_records();
-    }
-
-    /// Hold the mirror to `KAD_MIRROR_MAX_RECORDS`, evicting oldest-first.
-    ///
-    /// The in-memory Kademlia store has its own ceiling, but it is emptied on
-    /// every restart and refilled from here — so without a ceiling on the table
-    /// itself, records that were long ago evicted from memory stay on disk
-    /// forever and the volume grows without bound. `rowid` is insertion order
-    /// (an `ON CONFLICT` update keeps the original), so ascending rowid is
-    /// oldest-first.
-    fn trim_kad_records(&self) {
-        let count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM kad_records", [], |r| r.get(0))
-            .unwrap_or(0);
-        let excess = count - KAD_MIRROR_MAX_RECORDS;
-        if excess <= 0 {
-            return;
-        }
-        let _ = self.conn.execute(
-            "DELETE FROM kad_records WHERE rowid IN (
-                 SELECT rowid FROM kad_records ORDER BY rowid ASC LIMIT ?1
-             )",
-            rusqlite::params![excess],
-        );
-    }
-
-    /// All mirrored kad records, for warm-loading the MemoryStore at boot.
-    pub fn load_kad_records(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let Ok(mut stmt) = self.conn.prepare("SELECT key, value FROM kad_records") else {
-            return Vec::new();
-        };
-        stmt.query_map([], |r| {
-            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
-        })
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
-    }
-
-    pub fn receipt_count(&self) -> i64 {
-        self.conn
-            .query_row("SELECT COUNT(*) FROM receipts", [], |r| r.get(0))
-            .unwrap_or(0)
-    }
-
-    /// Current holder of a username (receipted claims only), for the
-    /// HTTP availability endpoint.
-    pub fn lookup_username(&self, username: &str) -> Option<(String, i64)> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        self.conn
-            .query_row(
-                "SELECT did, received_at, released_at FROM receipts WHERE username = ?1",
-                [username],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, i64>(1)?,
-                        r.get::<_, Option<i64>>(2)?,
-                    ))
-                },
-            )
-            .ok()
-            .filter(|(_, _, rel)| match rel {
-                Some(rel_at) => now < rel_at + RELEASE_GRACE_SECS,
-                None => true,
-            })
-            .map(|(did, received_at, _)| (did, received_at))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ed25519_dalek::{Signer, SigningKey};
-
-    fn make_claim(seed: u8, username: &str, claimed_at: i64) -> UsernameClaim {
-        let key = SigningKey::from_bytes(&[seed; 32]);
-        // did:key encoding: z + base58(0xed 0x01 + pubkey)
-        let mut bytes = vec![0xed, 0x01];
-        bytes.extend_from_slice(key.verifying_key().as_bytes());
-        let did = format!("did:key:z{}", bs58::encode(bytes).into_string());
-        let sig = key.sign(&canonical_claim_bytes(username, &did, claimed_at));
-        UsernameClaim {
-            version: 1,
-            username: username.to_string(),
-            did,
-            claimed_at,
-            sig: hex::encode(sig.to_bytes()),
-            receipt: None,
-            anchor: None,
-            release: None,
-        }
-    }
-
-    fn store() -> (RegistryStore, libp2p::identity::Keypair, String) {
-        let dir = std::env::temp_dir().join(format!("relay-test-{}", rand::random::<u64>()));
-        let store = RegistryStore::open(&dir).unwrap();
-        let kp = libp2p::identity::Keypair::generate_ed25519();
-        let pid = kp.public().to_peer_id().to_string();
-        (store, kp, pid)
-    }
-
-    #[test]
-    fn grants_first_claim_and_verifies() {
-        let (mut s, kp, pid) = store();
-        let claim = make_claim(1, "ada_99", 1000);
-        match s.handle_receipt(&kp, &pid, &claim) {
-            ReceiptResponse::Granted(r) => {
-                assert_eq!(r.relay_peer_id, pid);
-                // Receipt signature verifies with the relay pubkey.
-                let bytes = canonical_receipt_bytes(&claim.sig, r.received_at, &pid);
-                assert!(kp.public().verify(&bytes, &hex::decode(r.sig).unwrap()));
-            }
-            other => panic!("expected Granted, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn refuses_second_did_same_username() {
-        let (mut s, kp, pid) = store();
-        let first = make_claim(1, "ada_99", 1000);
-        let second = make_claim(2, "ada_99", 500); // earlier self-asserted time!
-        assert!(matches!(
-            s.handle_receipt(&kp, &pid, &first),
-            ReceiptResponse::Granted(_)
-        ));
-        match s.handle_receipt(&kp, &pid, &second) {
-            ReceiptResponse::Refused { existing_did, .. } => {
-                assert_eq!(existing_did, Some(first.did));
-            }
-            other => panic!("expected Refused, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn same_did_refresh_keeps_original_time() {
-        let (mut s, kp, pid) = store();
-        let claim = make_claim(1, "ada_99", 1000);
-        let r1 = match s.handle_receipt(&kp, &pid, &claim) {
-            ReceiptResponse::Granted(r) => r,
-            other => panic!("{other:?}"),
-        };
-        let r2 = match s.handle_receipt(&kp, &pid, &claim) {
-            ReceiptResponse::Granted(r) => r,
-            other => panic!("{other:?}"),
-        };
-        assert_eq!(r1.received_at, r2.received_at);
-        assert_eq!(r1.sig, r2.sig);
-    }
-
-    #[test]
-    fn an_ed25519_did_key_fits_the_length_bound() {
-        // The bound must never refuse a real key. All-0xff key bytes give the
-        // longest base58 encoding a 34-byte payload can have.
-        let mut bytes = vec![0xed, 0x01];
-        bytes.extend_from_slice(&[0xff; 32]);
-        let did = format!("did:key:z{}", bs58::encode(bytes).into_string());
-        assert!(did.len() <= MAX_DID_KEY_LEN, "{} > bound", did.len());
-        let claim = make_claim(1, "ada_99", 1000);
-        assert!(claim.did.len() <= MAX_DID_KEY_LEN);
-    }
-
-    #[test]
-    fn an_oversized_did_is_refused_before_decoding() {
-        // Base58 decoding is quadratic: a 200k-character DID takes seconds to
-        // decode (far longer in a debug build). Refusing it has to be
-        // immediate, so the elapsed-time bound below separates the two paths
-        // by orders of magnitude rather than measuring anything fine-grained.
-        let (mut s, kp, pid) = store();
-        let mut claim = make_claim(1, "ada_99", 1000);
-        claim.did = format!("did:key:z{}", "2".repeat(200_000));
-        let started = std::time::Instant::now();
-        let response = s.handle_receipt(&kp, &pid, &claim);
-        let elapsed = started.elapsed();
-        match response {
-            ReceiptResponse::Refused { reason, .. } => {
-                assert!(reason.starts_with("invalid claim"), "{reason}");
-            }
-            other => panic!("expected Refused, got {other:?}"),
-        }
-        assert!(
-            elapsed < std::time::Duration::from_millis(100),
-            "oversized DID took {elapsed:?} to refuse"
-        );
-        // The release path decodes the same DID and must be bounded too.
-        assert!(!release_valid(&UsernameClaim {
-            release: Some(Release {
-                released_at: 0,
-                sig: "00".repeat(64),
-            }),
-            ..claim
-        }));
-    }
-
-    #[test]
-    fn rejects_forged_claim() {
-        let (mut s, kp, pid) = store();
-        let mut claim = make_claim(1, "ada_99", 1000);
-        claim.username = "stolen".to_string();
-        assert!(matches!(
-            s.handle_receipt(&kp, &pid, &claim),
-            ReceiptResponse::Refused { .. }
-        ));
-    }
-
-    #[test]
-    fn release_frees_name_after_grace() {
-        let (mut s, kp, pid) = store();
-        let key1 = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
-        let mut released = make_claim(1, "ada_99", 1000);
-        assert!(matches!(
-            s.handle_receipt(&kp, &pid, &released),
-            ReceiptResponse::Granted(_)
-        ));
-        // Owner tombstones the name (released_at far in the past so
-        // the grace window is already elapsed for the test).
-        let rel_at = 0i64;
-        let sig = key1.sign(&canonical_release_bytes(
-            &released.username,
-            &released.did,
-            rel_at,
-        ));
-        released.release = Some(Release {
-            released_at: rel_at,
-            sig: hex::encode(sig.to_bytes()),
-        });
-        assert!(release_valid(&released));
-        assert!(matches!(
-            s.handle_receipt(&kp, &pid, &released),
-            ReceiptResponse::Granted(_)
-        ));
-        // Grace elapsed (released_at=0) → lookup hides it, and a new
-        // DID can claim the name.
-        assert!(s.lookup_username("ada_99").is_none());
-        let newcomer = make_claim(2, "ada_99", 2000);
-        match s.handle_receipt(&kp, &pid, &newcomer) {
-            ReceiptResponse::Granted(_) => {}
-            other => panic!("expected Granted for newcomer, got {other:?}"),
-        }
-        assert_eq!(
-            s.lookup_username("ada_99").map(|(did, _)| did),
-            Some(newcomer.did)
-        );
-    }
-
-    #[test]
-    fn reclaim_within_grace_undoes_release() {
-        let (mut s, kp, pid) = store();
-        let key1 = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
-        let mut claim = make_claim(1, "ada_99", 1000);
-        assert!(matches!(
-            s.handle_receipt(&kp, &pid, &claim),
-            ReceiptResponse::Granted(_)
-        ));
-        // Release now (within grace), then re-claim without release.
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        let sig = key1.sign(&canonical_release_bytes(&claim.username, &claim.did, now));
-        claim.release = Some(Release {
-            released_at: now,
-            sig: hex::encode(sig.to_bytes()),
-        });
-        let _ = s.handle_receipt(&kp, &pid, &claim);
-        // Still within grace: visible, and another DID is refused.
-        assert!(s.lookup_username("ada_99").is_some());
-        let other = make_claim(2, "ada_99", 2000);
-        assert!(matches!(
-            s.handle_receipt(&kp, &pid, &other),
-            ReceiptResponse::Refused { .. }
-        ));
-        // Owner re-claims (no release) → release cleared.
-        claim.release = None;
-        let _ = s.handle_receipt(&kp, &pid, &claim);
-        let rel: Option<i64> = s
-            .conn
-            .query_row(
-                "SELECT released_at FROM receipts WHERE username = 'ada_99'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(rel.is_none());
-    }
-
-    #[test]
-    fn kad_record_mirror_round_trips() {
-        let (s, _, _) = store();
-        s.save_kad_record(b"k1", b"v1");
-        s.save_kad_record(b"k1", b"v2"); // upsert
-        s.save_kad_record(b"k2", b"v3");
-        let mut records = s.load_kad_records();
-        records.sort();
-        assert_eq!(
-            records,
-            vec![
-                (b"k1".to_vec(), b"v2".to_vec()),
-                (b"k2".to_vec(), b"v3".to_vec())
-            ]
-        );
-    }
 }

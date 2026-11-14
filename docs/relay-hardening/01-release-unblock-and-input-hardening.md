@@ -1,6 +1,8 @@
 # Unblock releases and bound receipt-request inputs
 
-Triage: ready-for-agent
+Status: implemented
+Updated: 2026-11-13
+Triage: done
 Repos: alexandria-relay
 Part of: alexandria-relay/docs/relay-hardening-spec.md
 
@@ -43,3 +45,23 @@ Read the parent spec and the repository `AGENTS.md`. Work on a branch from
 repository's `type(scope): message` form. Return the commits, the audit output
 and test evidence. Tracker updates are authorized by the invoked
 implement-spec workflow.
+
+## Notes
+
+- 2026-11-13: Done. Merged in PR #14 and deployed to both regions. `cargo
+  audit` exits zero with the hickory ignores documented in
+  `.cargo/audit.toml`. A 200,000-character DID took 61.7 s to refuse in a
+  debug build before the bound and is now refused at once (unit test
+  `an_oversized_did_is_refused_before_decoding`). Receipt requests are capped
+  at 8 KiB, pending incoming handshakes at 256, and seed buffers are zeroized.
+  `docker build .` passed in CI on Rust 1.89.
+
+- 2026-11-13, review fixes: an owner-signed release dated near the end of
+  time no longer overflows the grace sum. It saturates, so the name stays
+  held; before, it panicked the store thread in a debug build and freed
+  the name at once in a release build. Two cases gained wire-level tests:
+  twenty receipt requests with a DID just under the request cap are
+  refused in well under a second (`tests/relay.rs`; 1.7 s with the length
+  guard removed), and a dial is refused while a socket that never
+  negotiates holds the only pending-incoming slot (`tests/limits.rs`;
+  accepted with the cap removed).

@@ -1,6 +1,8 @@
 # Make per-address limits see clients and bound the handshake surface
 
-Triage: ready-for-agent
+Status: implemented
+Updated: 2026-11-13
+Triage: done
 Repos: alexandria-relay
 Part of: alexandria-relay/docs/relay-hardening-spec.md
 Blocked by: alexandria-relay/docs/relay-hardening/03-runtime-config-and-black-box-seam.md
@@ -51,3 +53,44 @@ TDD skill at the black-box seam. Branch from the integration tip that contains
 03; confirm ancestry before editing. Return commits, red/green evidence and
 unresolved blockers. Tracker updates are authorized by the invoked
 implement-spec workflow.
+
+## Notes
+
+- 2026-11-13: Done. `client_bucket` in `src/addr.rs` (full IPv4 address,
+  IPv6 /64, IPv4-mapped addresses unmapped first) keys the libp2p
+  connection limiter, the lookup limiter and the `/peers` source map;
+  `/peers` still presents /24 and /48. `--trusted-proxy-header`
+  (`RELAY_TRUSTED_PROXY_HEADER`, `Fly-Client-IP` when given without a
+  value) feeds one `client_ip` function in `src/http.rs`; unset, headers
+  are ignored. Connection remote addresses no longer enter the routing
+  table. The HTTP listener is now served through hyper directly with a
+  header read timeout (10 s), a request timeout (15 s, then `503`) and a
+  concurrent-connection cap (256), each a flag. Item 5 was already
+  satisfied by ticket 04 (the image runs as uid 10001); nothing changed
+  here. The operations doc has the client-address section. Red: in
+  `tests/limits.rs`, with the config fields added but no behaviour, five
+  of six cases failed (header address still charged to the socket
+  address, a neighbouring /64 refused, the relay handed out the
+  advertiser's `127.0.0.1` ephemeral address, a silent connection stayed
+  open past ten seconds, a second connection was served while the only
+  slot was held); green: all six pass, plus unit tests for the bucketing
+  and header parsing.
+- Deviations: the bucketing lives inside the lookup limiter, so callers
+  pass raw addresses. An appending header such as `X-Forwarded-For` is
+  read from its last entry, and a missing or unparsable header falls back
+  to the socket address. The HTTP server dropped HTTP/2 (every client
+  speaks HTTP/1.1). Connections past the cap wait in the listen backlog
+  rather than being refused. libp2p's own per-IP reservation and circuit
+  limiters still key on the full address; they are not configurable and
+  are listed as affected in the operations doc. The Fly configs do not
+  enable the header flag; that is a deploy decision.
+
+- 2026-11-13, review fixes: the per-IP connection limiter, the receipt
+  limiter and the lookup limiter share one window counter
+  (`src/rate.rs`). The connection and receipt windows now end exactly
+  their length after they opened, as the lookup window already did; they
+  used to run until strictly past it. Not covered black-box: two IPv6
+  clients in one /64 sharing the connection-limiter budget would need two
+  addresses in one /64 on the test host, and loopback has only `::1`. The
+  bucketing stays unit-tested in `src/addr.rs`, and the lookup limiter's
+  /64 case is tested over HTTP.

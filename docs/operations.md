@@ -1,15 +1,18 @@
 # Relay operations
 
 Status: live
-Updated: 2026-11-12
+Updated: 2026-11-13
 
-How to run, watch and deploy the relay. Configuration flags and env vars are
-in the [README](../README.md#configuration).
+How to run, watch and deploy the relay. Listener and identity settings are
+in the [README](../README.md#configuration); limits are below. To run a
+relay of your own, start with [self-hosting.md](self-hosting.md); this page
+also covers the project's Fly deployment.
 
 ## HTTP endpoints
 
-The HTTP server listens on the metrics port (default `9090`). On Fly it is
-also served over TLS on `443`; `9090` is kept for the platform healthcheck.
+The HTTP server listens on `--metrics-bind` and `--metrics-port` (default
+`0.0.0.0:9090`). On Fly it is also served over TLS on `443`; `9090` is kept
+for the platform healthcheck.
 
 Operational endpoints need `Authorization: Bearer $RELAY_ADMIN_TOKEN`. They
 answer `404`, not `401`, when the token is missing, wrong or not configured,
@@ -17,11 +20,17 @@ so a scanner can't tell that they exist.
 
 | Endpoint | Auth | Returns |
 |---|---|---|
-| `GET /health` | public | `{"status":"ok","peer_id":…,"uptime_seconds":…,"connections":…}` |
+| `GET /health` | public | `{"status":"ok","version":…,"peer_id":…,"uptime_seconds":…,"connections":…,"profile_relays":…,"reachable_relays":…,"bootstrap_status":…}`. `connections` is the live count of connected peers |
 | `GET /username/:name` | public | Username availability from the receipt registry. Clients resolve names against it |
 | `GET /health/alerts` | bearer | `200` when healthy, `503` when any alert fires; the body lists firing alerts and rolling 60 s rates |
-| `GET /metrics` | bearer | Connections, circuits, reservations, DHT updates, identify events, listener errors, IP rate limits, rolling-minute denials |
+| `GET /metrics` | bearer | Connections, circuits, reservations, receipt requests, DHT updates, identify events, listener errors, IP rate limits, rolling-minute denials, mesh state. JSON, or Prometheus text when `Accept` names `text/plain` ([names](#prometheus)) |
 | `GET /peers` | bearer | `{peer_id, source_prefix, has_reservation}` per peer. `source_prefix` is a `/24` (IPv4) or `/48` (IPv6) network, never a full address |
+
+Mesh state, on both routes: `profile_relays` is how many other relays the
+network profile names (0 without `--network-profile`), `reachable_relays` how
+many of them this relay is connected to, and `bootstrap_status` is
+`disabled` (no profile), `pending` (no bootstrap finished yet), `ok` or
+`failed` (the last bootstrap timed out).
 
 ## Monitoring
 
@@ -29,6 +38,29 @@ The `alexandria-monitoring` observer scrapes `/metrics` every 10 seconds
 (and `/peers`, for geo attribution of NATted peers) and shows a relay health
 panel. On the observer, set `RELAY_METRICS_URL` to the relays' `https://…/metrics`
 URLs (comma-separated) and `RELAY_ADMIN_TOKEN` to the relay's token.
+
+### Prometheus
+
+A request whose `Accept` header names `text/plain`, as Prometheus's scraper
+does, gets the text exposition format (0.0.4); anything else gets JSON. Same
+bearer token. Each JSON counter becomes `relay_<field>_total`
+(`relay_circuits_accepted_total`; `total_connections_served` becomes
+`relay_connections_served_total`), each gauge `relay_<field>`
+(`relay_connections`, `relay_reachable_relays`, `relay_uptime_seconds`).
+`relay_bootstrap_status{status="…"}` is 1 for the current state and 0 for
+the others, and `relay_info{peer_id,version}` is always 1. Nothing per peer
+is exported. A scrape configuration is in
+[self-hosting.md](self-hosting.md#prometheus).
+
+### Logs
+
+At the default `info` level the relay logs startup, mesh changes, errors
+and one `HEALTH` line every `--health-log-interval-secs`, with the circuits,
+reservations and receipt requests (accepted and denied) since the previous
+line. Per-connection, per-circuit, per-reservation and per-receipt lines
+are at `debug` (`RUST_LOG=alexandria_relay=debug`). Each kind has its own
+target, so `RUST_LOG=alexandria_relay::event::<kind>=debug` turns on one kind
+alone: `connection`, `identify`, `reservation`, `circuit`, `receipt` or `kad`.
 
 ## External alerting
 
@@ -38,7 +70,7 @@ Point an HTTP monitor (UptimeRobot, healthchecks.io) at
 
 | Alert | Fires when |
 |---|---|
-| `connections_near_cap` | connections > 80% of the 1,024 cap |
+| `connections_near_cap` | connections > 80% of `--max-connections` (default 1,024) |
 | `circuits_denied_per_min_high` | > 100 circuit denials in the last minute |
 | `circuit_denial_majority` | denials > accepts in the last minute, with > 20 total |
 | `reservations_denied_per_min_high` | > 10 reservation denials in the last minute |
@@ -46,43 +78,151 @@ Point an HTTP monitor (UptimeRobot, healthchecks.io) at
 
 ## Limits and hardening
 
-Values are constants in `src/main.rs` and `src/username_reg.rs`.
+Every limit is a flag with a matching environment variable, read at
+startup; `alexandria-relay --help` lists them with their defaults. Durations
+are in seconds.
 
-| Limit | Value |
-|---|---|
-| Connections | 1,024 total, 8 per PeerId |
-| Connections still in the handshake | 256 incoming |
-| Connections per IP | 32 concurrent, 32 new per minute |
-| Relay reservations | 1,024 total, 16 per peer, 1 h each |
-| Relay circuits | 2,048 total, 128 per peer, 128 MB and 15 min each |
-| DHT records | 16,384 (memory store and disk mirror), 64 KB each |
-| Username receipt requests | 5 per PeerId per minute, 8 KiB each, DID at most 64 characters |
-| Username lookups (`/username/:name`) | 30 per minute per client IP |
-| Idle connection timeout | 10 min |
-| Health log interval | 5 min |
+| Limit | Flag | Variable | Default |
+|---|---|---|---|
+| Connections in total | `--max-connections` | `RELAY_MAX_CONNECTIONS` | 1024 |
+| Connections per PeerId | `--max-connections-per-peer` | `RELAY_MAX_CONNECTIONS_PER_PEER` | 8 |
+| Incoming connections still in the handshake | `--max-pending-incoming` | `RELAY_MAX_PENDING_INCOMING` | 256 |
+| Concurrent connections per IP | `--max-connections-per-ip` | `RELAY_MAX_CONNECTIONS_PER_IP` | 32 |
+| New connections per IP per window | `--max-new-connections-per-ip` | `RELAY_MAX_NEW_CONNECTIONS_PER_IP` | 32 |
+| Per-IP connection window | `--ip-rate-window-secs` | `RELAY_IP_RATE_WINDOW_SECS` | 60 |
+| Idle connection timeout | `--idle-timeout-secs` | `RELAY_IDLE_TIMEOUT_SECS` | 600 |
+| Identify addresses added per peer | `--max-identify-addrs` | `RELAY_MAX_IDENTIFY_ADDRS` | 16 |
+| Kademlia query timeout | `--kad-query-timeout-secs` | `RELAY_KAD_QUERY_TIMEOUT_SECS` | 60 |
+| Kademlia replication factor | `--kad-replication-factor` | `RELAY_KAD_REPLICATION_FACTOR` | 20 |
+| DHT records (memory store and disk mirror) | `--kad-max-records` | `RELAY_KAD_MAX_RECORDS` | 16384 |
+| DHT record size, bytes | `--kad-max-record-bytes` | `RELAY_KAD_MAX_RECORD_BYTES` | 65536 |
+| Reservations in total | `--max-reservations` | `RELAY_MAX_RESERVATIONS` | 1024 |
+| Reservations per peer | `--max-reservations-per-peer` | `RELAY_MAX_RESERVATIONS_PER_PEER` | 16 |
+| Reservation lifetime | `--reservation-duration-secs` | `RELAY_RESERVATION_DURATION_SECS` | 3600 |
+| Circuits in total | `--max-circuits` | `RELAY_MAX_CIRCUITS` | 2048 |
+| Circuits per peer | `--max-circuits-per-peer` | `RELAY_MAX_CIRCUITS_PER_PEER` | 128 |
+| Bytes per circuit | `--max-circuit-bytes` | `RELAY_MAX_CIRCUIT_BYTES` | 134217728 (128 MiB) |
+| Circuit lifetime | `--max-circuit-duration-secs` | `RELAY_MAX_CIRCUIT_DURATION_SECS` | 900 |
+| Username receipt requests per PeerId per window | `--receipt-limit` | `RELAY_RECEIPT_LIMIT` | 5 |
+| Receipt window | `--receipt-window-secs` | `RELAY_RECEIPT_WINDOW_SECS` | 60 |
+| Username lookups per client IP per window | `--lookup-limit` | `RELAY_LOOKUP_LIMIT` | 30 |
+| Lookup window | `--lookup-window-secs` | `RELAY_LOOKUP_WINDOW_SECS` | 60 |
+| Client IPs the lookup limiter tracks | `--lookup-max-tracked` | `RELAY_LOOKUP_MAX_TRACKED` | 10000 |
+| Time for an HTTP request's headers to arrive | `--http-header-read-timeout-secs` | `RELAY_HTTP_HEADER_READ_TIMEOUT_SECS` | 10 |
+| Time from HTTP request headers to response (then `503`) | `--http-request-timeout-secs` | `RELAY_HTTP_REQUEST_TIMEOUT_SECS` | 15 |
+| Concurrent HTTP connections (more wait in the listen backlog) | `--http-max-connections` | `RELAY_HTTP_MAX_CONNECTIONS` | 256 |
+| Health log interval | `--health-log-interval-secs` | `RELAY_HEALTH_LOG_INTERVAL_SECS` | 300 |
+
+Two bounds are part of the wire format and are not configurable: a username
+receipt request is at most 8 KiB, and its DID at most 64 characters.
+
+"Per IP" means per client bucket: the full IPv4 address, or the /64 an IPv6
+address belongs to, since one subscriber holds a whole /64. The relay's
+connection limiter, the lookup limiter and the source prefixes behind
+`/peers` all use it.
+
+### DHT records and the store
+
+The relay keeps one SQLite database, `username_registry.db`, in
+`--data-dir`. It holds username receipts and a mirror of every DHT record the
+in-memory store accepted, with each record's expiry and publisher, so a
+restart reloads the records with the time they had left. The database runs
+in write-ahead-log mode, so the directory also holds `-wal` and `-shm` files
+and must be writable, not only the database file. All database work runs on
+one dedicated thread; a burst of DHT writes never delays circuits or HTTP.
+If that thread falls 1,024 requests behind, new mirror writes are dropped
+(the record stays in memory) and receipt requests are refused with "relay
+busy".
+
+- Expired records are skipped on reload and deleted every 10 minutes.
+- When the mirror is over `--kad-max-records`, it evicts expired records
+  first, then the soonest-expiring, then the oldest-inserted.
+- A database written by an older binary is recreated empty at startup. The
+  project is pre-launch, so there are no migrations.
+
+Memory and disk: the records the app writes are signed username claims,
+about 300 bytes bare and 0.8 to 1.5 KB with relay receipts, an anchor and a
+release. With per-record overhead, budget about 2 KB per record: the default
+16,384 records come to about 32 MiB of memory, and a similar amount on disk.
+The cap on record size (`--kad-max-record-bytes`, 64 KiB) is what someone
+writing junk records could reach, about 1 GiB at the default record cap;
+lower `--kad-max-records` on a small machine.
+
+Provider announcements are not mirrored; they expire on their own. The
+memory store keeps at most 20 providers per key (libp2p's default, the
+Kademlia `k`) and ignores further providers until one expires. The
+relay-discovery key is a single key, so at most 20 announcing relays are
+listed on any one relay at a time.
 
 Other hardening:
-- Private, CGNAT, link-local, ULA, IPv4-mapped, multicast and site-local
-  addresses are kept out of the DHT routing table.
+- A peer enters the DHT routing table only from the addresses it reports
+  through Identify, never from the address its connection came from.
+  Private, CGNAT, link-local, ULA, IPv4-mapped, multicast and site-local
+  addresses are kept out.
+- The HTTP listener speaks HTTP/1.1 only and closes connections whose
+  headers do not arrive within the header timeout, idle keep-alive
+  connections included.
 - `RELAY_SEED` is cleared from the environment before the async runtime
   starts, and the seed buffer is zeroed after use.
 - SIGTERM and SIGINT shut down gracefully.
 
 Tuning notes:
 - The per-IP limits suit residential and mobile NATs. Load tests from one IP
-  (CI runners, dev clusters) will hit them; raise them for the test.
-- The per-peer circuit cap (128) is the first limit to raise if you add
-  observers that fan-dial peers through circuits, since each counts as the
-  source peer. With several high-frequency observers, try 256–512 before the
-  global circuit cap becomes the bottleneck.
+  (CI runners, dev clusters) will hit them; start the relay under test with
+  higher `--max-connections-per-ip` and `--max-new-connections-per-ip`.
+- The per-peer circuit cap (`--max-circuits-per-peer`) is the first limit to
+  raise if you add observers that fan-dial peers through circuits, since
+  each counts as the source peer. With several high-frequency observers, try
+  256–512 before the global circuit cap becomes the bottleneck.
+
+## Client addresses behind a proxy
+
+Every per-address limit keys on the address a connection comes from. When a
+proxy sits in front of the relay, that is the proxy's address, and the limit
+then either throttles every user as one client or, with a high ceiling,
+protects nothing.
+
+**libp2p listener.** Per-address limits on the libp2p port work only on a
+host that delivers connections with their original source address: a VM or
+bare-metal host with a public IP, or a load balancer in pass-through mode.
+The relay cannot read PROXY protocol on this listener. Fly's TCP and HTTP
+services do not preserve source addresses, so on Fly these limiters see the
+proxy:
+
+- the relay's per-IP connection limiter (`--max-connections-per-ip`,
+  `--max-new-connections-per-ip`);
+- libp2p's built-in per-IP reservation and circuit rate limiters, which are
+  not configurable and key on the full address;
+- the username lookup limiter, unless `--trusted-proxy-header` is set.
+
+Per-PeerId limits and the global caps are unaffected.
+
+**HTTP listener.** Set `--trusted-proxy-header` (`RELAY_TRUSTED_PROXY_HEADER`)
+when every request reaches the listener through a proxy that writes the
+client address into a header, overwriting anything the client sent. Given
+without a value it reads `Fly-Client-IP`, which Fly's `http` handler sets;
+behind nginx or Caddy, name the header the proxy sets (for example
+`X-Real-IP`). For an appending header such as `X-Forwarded-For`, the relay
+reads the last entry. A request without the header is charged to the socket
+address. Leave the flag unset on a listener that clients can reach directly:
+any client could then write a new address into the header for every request
+and never hit the lookup limit. Behind a local reverse proxy, bind the
+listener to loopback with `--metrics-bind 127.0.0.1`.
+
+**QUIC on Fly.** Fly documents that a UDP service must bind the
+`fly-global-services` address, and that a socket bound to the wildcard
+address replies from the wrong source. The relay binds `--listen-ip4`
+(default `0.0.0.0`), not that address, so QUIC reachability on Fly is
+unverified.
 
 ## Deployment (Fly.io)
 
-The `Dockerfile` builds with `rust:1.89-slim-bookworm` and runs on
-`debian:bookworm-slim`. Both stages refuse to build if `ca-certificates` is
-older than `20250419~deb12u2` (the eMudhra trust-store fix). Cargo uses the
-committed lockfile. Updating the repository does not update running machines:
-rebuild and redeploy.
+The `Dockerfile` builds a static musl binary with `rust:1.89-alpine` and runs
+it on `debian:bookworm-slim` as uid/gid `10001`, with `RELAY_DATA_DIR=/data`.
+The runtime stage refuses to build if `ca-certificates` is older than
+`20250419~deb12u2` (the eMudhra trust-store fix). Cargo uses the committed
+lockfile. Updating the repository does not update running machines: tag a
+release or run the workflow to redeploy.
 
 Fly services (`fly.toml`, `fly-eu.toml`):
 
@@ -104,9 +244,10 @@ fly status && fly logs
 ```
 
 Also set `RELAY_PUBLIC_HOST` to the app's hostname. `fly-eu.toml` mounts
-`relay_data` at `/data`. `fly.toml` (Mumbai) has no mount, because `bom` has
-refused volume creation, so its receipt history resets on restart. Issued
-receipts stay valid, because they are signed.
+`relay_data` at `/data`. `fly.toml` (Singapore) has no mount: the app started
+in `bom`, which refused volume creation, and Fly has since retired `bom`. Its
+receipt history resets on restart. Issued receipts stay valid, because they
+are signed.
 
 Routine deploys run from CI on `v*` tags or manual dispatch (see
 [CONTRIBUTING.md](../CONTRIBUTING.md#ci-and-releases)).

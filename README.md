@@ -27,6 +27,9 @@ Relay and bootstrap node for the Alexandria P2P network: one Rust binary
   ([limits](docs/operations.md#limits-and-hardening)).
 - Operational endpoints need a bearer token and answer `404` without it.
 - Any node can run a relay. The network does not depend on one instance.
+  With `--network-profile` a relay joins the other relays' DHT; with
+  `--announce` app nodes discover it. Neither makes it a receipt issuer:
+  that is the profile's issuer list.
 
 ## Quick start
 
@@ -36,19 +39,36 @@ cargo run -- --port 4001      # libp2p on TCP + QUIC 4001, HTTP on 9090
 curl localhost:9090/health   # from another shell
 ```
 
+To run a relay of your own (systemd or Docker Compose, TLS, joining the
+mesh, Prometheus, the `doctor` reachability check), follow
+[docs/self-hosting.md](docs/self-hosting.md). Release binaries and the
+`ghcr.io/ifftu-dev/alexandria-relay` image are published on every tag.
+
 ## Configuration
 
-| Parameter | Kind | Default | Description |
-|---|---|---|---|
-| `--port` | flag | `4001` | TCP listen port |
-| `--quic-port` | flag | `4001` | QUIC (UDP) listen port |
-| `--metrics-port` | flag | `9090` | HTTP health and metrics port |
-| `--generate-key` | flag | — | Print a keypair seed and exit |
-| `--public-host` / `RELAY_PUBLIC_HOST` | flag or env | unset | Public hostname. Advertised (with its resolved IPs) in reservation responses; without it clients reject reservations |
-| `--data-dir` / `RELAY_DATA_DIR` | flag or env | `./relay-data` | Receipts database and DHT record mirror |
-| `RELAY_SEED` | env | random | 32-byte hex seed for a stable PeerId. Read, then cleared from the environment at startup |
-| `RELAY_ADMIN_TOKEN` | env | unset | Bearer token for `/peers`, `/metrics` and `/health/alerts`; at least 16 characters, otherwise those endpoints stay off |
-| `RUST_LOG` | env | `info` | Log level |
+Every flag also reads the matching `RELAY_*` variable; `--help` lists them
+all with their defaults. Limits (connections, circuits, DHT records, receipt
+and lookup budgets) are in
+[docs/operations.md](docs/operations.md#limits-and-hardening).
+
+| Flag / variable | Default | Description |
+|---|---|---|
+| `--port` / `RELAY_PORT` | `4001` | TCP listen port (`0` = ephemeral) |
+| `--quic-port` / `RELAY_QUIC_PORT` | `4001` | QUIC (UDP) listen port |
+| `--listen-ip4` / `RELAY_LISTEN_IP4` | `0.0.0.0` | IPv4 address the libp2p listeners bind |
+| `--listen-ip6` / `RELAY_LISTEN_IP6` | `::` | IPv6 address the libp2p listeners also bind (best-effort), or `off` |
+| `--metrics-port` / `RELAY_METRICS_PORT` | `9090` | HTTP health, metrics and lookup port |
+| `--metrics-bind` / `RELAY_METRICS_BIND` | `0.0.0.0` | HTTP listen address; `127.0.0.1` keeps it behind a local reverse proxy |
+| `--trusted-proxy-header` / `RELAY_TRUSTED_PROXY_HEADER` | unset | Read the HTTP client address from this header (`Fly-Client-IP` when given without a value). Only behind a proxy that overwrites it; see [client addresses](docs/operations.md#client-addresses-behind-a-proxy) |
+| `--public-host` / `RELAY_PUBLIC_HOST` | unset | Public hostname. Advertised (with its resolved IPs) in reservation responses; without it clients reject reservations |
+| `--data-dir` / `RELAY_DATA_DIR` | `./relay-data` | Receipts database and DHT record mirror |
+| `--network-profile` / `RELAY_NETWORK_PROFILE` | unset | The app's network profile JSON. With it the relay dials the profile's other relays, redials them with backoff and runs Kademlia bootstrap every 5 minutes; without it, it joins no mesh |
+| `--announce` / `RELAY_ANNOUNCE` | off | Publish this relay under the network's relay-discovery key so app nodes find it. Needs `--network-profile`. Advertises connectivity only; grants no receipt-issuer trust |
+| `--generate-key` | — | Print a keypair seed and exit |
+| `doctor` (subcommand) | — | Start with this configuration, dial every advertised address, report, exit non-zero if none answers |
+| `RELAY_SEED` (env only) | random | 32-byte hex seed for a stable PeerId. Read, then cleared from the environment at startup |
+| `RELAY_ADMIN_TOKEN` (env only) | unset | Bearer token for `/peers`, `/metrics` and `/health/alerts`; at least 16 characters, otherwise those endpoints stay off |
+| `RUST_LOG` (env only) | `info` | Log level |
 
 Set `RELAY_SEED` and `RELAY_PUBLIC_HOST` in production. Generate an admin
 token with `openssl rand -base64 32`; the monitoring observer needs the same
@@ -57,24 +77,31 @@ value.
 ## Architecture
 
 TCP (Noise + Yamux) and QUIC transports carry Circuit Relay v2, Kademlia and
-Identify, plus the username-receipt request/response protocol. An Axum HTTP
-server serves health, metrics and username lookups. Code lives in
-`src/main.rs` (swarm, limits, HTTP) and `src/username_reg.rs` (receipts,
-SQLite store, DHT mirror).
+Identify, plus the username-receipt request/response protocol. An Axum
+router, served over HTTP/1.1 by hyper with header and request timeouts,
+serves health, metrics and username lookups. The library's `start`
+runs a whole relay from one configuration value; `src/main.rs` parses flags
+and waits for a signal. Modules: `config` (flags and limits), `swarm`
+(behaviour and event loop), `http` (routes), `store` (SQLite receipts and DHT
+mirror), `username_reg` (receipt wire types and claim verification),
+`profile` and `mesh` (network profile and mesh join), `doctor` (the
+reachability check) and `addr` (address helpers). `tests/` drives a relay
+over loopback.
 
 ## Deployed relays
 
 Relay PeerIds, hostnames and fallback IPs are owned by the app's network
 profile:
 [`src-tauri/resources/networks/preprod.json`](https://github.com/ifftu-dev/alexandria/blob/main/src-tauri/resources/networks/preprod.json).
-Two Fly.io apps run today: `fly.toml` (Mumbai, `bom`) and `fly-eu.toml`
+Two Fly.io apps run today: `fly.toml` (Singapore, `sin`) and `fly-eu.toml`
 (Frankfurt, `fra`).
 
 ## Documentation
 
 | Doc | Contents |
 |---|---|
-| [docs/operations.md](docs/operations.md) | Endpoints, alerting, limits, deployment, adding a region |
+| [docs/self-hosting.md](docs/self-hosting.md) | Running your own relay: systemd, Compose, TLS, mesh, `doctor`, Prometheus |
+| [docs/operations.md](docs/operations.md) | Endpoints, metrics, alerting, limits, deployment, adding a region |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Local checks, CI and releases, commit messages |
 | [docs/audits/security-2026-08.md](docs/audits/security-2026-08.md) | Security audit (2026-08, remediated) |
 
