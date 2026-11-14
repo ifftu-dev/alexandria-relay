@@ -5,51 +5,6 @@
 # advisory gets buried in a list nobody reads.
 
 [advisories]
-ignore = [
-    # hickory-proto / hickory-resolver 0.25.2 — DNS message parsing, zone-file
-    # and SVCB text parsing, and DNSSEC validation advisories:
-    #
-    #   -0118  O(n²) name compression in message encoding (no fixed version)
-    #   -0119  unbounded NSEC3 validation loop
-    #   -0487  panic on a malformed SVCB/HTTPS `alpn` value in text form
-    #   -0489  panic on an SVCB/HTTPS parameter that is a single quote
-    #   -0490  zone-file lexer panic on a token of 4096+ characters
-    #   -0491  memory amplification from DNS header record counts
-    #   -0504  inverted NSEC3 comparison in DNSSEC validation (no fixed version)
-    #   -0505  NSEC3 owner names not checked against the zone (no fixed version)
-    #   -0511  NXDOMAIN accepted for an empty non-terminal (no fixed version)
-    #   -0512  DNSSEC accepted an unrelated signed RRset (no fixed version)
-    #   -0514  resolver returned records that failed DNSSEC validation
-    #   -0530  parent-side NSEC at a zone cut accepted as nonexistence proof
-    #   -0531  child-side NSEC/NSEC3 accepted as proof of no DS record
-    #   -0532  parent-side NSEC3 at a zone cut accepted as nonexistence proof
-    #
-    # Not reachable: hickory arrives through libp2p's *optional* `dns` and
-    # `mdns` features, which this crate does not enable (see the feature list
-    # in Cargo.toml — kad, tcp, quic, noise, yamux, identify, relay, tokio,
-    # ed25519, macros, request-response, cbor). It is present in Cargo.lock,
-    # which is what cargo-audit reads, but never compiled into the binary:
-    #
-    #     cargo tree -e normal | grep -c hickory   # => 0
-    #
-    # The relay resolves its own public hostname once at startup through the
-    # OS resolver (tokio::net::lookup_host), not through hickory.
-    #
-    # Re-evaluate if `dns` or `mdns` is ever added to the libp2p features, or
-    # when a libp2p release moves to a hickory version that fixes these
-    # (>= 0.26.2 for the ones with a fix).
-    "RUSTSEC-2026-0118",
-    "RUSTSEC-2026-0119",
-    "RUSTSEC-2026-0487",
-    "RUSTSEC-2026-0489",
-    "RUSTSEC-2026-0490",
-    "RUSTSEC-2026-0491",
-    "RUSTSEC-2026-0504",
-    "RUSTSEC-2026-0505",
-    "RUSTSEC-2026-0511",
-    "RUSTSEC-2026-0512",
-    "RUSTSEC-2026-0514",
-    "RUSTSEC-2026-0530",
-    "RUSTSEC-2026-0531",
-    "RUSTSEC-2026-0532",
-]
+# No accepted advisories. libp2p 0.57 moved to hickory 0.26.3, which cleared
+# the hickory-proto / hickory-resolver 0.25.2 entries that used to sit here.
+ignore = []
