@@ -294,12 +294,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - region: mumbai
+          - region: singapore
             config: fly.toml
-            fly_region: bom
+            fly_region: sin
+            volume: false
           - region: frankfurt
             config: fly-eu.toml
             fly_region: fra
+            volume: true
     concurrency:
       # Per-region lock so the two regions deploy in parallel but
       # never overlap with themselves.
@@ -315,11 +317,13 @@ jobs:
       - run: flyctl scale count 1 --yes --config ${{ matrix.config }} || true
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-      # The registry store mounts a volume; ensure one exists per region.
-      # Best-effort: volume creation races registration and bom has had
-      # zone-saturation quirks — log state, attempt create, and let the
-      # deploy step be the real arbiter (it fails loudly if unmounted).
-      - run: |
+      # The registry store mounts a volume in regions whose config has a
+      # [mounts] section (matrix.volume); ensure one exists there.
+      # Best-effort: volume creation races registration — log state,
+      # attempt create, and let the deploy step be the real arbiter (it
+      # fails loudly if unmounted).
+      - if: matrix.volume
+        run: |
           echo "--- volumes before:"
           flyctl volumes list --config ${{ matrix.config }} || true
           if ! flyctl volumes list --config ${{ matrix.config }} --json | grep -q '"name": *"relay_data"'; then

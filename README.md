@@ -93,7 +93,7 @@ over loopback.
 Relay PeerIds, hostnames and fallback IPs are owned by the app's network
 profile:
 [`src-tauri/resources/networks/preprod.json`](https://github.com/ifftu-dev/alexandria/blob/main/src-tauri/resources/networks/preprod.json).
-Two Fly.io apps run today: `fly.toml` (Mumbai, `bom`) and `fly-eu.toml`
+Two Fly.io apps run today: `fly.toml` (Singapore, `sin`) and `fly-eu.toml`
 (Frankfurt, `fra`).
 
 ## Documentation

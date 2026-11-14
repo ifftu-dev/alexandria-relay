@@ -244,9 +244,10 @@ fly status && fly logs
 ```
 
 Also set `RELAY_PUBLIC_HOST` to the app's hostname. `fly-eu.toml` mounts
-`relay_data` at `/data`. `fly.toml` (Mumbai) has no mount, because `bom` has
-refused volume creation, so its receipt history resets on restart. Issued
-receipts stay valid, because they are signed.
+`relay_data` at `/data`. `fly.toml` (Singapore) has no mount: the app started
+in `bom`, which refused volume creation, and Fly has since retired `bom`. Its
+receipt history resets on restart. Issued receipts stay valid, because they
+are signed.
 
 Routine deploys run from CI on `v*` tags or manual dispatch (see
 [CONTRIBUTING.md](../CONTRIBUTING.md#ci-and-releases)).

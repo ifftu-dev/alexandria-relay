@@ -82,7 +82,7 @@ Pushing a `v*` tag runs every job above except Docker Build, then:
 | --- | --- |
 | Container image, `linux/amd64` and `linux/arm64` | `ghcr.io/ifftu-dev/alexandria-relay`, tagged with the version (`v1.2.3` → `1.2.3`), `latest` and `sha-<commit>` |
 | Static Linux binaries `alexandria-relay-linux-amd64` and `-arm64`, plus `SHA256SUMS` | The GitHub release created from the tag |
-| Deploy of that image to `fly.toml` (Mumbai) and `fly-eu.toml` (Frankfurt) | Fly.io |
+| Deploy of that image to `fly.toml` (Singapore) and `fly-eu.toml` (Frankfurt) | Fly.io |
 
 Each architecture builds natively on its own runner. The binary attached to
 the release is the one inside the image (`docker buildx build --target binary`
