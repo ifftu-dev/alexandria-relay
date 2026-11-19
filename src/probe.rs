@@ -117,16 +117,16 @@ impl fmt::Display for ProbeReport {
 
 /// A transport the probe dials.
 #[derive(Clone, Copy)]
-enum Transport {
+enum ProbeTransport {
     Tcp,
     Quic,
 }
 
-impl Transport {
+impl ProbeTransport {
     fn label(self) -> &'static str {
         match self {
-            Transport::Tcp => "tcp",
-            Transport::Quic => "quic",
+            ProbeTransport::Tcp => "tcp",
+            ProbeTransport::Quic => "quic",
         }
     }
 
@@ -134,8 +134,8 @@ impl Transport {
     fn addr(self, host: &Host, port: u16) -> Multiaddr {
         let mut addr = Multiaddr::empty().with(host.protocol());
         match self {
-            Transport::Tcp => addr.push(Protocol::Tcp(port)),
-            Transport::Quic => {
+            ProbeTransport::Tcp => addr.push(Protocol::Tcp(port)),
+            ProbeTransport::Quic => {
                 addr.push(Protocol::Udp(port));
                 addr.push(Protocol::QuicV1);
             }
@@ -193,9 +193,9 @@ pub async fn run(args: ProbeArgs) -> ProbeReport {
 
     let host = Host::parse(&args.host);
     let timeout = Duration::from_secs(args.timeout_secs);
-    let mut transports = vec![Transport::Tcp];
+    let mut transports = vec![ProbeTransport::Tcp];
     if args.quic {
-        transports.push(Transport::Quic);
+        transports.push(ProbeTransport::Quic);
     }
     let checks = transports.iter().map(|&transport| {
         let addr = transport.addr(&host, args.port);
@@ -326,10 +326,13 @@ async fn fetch_peer_id(host: &str, port: u16, path: &str) -> Result<PeerId, Atte
 }
 
 /// Why one attempt failed.
+#[derive(Debug, thiserror::Error)]
 enum AttemptError {
     /// Worth retrying: nothing answered yet, or the connection dropped.
+    #[error("{0}")]
     Retry(String),
     /// Something answered, and it is not the expected relay.
+    #[error("{0}")]
     Final(String),
 }
 
@@ -457,7 +460,11 @@ mod tests {
 
     #[test]
     fn hosts_dial_as_dns4_or_their_own_ip_family() {
-        let addr = |host: &str| Transport::Tcp.addr(&Host::parse(host), 4001).to_string();
+        let addr = |host: &str| {
+            ProbeTransport::Tcp
+                .addr(&Host::parse(host), 4001)
+                .to_string()
+        };
         assert_eq!(
             addr("relay.example.org"),
             "/dns4/relay.example.org/tcp/4001"
@@ -466,7 +473,7 @@ mod tests {
         assert_eq!(addr("2001:db8::1"), "/ip6/2001:db8::1/tcp/4001");
         assert_eq!(addr("[2001:db8::1]"), "/ip6/2001:db8::1/tcp/4001");
         assert_eq!(
-            Transport::Quic
+            ProbeTransport::Quic
                 .addr(&Host::parse("relay.example.org"), 4001)
                 .to_string(),
             "/dns4/relay.example.org/udp/4001/quic-v1"
