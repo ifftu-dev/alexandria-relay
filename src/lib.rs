@@ -31,6 +31,10 @@
 //!
 //! - Connection limits (per-peer, per-IP, and total) prevent resource exhaustion
 //! - IP-level rate limiting prevents PeerId rotation attacks
+//! - Optional PROXY protocol v2 on inbound TCP keeps per-IP limits on the
+//!   real client address behind a proxy (Fly.io)
+//! - QUIC can be switched off; when on, pending handshakes have their own
+//!   budget and flow-control windows are small
 //! - Relay circuit limits (bandwidth, duration, reservations) prevent abuse
 //! - Kademlia memory store size is capped
 //! - Idle connection timeout prevents connection leaks
@@ -55,6 +59,10 @@
 //!
 //! # Check that the advertised addresses answer, then exit (0 = reachable)
 //! alexandria-relay doctor --public-host relay.example.org
+//!
+//! # From another machine, dial a running relay as a client would and check
+//! # its PeerId and Identify (0 = every transport passed)
+//! alexandria-relay probe --host relay.example.org --network-profile preprod.json
 //! ```
 
 //!
@@ -65,14 +73,19 @@
 //! black-box tests call it on ephemeral loopback ports.
 
 mod addr;
+mod client;
 pub mod config;
 pub mod doctor;
 mod http;
 mod mesh;
+pub mod probe;
 pub mod profile;
+mod proxy;
+mod quic_budget;
 mod rate;
 mod store;
 mod swarm;
+mod transport;
 pub mod username_reg;
 
 use std::net::SocketAddr;

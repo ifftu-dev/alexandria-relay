@@ -1,0 +1,204 @@
+name: Fly deploy
+
+# Deploys one Fly app from a published image, then probes it from the runner
+# the way a client reaches it. Called by ci.yml for each production region
+# and for the staging relay; it has no trigger of its own.
+#
+# The relay is reached at `<app>.fly.dev`, the app named in the Fly config.
+# The probe pins the relay's PeerId either from the app repository's network
+# profile (production) or from a PeerId the caller passes (staging), and
+# fails without one: CI never probes an unpinned identity.
+
+on:
+  workflow_call:
+    inputs:
+      config:
+        description: Fly config file to deploy
+        type: string
+        required: true
+      fly_region:
+        description: Fly region the app runs in (volume creation)
+        type: string
+        required: true
+      volume:
+        description: Ensure the `relay_data` volume exists before deploying
+        type: boolean
+        default: false
+      image:
+        description: Published image, by digest (`ghcr.io/...@sha256:...`) or tag
+        type: string
+        required: true
+      pin:
+        description: Where the expected PeerId comes from, `profile` or `peer-id`
+        type: string
+        default: profile
+      peer_id:
+        description: Expected PeerId when `pin` is `peer-id`
+        type: string
+        default: ""
+      quic:
+        description: >-
+          Deploy with QUIC on and add a QUIC probe whose result is recorded
+          but never fails the job (staging only; QUIC on Fly is expected to
+          fail)
+        type: boolean
+        default: false
+    secrets:
+      FLY_API_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  # The app repository's network profile on its default branch. Read at run
+  # time; its values are never copied into this repository.
+  PROFILE_URL: https://raw.githubusercontent.com/ifftu-dev/alexandria/HEAD/src-tauri/resources/networks/preprod.json
+
+jobs:
+  deploy:
+    name: Deploy and probe
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+      # Checked before anything changes on Fly, so a missing pin fails
+      # the run with the relay untouched.
+      - name: Check the PeerId pin
+        id: target
+        env:
+          CONFIG: ${{ inputs.config }}
+          PIN: ${{ inputs.pin }}
+          PEER_ID: ${{ inputs.peer_id }}
+        run: |
+          case "$PIN" in
+            profile) ;;
+            peer-id)
+              if [ -z "$PEER_ID" ]; then
+                echo "::error::No PeerId to pin the probe to (repository variable STAGING_RELAY_PEER_ID is unset)"
+                exit 1
+              fi
+              ;;
+            *) echo "::error::Unknown pin '$PIN'"; exit 1 ;;
+          esac
+          app=$(sed -n 's/^app = "\(.*\)"$/\1/p' "$CONFIG")
+          if [ -z "$app" ]; then
+            echo "::error::No app name in $CONFIG"
+            exit 1
+          fi
+          echo "app=$app" >> "$GITHUB_OUTPUT"
+          echo "host=$app.fly.dev" >> "$GITHUB_OUTPUT"
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      # The receipt store is a single-writer sqlite DB — exactly one
+      # machine per region (regions provide the redundancy). Fly's
+      # default of 2 machines also makes the volume mount unsatisfiable
+      # (mounts need one volume per machine).
+      - run: flyctl scale count 1 --yes --config "$CONFIG" || true
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          CONFIG: ${{ inputs.config }}
+      # The registry store mounts a volume in regions whose config has a
+      # [mounts] section (inputs.volume); ensure one exists there.
+      # Best-effort: volume creation races registration — log state,
+      # attempt create, and let the deploy step be the real arbiter (it
+      # fails loudly if unmounted).
+      - if: inputs.volume
+        run: |
+          echo "--- volumes before:"
+          flyctl volumes list --config "$CONFIG" || true
+          if ! flyctl volumes list --config "$CONFIG" --json | grep -q '"name": *"relay_data"'; then
+            flyctl volumes create relay_data --region "$FLY_REGION" --size 1 --yes --config "$CONFIG" || \
+              echo "::warning::volume create failed — proceeding, deploy will verify"
+            sleep 10  # registration race: give the API a beat before deploy
+          fi
+          echo "--- volumes after:"
+          flyctl volumes list --config "$CONFIG" || true
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          CONFIG: ${{ inputs.config }}
+          FLY_REGION: ${{ inputs.fly_region }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Copy the published image into the app's Fly registry, so the deploy
+      # does not depend on the GitHub package being public.
+      - name: Copy the image to the Fly registry
+        id: fly-image
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          APP: ${{ steps.target.outputs.app }}
+          SOURCE: ${{ inputs.image }}
+        run: |
+          target="registry.fly.io/$APP:sha-$GITHUB_SHA"
+          flyctl auth docker
+          docker buildx imagetools create --tag "$target" "$SOURCE"
+          echo "image=$target" >> "$GITHUB_OUTPUT"
+      # The Fly config and the image deploy together: the config's PROXY
+      # header setting must match what the image expects.
+      - name: Deploy
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          CONFIG: ${{ inputs.config }}
+          IMAGE: ${{ steps.fly-image.outputs.image }}
+          QUIC: ${{ inputs.quic }}
+        run: |
+          extra=()
+          if [ "$QUIC" = "true" ]; then extra+=(--env RELAY_QUIC=true); fi
+          flyctl deploy --config "$CONFIG" --image "$IMAGE" "${extra[@]}"
+      # The image is pulled here, while the registry login is still needed,
+      # so the probe steps below only run it.
+      - name: Pull the published image
+        env:
+          IMAGE: ${{ inputs.image }}
+        run: docker pull "$IMAGE"
+      # No secrets in this step's environment, and none passed to the
+      # container: the probe tests exactly the deployed bytes and has no
+      # credentials to leak. TCP only; QUIC does not work on Fly.
+      - name: Probe over TCP
+        env:
+          IMAGE: ${{ inputs.image }}
+          HOST: ${{ steps.target.outputs.host }}
+          PIN: ${{ inputs.pin }}
+          PEER_ID: ${{ inputs.peer_id }}
+        run: |
+          args=(probe --host "$HOST")
+          mounts=()
+          if [ "$PIN" = "profile" ]; then
+            curl -fsSL --proto '=https' --retry 3 -o "$RUNNER_TEMP/profile.json" "$PROFILE_URL"
+            mounts=(-v "$RUNNER_TEMP/profile.json:/probe/profile.json:ro")
+            args+=(--network-profile /probe/profile.json)
+          else
+            args+=(--peer-id "$PEER_ID")
+          fi
+          docker run --rm --pull never "${mounts[@]}" "$IMAGE" "${args[@]}"
+      # Staging with QUIC on: dial QUIC a few times and record how many got
+      # through. The job never fails on it; the result is what is wanted.
+      - name: Probe over QUIC (recorded, never fails)
+        if: inputs.quic
+        env:
+          IMAGE: ${{ inputs.image }}
+          HOST: ${{ steps.target.outputs.host }}
+          PEER_ID: ${{ inputs.peer_id }}
+        run: |
+          attempts=5
+          passed=0
+          for i in $(seq "$attempts"); do
+            echo "--- attempt $i of $attempts"
+            if docker run --rm --pull never "$IMAGE" probe --host "$HOST" --peer-id "$PEER_ID" --quic --timeout-secs 30; then
+              passed=$((passed + 1))
+            fi
+          done
+          echo "QUIC from the runner to $HOST: $passed of $attempts attempts passed"
+          {
+            echo "### QUIC probe"
+            echo
+            echo "QUIC from the runner to \`$HOST\`: $passed of $attempts attempts passed."
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$passed" -lt "$attempts" ]; then
+            echo "::warning::QUIC probe: $passed of $attempts attempts passed"
+          fi

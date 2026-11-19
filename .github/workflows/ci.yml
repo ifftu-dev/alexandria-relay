@@ -8,10 +8,25 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
-      deploy:
-        description: Deploy the published image to both Fly regions
+      # Production is never the default: a manual run deploys both relays
+      # only when `production` is chosen.
+      target:
+        description: Where to deploy the published image
+        type: choice
+        options: [staging, production, none]
+        default: staging
+      staging_quic:
+        description: "Staging only: deploy with QUIC on and record a QUIC probe"
         type: boolean
-        default: true
+        default: false
+      # Rehearses a release candidate on the exact bytes it published: no
+      # image is built, tagged or released, and staging runs this one.
+      image:
+        description: >-
+          Staging only: deploy this published image instead of building one
+          (ghcr.io/<owner>/<repo>@sha256:<digest>, or :<tag>)
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -21,6 +36,33 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # Checks a manual run's inputs before anything builds or deploys. On
+  # other events it has nothing to check and passes, so the jobs that need
+  # it run as before.
+  dispatch:
+    name: Check the run's inputs
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.check.outputs.image }}
+    steps:
+      - id: check
+        if: github.event_name == 'workflow_dispatch' && inputs.image != ''
+        env:
+          TARGET: ${{ inputs.target }}
+          IMAGE: ${{ inputs.image }}
+        run: |
+          if [ "$TARGET" != staging ]; then
+            echo "::error::The image input deploys to staging only; target is '$TARGET'"
+            exit 1
+          fi
+          repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+          repo_re="${repo//./\\.}"
+          if ! [[ "$IMAGE" =~ ^${repo_re}(@sha256:[0-9a-f]{64}|:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})$ ]]; then
+            echo "::error::'$IMAGE' is not $repo@sha256:<digest> or $repo:<tag>"
+            exit 1
+          fi
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
   check:
     name: Check
     runs-on: ubuntu-latest
@@ -112,15 +154,16 @@ jobs:
           cache-to: type=gha,scope=linux-amd64,mode=max
       - run: scripts/smoke-image.sh alexandria-relay:ci
 
-  # Publishing runs on `v*` tags and manual runs, after every check passes.
+  # Publishing runs on `v*` tags and manual runs without an `image` input,
+  # after every check passes.
   # Each architecture builds natively on its own runner, pushes its image by
   # digest and exports the same static binary; `manifest` joins the two
   # images under one set of tags. Image: ghcr.io/<owner>/<repo>.
   image:
     name: Publish ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
-    needs: [check, clippy, fmt, test, audit, deny]
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    needs: [dispatch, check, clippy, fmt, test, audit, deny]
+    if: (github.event_name == 'workflow_dispatch' && inputs.image == '') || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
     permissions:
       contents: read
       packages: write
@@ -247,11 +290,12 @@ jobs:
           docker buildx imagetools inspect "$IMAGE@$digest"
           echo "ref=$IMAGE@$digest" >> "$GITHUB_OUTPUT"
 
+  # Tag pushes only: a manual run on a tag never uploads release assets.
   release:
     name: GitHub release
     runs-on: ubuntu-latest
     needs: [manifest]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
     steps:
@@ -279,82 +323,105 @@ jobs:
             gh release create "$TAG" "${flags[@]}" alexandria-relay-linux-* SHA256SUMS
           fi
 
-  # Deploys the image `manifest` published, so both regions run the same
-  # bytes and neither builds on Fly. Release tags and manual runs deploy;
-  # pre-release tags (`v1.2.3-rc.1`) publish without deploying.
-  deploy:
-    name: Deploy ${{ matrix.region }}
-    runs-on: ubuntu-latest
+  # Production deploys the image `manifest` published, so both regions run
+  # the same bytes and neither builds on Fly. Release tags deploy, and manual
+  # runs with `target: production`; pre-release tags (`v1.2.3-rc.1`) publish
+  # without deploying. The regions deploy as a chain: Frankfurt, probed from
+  # the runner, then Singapore, probed. A failed Frankfurt deploy or probe
+  # leaves Singapore untouched. Steps: fly-deploy.yml.
+  deploy-frankfurt:
+    name: Deploy frankfurt
     needs: [manifest]
-    if: (github.event_name == 'workflow_dispatch' && inputs.deploy) || (startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-'))
+    if: (github.event_name == 'workflow_dispatch' && inputs.target == 'production') || (startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-'))
     permissions:
       contents: read
       packages: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - region: singapore
-            config: fly.toml
-            fly_region: sin
-            volume: false
-          - region: frankfurt
-            config: fly-eu.toml
-            fly_region: fra
-            volume: true
     concurrency:
-      # Per-region lock so the two regions deploy in parallel but
-      # never overlap with themselves.
-      group: deploy-${{ matrix.region }}
+      # Per-region lock so a region never overlaps with itself.
+      group: deploy-frankfurt
       cancel-in-progress: false
+    uses: ./.github/workflows/fly-deploy.yml
+    with:
+      config: fly-eu.toml
+      fly_region: fra
+      volume: true
+      image: ${{ needs.manifest.outputs.ref }}
+    secrets:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+  deploy-singapore:
+    name: Deploy singapore
+    needs: [manifest, deploy-frankfurt]
+    if: (github.event_name == 'workflow_dispatch' && inputs.target == 'production') || (startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-'))
+    permissions:
+      contents: read
+      packages: read
+    concurrency:
+      group: deploy-singapore
+      cancel-in-progress: false
+    uses: ./.github/workflows/fly-deploy.yml
+    with:
+      config: fly.toml
+      fly_region: sin
+      volume: false
+      image: ${{ needs.manifest.outputs.ref }}
+    secrets:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+  # The staging relay (fly-staging.toml), for rehearsing a release candidate
+  # before production. Manual runs only, `target: staging` (the default).
+  # It deploys the `image` input when given (nothing is built), otherwise
+  # the image `manifest` published. The app is created by hand for a
+  # rehearsal; the probe pins the PeerId from the STAGING_RELAY_PEER_ID
+  # repository variable and the job fails, before deploying, when it is
+  # unset.
+  staging:
+    name: Deploy staging
+    needs: [dispatch, manifest]
+    if: >-
+      !cancelled() && github.event_name == 'workflow_dispatch' && inputs.target == 'staging'
+      && needs.dispatch.result == 'success'
+      && (needs.manifest.result == 'success' || (inputs.image != '' && needs.manifest.result == 'skipped'))
+    permissions:
+      contents: read
+      packages: read
+    concurrency:
+      group: deploy-staging
+      cancel-in-progress: false
+    uses: ./.github/workflows/fly-deploy.yml
+    with:
+      config: fly-staging.toml
+      fly_region: fra
+      volume: false
+      image: ${{ needs.dispatch.outputs.image || needs.manifest.outputs.ref }}
+      pin: peer-id
+      peer_id: ${{ vars.STAGING_RELAY_PEER_ID }}
+      quic: ${{ inputs.staging_quic }}
+    secrets:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+  # Runs where nothing deploys (pre-release tags, manual runs with
+  # `target: none`): proves the published image carries the probe the deploy
+  # jobs run, without touching Fly.
+  probe-help:
+    name: Check the probe subcommand
+    runs-on: ubuntu-latest
+    needs: [manifest]
+    if: (startsWith(github.ref, 'refs/tags/v') && contains(github.ref_name, '-')) || (github.event_name == 'workflow_dispatch' && inputs.target == 'none')
+    permissions:
+      contents: read
+      packages: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: superfly/flyctl-actions/setup-flyctl@master
-      # The receipt store is a single-writer sqlite DB — exactly one
-      # machine per region (regions provide the redundancy). Fly's
-      # default of 2 machines also makes the volume mount unsatisfiable
-      # (mounts need one volume per machine).
-      - run: flyctl scale count 1 --yes --config ${{ matrix.config }} || true
-        env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-      # The registry store mounts a volume in regions whose config has a
-      # [mounts] section (matrix.volume); ensure one exists there.
-      # Best-effort: volume creation races registration — log state,
-      # attempt create, and let the deploy step be the real arbiter (it
-      # fails loudly if unmounted).
-      - if: matrix.volume
-        run: |
-          echo "--- volumes before:"
-          flyctl volumes list --config ${{ matrix.config }} || true
-          if ! flyctl volumes list --config ${{ matrix.config }} --json | grep -q '"name": *"relay_data"'; then
-            flyctl volumes create relay_data --region ${{ matrix.fly_region }} --size 1 --yes --config ${{ matrix.config }} || \
-              echo "::warning::volume create failed — proceeding, deploy will verify"
-            sleep 10  # registration race: give the API a beat before deploy
-          fi
-          echo "--- volumes after:"
-          flyctl volumes list --config ${{ matrix.config }} || true
-        env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-      - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      # Copy the published image into the app's Fly registry, so the deploy
-      # does not depend on the GitHub package being public.
-      - name: Copy the image to the Fly registry
-        id: fly-image
+      - name: Pull the published image
         env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-          CONFIG: ${{ matrix.config }}
-          SOURCE: ${{ needs.manifest.outputs.ref }}
-        run: |
-          app=$(sed -n 's/^app = "\(.*\)"$/\1/p' "$CONFIG")
-          target="registry.fly.io/$app:sha-$GITHUB_SHA"
-          flyctl auth docker
-          docker buildx imagetools create --tag "$target" "$SOURCE"
-          echo "image=$target" >> "$GITHUB_OUTPUT"
-      - run: flyctl deploy --config ${{ matrix.config }} --image ${{ steps.fly-image.outputs.image }}
+          IMAGE: ${{ needs.manifest.outputs.ref }}
+        run: docker pull "$IMAGE"
+      - name: Run probe --help from the published image
         env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          IMAGE: ${{ needs.manifest.outputs.ref }}
+        run: docker run --rm --pull never "$IMAGE" probe --help

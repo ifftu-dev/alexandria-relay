@@ -2,15 +2,19 @@
 //! configuration and check, from a second in-process swarm, what a client
 //! would see.
 //!
-//! Each advertised external address is dialled over its own transport (TCP
-//! or QUIC), a circuit reservation is made to list the address set
+//! The summary opens with the transports the relay runs. Each advertised
+//! external address is dialled over its own transport (TCP, or QUIC when it
+//! is on), a circuit reservation is made to list the address set
 //! reservations carry, the data directory is probed for writes and the admin
 //! token is tried against the local HTTP listener. The run passes when at
 //! least one advertised address answers.
 //!
 //! The dials leave from the same host, so a pass shows that the listeners,
 //! the advertised addresses and the PeerId line up. It does not prove that a
-//! firewall in front of the host lets outside clients in.
+//! firewall in front of the host lets outside clients in. With PROXY
+//! protocol on, the relay refuses TCP connections that carry no header, so
+//! the TCP dials pass only when they go through the proxy; the summary says
+//! so and points at `probe`, which checks from another machine.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -21,14 +25,13 @@ use futures::StreamExt;
 use libp2p::multiaddr::Protocol;
 use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::swarm::{dummy, SwarmEvent};
-use libp2p::{noise, relay, tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder};
+use libp2p::{noise, relay, tcp, yamux, Multiaddr, PeerId, SwarmBuilder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::config::ADMIN_TOKEN_MIN_LEN;
+use crate::addr::is_quic;
+use crate::client::{client_swarm, resolve, STEP_TIMEOUT};
+use crate::config::{ProxyProtocol, ADMIN_TOKEN_MIN_LEN};
 use crate::{start, RelayConfig};
-
-/// How long one dial, reservation or HTTP request may take.
-const STEP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What a doctor run found. `Display` is the summary the binary prints.
 pub struct DoctorReport {
@@ -61,6 +64,8 @@ pub async fn run(config: RelayConfig) -> DoctorReport {
     let public_host = config.public_host.clone();
     let data_dir = config.data_dir.clone();
     let admin_token = config.admin_token.clone();
+    let quic = config.quic;
+    let proxy_protocol = config.tcp_proxy_protocol;
 
     let handle = match start(config).await {
         Ok(handle) => handle,
@@ -74,11 +79,20 @@ pub async fn run(config: RelayConfig) -> DoctorReport {
     };
     let peer_id = handle.peer_id();
     lines.push(format!("PeerId: {peer_id}"));
+    lines.push(transport_line(quic, proxy_protocol));
+    if proxy_protocol == ProxyProtocol::V2 {
+        lines.push(PROXY_NOTE.to_string());
+    }
 
     // ── Advertised addresses ─────────────────────────────────────────
     let mut reachable_tcp = None;
     let mut reachable = 0usize;
-    let advertised = handle.external_addrs().to_vec();
+    let advertised: Vec<Multiaddr> = handle
+        .external_addrs()
+        .iter()
+        .filter(|a| quic || !is_quic(a))
+        .cloned()
+        .collect();
     if public_host.is_none() {
         lines.push(
             "FAIL  no external host: set --public-host (RELAY_PUBLIC_HOST). Without it the \
@@ -167,61 +181,16 @@ pub async fn run(config: RelayConfig) -> DoctorReport {
     DoctorReport { lines, passed }
 }
 
-/// `addr` with a DNS component replaced by the first address it resolves
-/// to in the matching family, the way a client without a DNS transport
-/// would dial it.
-async fn resolve(addr: &Multiaddr) -> Result<Multiaddr, String> {
-    let port = addr
-        .iter()
-        .find_map(|p| match p {
-            Protocol::Tcp(port) | Protocol::Udp(port) => Some(port),
-            _ => None,
-        })
-        .ok_or("no port")?;
-    let mut out = Multiaddr::empty();
-    for p in addr.iter() {
-        let (host, v4, v6) = match &p {
-            Protocol::Dns(h) => (h.to_string(), true, true),
-            Protocol::Dns4(h) => (h.to_string(), true, false),
-            Protocol::Dns6(h) => (h.to_string(), false, true),
-            _ => {
-                out.push(p);
-                continue;
-            }
-        };
-        let ip = tokio::time::timeout(STEP_TIMEOUT, tokio::net::lookup_host((host.as_str(), port)))
-            .await
-            .map_err(|_| format!("{host} did not resolve in time"))?
-            .map_err(|e| format!("{host} does not resolve: {e}"))?
-            .map(|sa| sa.ip())
-            .find(|ip| (v4 && ip.is_ipv4()) || (v6 && ip.is_ipv6()))
-            .ok_or_else(|| format!("{host} has no address of the right family"))?;
-        out.push(match ip {
-            IpAddr::V4(ip) => Protocol::Ip4(ip),
-            IpAddr::V6(ip) => Protocol::Ip6(ip),
-        });
-    }
-    Ok(out)
+/// The transports the relay runs, as one summary line.
+fn transport_line(quic: bool, proxy_protocol: ProxyProtocol) -> String {
+    let quic = if quic { "on" } else { "off" };
+    format!("Transports: TCP (PROXY protocol {proxy_protocol}), QUIC {quic}")
 }
 
-/// A swarm with TCP and QUIC and the given behaviour.
-fn client_swarm<B: libp2p::swarm::NetworkBehaviour>(
-    behaviour: impl FnOnce(&libp2p::identity::Keypair) -> B,
-) -> Result<Swarm<B>, String> {
-    Ok(SwarmBuilder::with_new_identity()
-        .with_tokio()
-        .with_tcp(
-            tcp::Config::default(),
-            noise::Config::new,
-            yamux::Config::default,
-        )
-        .map_err(|e| e.to_string())?
-        .with_quic()
-        .with_behaviour(|key| behaviour(key))
-        .map_err(|e| e.to_string())?
-        .with_swarm_config(|c| c.with_idle_connection_timeout(STEP_TIMEOUT))
-        .build())
-}
+/// Printed under the transport line when PROXY protocol is on.
+const PROXY_NOTE: &str = "Note: PROXY protocol is on, so the relay refuses TCP connections \
+    without a header. The TCP dials below pass only when they go through the proxy; check \
+    from another machine with `alexandria-relay probe --host <public host>`";
 
 /// Dial `peer` on `addr` from a fresh swarm. Returns the address dialled.
 async fn dial(peer: PeerId, addr: &Multiaddr) -> Result<Multiaddr, String> {

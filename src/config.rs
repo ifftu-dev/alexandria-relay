@@ -47,6 +47,28 @@ pub const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 32;
 /// holds handshake state with no ceiling at all.
 pub const DEFAULT_MAX_PENDING_INCOMING: u32 = 256;
 
+/// Maximum incoming QUIC connections still in the handshake, a budget of
+/// their own below [`DEFAULT_MAX_PENDING_INCOMING`].
+///
+/// QUIC runs over UDP, whose source addresses are spoofable, so a QUIC
+/// handshake flood is cheap. Its own budget keeps it from using up the
+/// pending slots TCP needs.
+pub const DEFAULT_QUIC_MAX_PENDING_INCOMING: u32 = 64;
+
+/// QUIC receive window per stream, in bytes (quinn's default is 10 MB).
+///
+/// A relayed circuit is one stream, so this caps a circuit's QUIC throughput
+/// near 256 KiB per round trip, which is plenty for relayed traffic.
+pub const DEFAULT_QUIC_MAX_STREAM_DATA: u32 = 256 * 1024;
+
+/// QUIC receive window per connection, in bytes (quinn's default is 15 MB).
+/// At [`DEFAULT_MAX_CONNECTIONS`] that bounds receive buffers at 512 MiB.
+pub const DEFAULT_QUIC_MAX_CONNECTION_DATA: u32 = 512 * 1024;
+
+/// How long a QUIC handshake may take, in seconds (libp2p's default).
+/// Shorter values hurt lossy mobile links.
+pub const DEFAULT_QUIC_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
+
 /// Maximum new connections from a single IP per rate window.
 pub const DEFAULT_MAX_NEW_CONNECTIONS_PER_IP: usize = 32;
 
@@ -97,6 +119,12 @@ pub const DEFAULT_HTTP_REQUEST_TIMEOUT_SECS: u64 = 15;
 /// listen backlog until one closes, so a flood of slow clients cannot grow
 /// memory or file descriptors without bound.
 pub const DEFAULT_HTTP_MAX_CONNECTIONS: usize = 256;
+
+/// How long an inbound TCP connection has to send its PROXY protocol header,
+/// in seconds, when `--tcp-proxy-protocol v2` is on. Fly's proxy writes the
+/// header as soon as it connects, so this only fires for sockets that did
+/// not come through the proxy.
+pub const DEFAULT_PROXY_HEADER_TIMEOUT_SECS: u64 = 5;
 
 /// The header the Fly proxy writes the client address into. The value
 /// `--trusted-proxy-header` takes when given without one.
@@ -188,6 +216,8 @@ pub struct Limits {
     pub max_new_connections_per_ip: usize,
     pub ip_rate_window: Duration,
     pub idle_timeout: Duration,
+    /// QUIC's own handshake budget, timeout and flow-control windows.
+    pub quic: QuicLimits,
     pub kad_query_timeout: Duration,
     pub kad_replication_factor: NonZeroUsize,
     pub kad_max_records: usize,
@@ -221,6 +251,7 @@ impl Default for Limits {
             max_new_connections_per_ip: DEFAULT_MAX_NEW_CONNECTIONS_PER_IP,
             ip_rate_window: Duration::from_secs(DEFAULT_IP_RATE_WINDOW_SECS),
             idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
+            quic: QuicLimits::default(),
             kad_query_timeout: Duration::from_secs(DEFAULT_KAD_QUERY_TIMEOUT_SECS),
             kad_replication_factor: NonZeroUsize::new(DEFAULT_KAD_REPLICATION_FACTOR)
                 .expect("non-zero default"),
@@ -247,6 +278,54 @@ impl Default for Limits {
     }
 }
 
+/// The limits that apply to QUIC alone. They have no effect with QUIC off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuicLimits {
+    /// Incoming QUIC connections that may be in the handshake at once;
+    /// further ones are refused until a slot frees. Counted apart from, and
+    /// also within, [`Limits::max_pending_incoming`].
+    pub max_pending_incoming: u32,
+    /// Receive window per stream, in bytes.
+    pub max_stream_data: u32,
+    /// Receive window per connection, in bytes.
+    pub max_connection_data: u32,
+    /// How long a QUIC handshake may take.
+    pub handshake_timeout: Duration,
+}
+
+impl Default for QuicLimits {
+    fn default() -> Self {
+        QuicLimits {
+            max_pending_incoming: DEFAULT_QUIC_MAX_PENDING_INCOMING,
+            max_stream_data: DEFAULT_QUIC_MAX_STREAM_DATA,
+            max_connection_data: DEFAULT_QUIC_MAX_CONNECTION_DATA,
+            handshake_timeout: Duration::from_secs(DEFAULT_QUIC_HANDSHAKE_TIMEOUT_SECS),
+        }
+    }
+}
+
+/// Whether inbound TCP connections open with a PROXY protocol header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum ProxyProtocol {
+    /// No header is read; a connection that sends one fails multistream.
+    #[default]
+    Off,
+    /// Every inbound TCP connection must open with a valid PROXY protocol
+    /// v2 header, whose source address the connection is attributed to;
+    /// any other connection is closed. Version 1 (text) is refused.
+    V2,
+}
+
+/// The flag's value: `off` or `v2`.
+impl std::fmt::Display for ProxyProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ProxyProtocol::Off => "off",
+            ProxyProtocol::V2 => "v2",
+        })
+    }
+}
+
 /// The single input to [`crate::start`].
 ///
 /// Not `Debug`: it carries the identity keypair and the admin token.
@@ -264,6 +343,17 @@ pub struct RelayConfig {
     pub tcp_port: u16,
     /// QUIC (UDP) listen port. `0` binds an ephemeral port.
     pub quic_port: u16,
+    /// Run QUIC alongside TCP. Off: no QUIC transport, no UDP listener and
+    /// no QUIC external addresses, so Identify and reservations carry none.
+    pub quic: bool,
+    /// Read a PROXY protocol header off every inbound TCP connection (see
+    /// [`ProxyProtocol`]). Turn it on only when every connection reaches the
+    /// relay through a proxy that sends one: the relay trusts the header.
+    pub tcp_proxy_protocol: ProxyProtocol,
+    /// How long an inbound TCP connection has to send its PROXY header.
+    /// Connections waiting for one are capped at
+    /// `limits.max_pending_incoming`.
+    pub proxy_header_timeout: Duration,
     /// Address the HTTP health, metrics and lookup listener binds.
     pub metrics_bind: IpAddr,
     /// HTTP listen port. `0` binds an ephemeral port.
@@ -299,6 +389,9 @@ impl Default for RelayConfig {
             listen_ip6: Some(Ipv6Addr::UNSPECIFIED),
             tcp_port: DEFAULT_PORT,
             quic_port: DEFAULT_PORT,
+            quic: true,
+            tcp_proxy_protocol: ProxyProtocol::Off,
+            proxy_header_timeout: Duration::from_secs(DEFAULT_PROXY_HEADER_TIMEOUT_SECS),
             metrics_bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             metrics_port: DEFAULT_METRICS_PORT,
             public_host: None,
@@ -361,6 +454,33 @@ pub struct Cli {
     /// QUIC (UDP) listen port (0 = ephemeral)
     #[arg(long, global = true, env = "RELAY_QUIC_PORT", default_value_t = DEFAULT_PORT)]
     pub quic_port: u16,
+
+    /// Run QUIC (UDP) alongside TCP: `true` or `false`. Off, the relay binds
+    /// no UDP port and advertises no QUIC address. Turn it off where UDP
+    /// does not reach the relay reliably (Fly.io)
+    #[arg(long, global = true, env = "RELAY_QUIC", default_value_t = true, action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), value_name = "BOOL")]
+    pub quic: bool,
+
+    /// Read a PROXY protocol header off every inbound TCP connection: `off`
+    /// or `v2`. With `v2`, each connection must open with a v2 header, whose
+    /// source address every per-IP limit, Identify and /peers then use, and
+    /// any other connection is closed. Turn it on only when every
+    /// connection comes through a proxy that sends the header (Fly.io with
+    /// `proxy_proto` v2): the relay trusts it
+    #[arg(
+        long,
+        global = true,
+        env = "RELAY_TCP_PROXY_PROTOCOL",
+        value_enum,
+        default_value = "off",
+        value_name = "MODE"
+    )]
+    pub tcp_proxy_protocol: ProxyProtocol,
+
+    /// Time an inbound TCP connection has to send its PROXY header, in
+    /// seconds
+    #[arg(long, global = true, env = "RELAY_PROXY_HEADER_TIMEOUT_SECS", default_value_t = DEFAULT_PROXY_HEADER_TIMEOUT_SECS, value_parser = clap::value_parser!(u64).range(1..))]
+    pub proxy_header_timeout_secs: u64,
 
     /// IPv4 address the libp2p TCP and QUIC listeners bind
     #[arg(long, global = true, env = "RELAY_LISTEN_IP4", default_value_t = Ipv4Addr::UNSPECIFIED)]
@@ -468,6 +588,23 @@ pub struct Cli {
     #[arg(long, global = true, env = "RELAY_MAX_IDENTIFY_ADDRS", default_value_t = DEFAULT_MAX_IDENTIFY_ADDRS, help_heading = "Connection limits")]
     pub max_identify_addrs: usize,
 
+    /// Maximum incoming QUIC connections still in the handshake, a budget
+    /// of their own within --max-pending-incoming
+    #[arg(long, global = true, env = "RELAY_QUIC_MAX_PENDING_INCOMING", default_value_t = DEFAULT_QUIC_MAX_PENDING_INCOMING, value_parser = clap::value_parser!(u32).range(1..), help_heading = "QUIC limits")]
+    pub quic_max_pending_incoming: u32,
+
+    /// QUIC receive window per stream, in bytes
+    #[arg(long, global = true, env = "RELAY_QUIC_MAX_STREAM_DATA", default_value_t = DEFAULT_QUIC_MAX_STREAM_DATA, value_parser = clap::value_parser!(u32).range(1..), help_heading = "QUIC limits")]
+    pub quic_max_stream_data: u32,
+
+    /// QUIC receive window per connection, in bytes
+    #[arg(long, global = true, env = "RELAY_QUIC_MAX_CONNECTION_DATA", default_value_t = DEFAULT_QUIC_MAX_CONNECTION_DATA, value_parser = clap::value_parser!(u32).range(1..), help_heading = "QUIC limits")]
+    pub quic_max_connection_data: u32,
+
+    /// How long a QUIC handshake may take, in seconds
+    #[arg(long, global = true, env = "RELAY_QUIC_HANDSHAKE_TIMEOUT_SECS", default_value_t = DEFAULT_QUIC_HANDSHAKE_TIMEOUT_SECS, value_parser = clap::value_parser!(u64).range(1..), help_heading = "QUIC limits")]
+    pub quic_handshake_timeout_secs: u64,
+
     /// Kademlia query timeout, in seconds
     #[arg(long, global = true, env = "RELAY_KAD_QUERY_TIMEOUT_SECS", default_value_t = DEFAULT_KAD_QUERY_TIMEOUT_SECS, value_parser = clap::value_parser!(u64).range(1..), help_heading = "DHT limits")]
     pub kad_query_timeout_secs: u64,
@@ -550,17 +687,41 @@ pub struct Cli {
 }
 
 /// Subcommands. Without one, the binary runs the relay.
-#[derive(clap::Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(clap::Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// Start the relay with this configuration, dial each advertised
-    /// address over TCP and QUIC from a second swarm, make a reservation,
+    /// address over its transport (TCP, or QUIC when on) from a second swarm, make a reservation,
     /// check the data directory and admin token, then exit: 0 when at least
     /// one advertised address answers. Binds the configured ports, so stop
     /// a running relay first
     Doctor,
+    /// Dial a running relay from this machine over TCP (and QUIC with
+    /// --quic), check that it answers with the expected PeerId and the
+    /// Alexandria Identify, then exit: 0 when every transport passed. Starts
+    /// no relay and needs no relay secrets; the relay flags under Options
+    /// are ignored
+    Probe(crate::probe::ProbeArgs),
 }
 
 impl Cli {
+    /// Parse the process arguments as [`Parser::parse`] does, except that
+    /// `probe`'s `--port`, `--network-profile` and `--quic` take nothing from
+    /// `RELAY_PORT`, `RELAY_NETWORK_PROFILE` or `RELAY_QUIC`. Clap hands a global flag's
+    /// environment value to a subcommand flag of the same name, and those
+    /// variables describe the local relay, not the one being probed.
+    pub fn parse_args() -> Self {
+        use clap::{CommandFactory, FromArgMatches};
+        let matches = Self::command().get_matches();
+        let mut cli = Self::from_arg_matches(&matches)
+            .unwrap_or_else(|e| e.format(&mut Self::command()).exit());
+        if let (Some(Command::Probe(args)), Some(("probe", sub))) =
+            (&mut cli.command, matches.subcommand())
+        {
+            args.drop_inherited_env(sub);
+        }
+        cli
+    }
+
     /// The relay configuration these flags describe. The secrets
     /// (`keypair`, `admin_token`) are environment-only and left `None`; the
     /// binary fills them in.
@@ -571,6 +732,9 @@ impl Cli {
             listen_ip6: self.listen_ip6.0,
             tcp_port: self.port,
             quic_port: self.quic_port,
+            quic: self.quic,
+            tcp_proxy_protocol: self.tcp_proxy_protocol,
+            proxy_header_timeout: Duration::from_secs(self.proxy_header_timeout_secs),
             metrics_bind: self.metrics_bind,
             metrics_port: self.metrics_port,
             public_host: self.public_host,
@@ -587,6 +751,12 @@ impl Cli {
                 max_new_connections_per_ip: self.max_new_connections_per_ip,
                 ip_rate_window: Duration::from_secs(self.ip_rate_window_secs),
                 idle_timeout: Duration::from_secs(self.idle_timeout_secs),
+                quic: QuicLimits {
+                    max_pending_incoming: self.quic_max_pending_incoming,
+                    max_stream_data: self.quic_max_stream_data,
+                    max_connection_data: self.quic_max_connection_data,
+                    handshake_timeout: Duration::from_secs(self.quic_handshake_timeout_secs),
+                },
                 kad_query_timeout: Duration::from_secs(self.kad_query_timeout_secs),
                 kad_replication_factor: self.kad_replication_factor,
                 kad_max_records: self.kad_max_records,
@@ -669,6 +839,12 @@ mod tests {
                 max_new_connections_per_ip: 32,
                 ip_rate_window: secs(60),
                 idle_timeout: secs(600),
+                quic: QuicLimits {
+                    max_pending_incoming: 64,
+                    max_stream_data: 262_144,
+                    max_connection_data: 524_288,
+                    handshake_timeout: secs(5),
+                },
                 kad_query_timeout: secs(60),
                 kad_replication_factor: NonZeroUsize::new(20).unwrap(),
                 kad_max_records: 16_384,
@@ -753,6 +929,126 @@ mod tests {
     }
 
     #[test]
+    fn proxy_protocol_displays_as_its_flag_value() {
+        use clap::ValueEnum;
+        for mode in [ProxyProtocol::Off, ProxyProtocol::V2] {
+            let flag = mode.to_possible_value().unwrap();
+            assert_eq!(mode.to_string(), flag.get_name());
+        }
+    }
+
+    #[test]
+    fn quic_is_on_unless_switched_off() {
+        let quic = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("alexandria-relay").chain(args.iter().copied()))
+                .map(|cli| cli.into_config().quic)
+        };
+        assert_eq!(quic(&[]).ok(), Some(true), "QUIC is on by default");
+        assert!(RelayConfig::default().quic, "the library default agrees");
+        assert_eq!(quic(&["--quic", "false"]).ok(), Some(false));
+        assert_eq!(quic(&["--quic", "off"]).ok(), Some(false));
+        assert_eq!(quic(&["--quic", "true"]).ok(), Some(true));
+        assert_eq!(quic(&["doctor", "--quic", "false"]).ok(), Some(false));
+        assert!(quic(&["--quic", "maybe"]).is_err());
+    }
+
+    #[test]
+    fn proxy_protocol_is_off_unless_set_to_v2() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("alexandria-relay").chain(args.iter().copied()))
+                .map(|cli| cli.into_config())
+        };
+        let config = parse(&[]).expect("no flags parse");
+        assert_eq!(config.tcp_proxy_protocol, ProxyProtocol::Off);
+        assert_eq!(config.proxy_header_timeout, Duration::from_secs(5));
+        let library = RelayConfig::default();
+        assert_eq!(library.tcp_proxy_protocol, ProxyProtocol::Off);
+        assert_eq!(library.proxy_header_timeout, Duration::from_secs(5));
+
+        let config = parse(&[
+            "--tcp-proxy-protocol",
+            "v2",
+            "--proxy-header-timeout-secs",
+            "2",
+        ])
+        .expect("flags parse");
+        assert_eq!(config.tcp_proxy_protocol, ProxyProtocol::V2);
+        assert_eq!(config.proxy_header_timeout, Duration::from_secs(2));
+        assert_eq!(
+            parse(&["doctor", "--tcp-proxy-protocol", "v2"])
+                .expect("doctor takes it")
+                .tcp_proxy_protocol,
+            ProxyProtocol::V2
+        );
+        assert!(
+            parse(&["--tcp-proxy-protocol", "v1"]).is_err(),
+            "v1 is refused"
+        );
+        assert!(parse(&["--proxy-header-timeout-secs", "0"]).is_err());
+    }
+
+    #[test]
+    fn probes_own_quic_flag_is_independent_of_the_relays() {
+        let probe_quic = |args: &[&str]| match Cli::try_parse_from(
+            ["alexandria-relay", "probe", "--host", "relay.example.org"]
+                .into_iter()
+                .chain(args.iter().copied()),
+        )
+        .expect("flags parse")
+        .command
+        {
+            Some(Command::Probe(p)) => p.quic,
+            other => panic!("not a probe: {other:?}"),
+        };
+        assert!(!probe_quic(&[]), "probe skips QUIC unless asked");
+        assert!(probe_quic(&["--quic"]));
+    }
+
+    #[test]
+    fn quic_protections_have_their_own_defaults_and_flags() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("alexandria-relay").chain(args.iter().copied()))
+                .map(|cli| cli.into_config().limits.quic)
+        };
+        let expected = QuicLimits {
+            max_pending_incoming: 64,
+            max_stream_data: 256 * 1024,
+            max_connection_data: 512 * 1024,
+            handshake_timeout: Duration::from_secs(5),
+        };
+        assert_eq!(parse(&[]).expect("no flags parse"), expected);
+        assert_eq!(Limits::default().quic, expected, "the library agrees");
+        assert_eq!(
+            parse(&[
+                "--quic-max-pending-incoming",
+                "8",
+                "--quic-max-stream-data",
+                "65536",
+                "--quic-max-connection-data",
+                "131072",
+                "--quic-handshake-timeout-secs",
+                "10",
+            ])
+            .expect("flags parse"),
+            QuicLimits {
+                max_pending_incoming: 8,
+                max_stream_data: 65_536,
+                max_connection_data: 131_072,
+                handshake_timeout: Duration::from_secs(10),
+            }
+        );
+        // Zero would refuse every QUIC handshake or stall every stream.
+        for flag in [
+            "--quic-max-pending-incoming",
+            "--quic-max-stream-data",
+            "--quic-max-connection-data",
+            "--quic-handshake-timeout-secs",
+        ] {
+            assert!(parse(&[flag, "0"]).is_err(), "{flag} 0 is refused");
+        }
+    }
+
+    #[test]
     fn a_zero_duration_is_refused() {
         // A zero interval panics the health timer; refuse it at parse time.
         assert!(
@@ -774,6 +1070,9 @@ mod tests {
             "RELAY_LOOKUP_MAX_TRACKED",
             "RELAY_HEALTH_LOG_INTERVAL_SECS",
             "RELAY_METRICS_BIND",
+            "RELAY_QUIC",
+            "RELAY_TCP_PROXY_PROTOCOL",
+            "RELAY_PROXY_HEADER_TIMEOUT_SECS",
             "RELAY_TRUSTED_PROXY_HEADER",
             "RELAY_HTTP_HEADER_READ_TIMEOUT_SECS",
             "RELAY_HTTP_REQUEST_TIMEOUT_SECS",

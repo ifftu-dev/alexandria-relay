@@ -3,7 +3,7 @@
 [![CI](https://github.com/ifftu-dev/alexandria-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/ifftu-dev/alexandria-relay/actions/workflows/ci.yml)
 
 Relay and bootstrap node for the Alexandria P2P network: one Rust binary
-(libp2p 0.56) that helps nodes find each other and get through NAT.
+(libp2p 0.57) that helps nodes find each other and get through NAT.
 
 ## What it does
 
@@ -55,6 +55,8 @@ and lookup budgets) are in
 |---|---|---|
 | `--port` / `RELAY_PORT` | `4001` | TCP listen port (`0` = ephemeral) |
 | `--quic-port` / `RELAY_QUIC_PORT` | `4001` | QUIC (UDP) listen port |
+| `--quic` / `RELAY_QUIC` | `true` | Run QUIC alongside TCP. `false` binds no UDP port and advertises no QUIC address; set it where UDP does not reach the relay (Fly.io) |
+| `--tcp-proxy-protocol` / `RELAY_TCP_PROXY_PROTOCOL` | `off` | `v2`: every inbound TCP connection must open with a PROXY protocol v2 header, whose source address the per-IP limits, Identify and `/peers` use. Only behind a proxy that sends it to every connection; see [client addresses](docs/operations.md#client-addresses-behind-a-proxy) |
 | `--listen-ip4` / `RELAY_LISTEN_IP4` | `0.0.0.0` | IPv4 address the libp2p listeners bind |
 | `--listen-ip6` / `RELAY_LISTEN_IP6` | `::` | IPv6 address the libp2p listeners also bind (best-effort), or `off` |
 | `--metrics-port` / `RELAY_METRICS_PORT` | `9090` | HTTP health, metrics and lookup port |
@@ -66,6 +68,7 @@ and lookup budgets) are in
 | `--announce` / `RELAY_ANNOUNCE` | off | Publish this relay under the network's relay-discovery key so app nodes find it. Needs `--network-profile`. Advertises connectivity only; grants no receipt-issuer trust |
 | `--generate-key` | — | Print a keypair seed and exit |
 | `doctor` (subcommand) | — | Start with this configuration, dial every advertised address, report, exit non-zero if none answers |
+| `probe` (subcommand) | — | Dial a running relay from another machine, check its PeerId and Identify, exit non-zero on failure ([usage](docs/self-hosting.md#checking-from-outside-probe)) |
 | `RELAY_SEED` (env only) | random | 32-byte hex seed for a stable PeerId. Read, then cleared from the environment at startup |
 | `RELAY_ADMIN_TOKEN` (env only) | unset | Bearer token for `/peers`, `/metrics` and `/health/alerts`; at least 16 characters, otherwise those endpoints stay off |
 | `RUST_LOG` (env only) | `info` | Log level |
@@ -76,16 +79,19 @@ value.
 
 ## Architecture
 
-TCP (Noise + Yamux) and QUIC transports carry Circuit Relay v2, Kademlia and
-Identify, plus the username-receipt request/response protocol. An Axum
+TCP (Noise + Yamux, optionally reading a PROXY v2 header) and, unless
+switched off, QUIC carry Circuit Relay v2, Kademlia and Identify, plus the
+username-receipt request/response protocol. An Axum
 router, served over HTTP/1.1 by hyper with header and request timeouts,
 serves health, metrics and username lookups. The library's `start`
 runs a whole relay from one configuration value; `src/main.rs` parses flags
 and waits for a signal. Modules: `config` (flags and limits), `swarm`
 (behaviour and event loop), `http` (routes), `store` (SQLite receipts and DHT
 mirror), `username_reg` (receipt wire types and claim verification),
-`profile` and `mesh` (network profile and mesh join), `doctor` (the
-reachability check) and `addr` (address helpers). `tests/` drives a relay
+`profile` and `mesh` (network profile and mesh join), `transport`
+(transport assembly), `proxy` (PROXY v2 parser and TCP wrapper),
+`quic_budget` (QUIC pending-handshake budget), `doctor` and `probe` (the
+reachability checks) and `addr` (address helpers). `tests/` drives a relay
 over loopback.
 
 ## Deployed relays
@@ -100,8 +106,8 @@ Two Fly.io apps run today: `fly.toml` (Singapore, `sin`) and `fly-eu.toml`
 
 | Doc | Contents |
 |---|---|
-| [docs/self-hosting.md](docs/self-hosting.md) | Running your own relay: systemd, Compose, TLS, mesh, `doctor`, Prometheus |
-| [docs/operations.md](docs/operations.md) | Endpoints, metrics, alerting, limits, deployment, adding a region |
+| [docs/self-hosting.md](docs/self-hosting.md) | Running your own relay: systemd, Compose, TLS, mesh, `doctor`, `probe`, Prometheus, proxied hosts |
+| [docs/operations.md](docs/operations.md) | Endpoints, metrics, alerting, limits, client addresses, deployment, rollback, staging rehearsal, adding a region |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Local checks, CI and releases, commit messages |
 | [docs/audits/security-2026-08.md](docs/audits/security-2026-08.md) | Security audit (2026-08, remediated) |
 

@@ -21,6 +21,7 @@ use crate::config::{Limits, ADMIN_TOKEN_MIN_LEN};
 #[cfg(test)]
 use crate::config::{DEFAULT_LOOKUP_LIMIT, DEFAULT_LOOKUP_MAX_TRACKED};
 use crate::mesh::BootstrapStatus;
+use crate::proxy::ProxyCounters;
 use crate::rate::RateWindows;
 use crate::store::{StoreError, StoreHandle};
 
@@ -43,6 +44,12 @@ pub(crate) struct RelayMetrics {
     pub(crate) ip_rate_limited: u64,
     /// Username-receipt requests received, refused ones included.
     pub(crate) receipt_requests: u64,
+    /// Connections established since start, inbound and outbound, by the
+    /// transport they run on.
+    pub(crate) connections_established: TransportCounts,
+    /// Incoming QUIC handshakes refused because the QUIC pending budget
+    /// (`RELAY_QUIC_MAX_PENDING_INCOMING`) was full.
+    pub(crate) quic_pending_denied: u64,
 
     /// Other relays named in the network profile (0 without a profile).
     pub(crate) profile_relays: usize,
@@ -60,6 +67,11 @@ pub(crate) struct RelayMetrics {
     pub(crate) prev_minute_circuits_accepted: u64,
     #[serde(skip)]
     pub(crate) prev_minute_reservations_denied: u64,
+    #[serde(skip)]
+    pub(crate) prev_minute_quic_pending_denied: u64,
+    /// QUIC handshakes refused by the pending budget in the most recent
+    /// completed 60s window.
+    pub(crate) quic_pending_denied_per_min: u64,
     /// Circuits denied in the most recent completed 60s window. Surfaced
     /// at /health/alerts so external healthcheckers can flag spikes
     /// without doing their own delta math.
@@ -82,10 +94,27 @@ pub(crate) struct RelayMetrics {
     /// observer (ad-hoc dialers come and go).
     #[serde(skip)]
     pub(crate) peers_with_reservation: HashSet<PeerId>,
+    /// PROXY protocol header refusals, shared with the TCP transport and
+    /// read live. Serialized as its `proxy_header_*` counters.
+    #[serde(flatten)]
+    pub(crate) proxy_header: ProxyCounters,
     /// When the relay started; `uptime_seconds` is computed from it on read.
     #[serde(skip)]
     pub(crate) started: Option<Instant>,
 }
+
+/// A count per libp2p transport.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub(crate) struct TransportCounts {
+    pub(crate) tcp: u64,
+    pub(crate) quic: u64,
+}
+
+/// QUIC budget refusals per minute above which `/health/alerts` reports
+/// `quic_pending_denied_sustained`: more than one a second, on average,
+/// over the last full minute. A burst of handshakes a busy minute can
+/// bring stays under it; a flood does not.
+const QUIC_DENIED_ALERT_PER_MIN: u64 = 60;
 
 impl RelayMetrics {
     /// A copy with `uptime_seconds` brought up to now.
@@ -203,9 +232,10 @@ impl RelayMetrics {
             .map(|c| (c, "counter"))
             .chain(gauges.iter().map(|g| (g, "gauge")));
         for ((name, help, value), kind) in kinds {
-            let _ = writeln!(out, "# HELP relay_{name} {help}");
-            let _ = writeln!(out, "# TYPE relay_{name} {kind}");
-            let _ = writeln!(out, "relay_{name} {value}");
+            write_sample(&mut out, name, help, kind, *value);
+        }
+        for (name, help, value) in self.proxy_header.counters() {
+            write_sample(&mut out, &format!("{name}_total"), help, "counter", value);
         }
         let _ = writeln!(
             out,
@@ -217,6 +247,7 @@ impl RelayMetrics {
             let status = status.as_str();
             let _ = writeln!(out, "relay_bootstrap_status{{status=\"{status}\"}} {value}");
         }
+        self.write_quic_and_transport_counters(&mut out);
         let _ = writeln!(out, "# HELP relay_info This relay's PeerId and version.");
         let _ = writeln!(out, "# TYPE relay_info gauge");
         let _ = writeln!(
@@ -227,6 +258,57 @@ impl RelayMetrics {
         );
         out
     }
+}
+
+impl RelayMetrics {
+    /// The per-transport and QUIC-budget part of [`RelayMetrics::prometheus`].
+    fn write_quic_and_transport_counters(&self, out: &mut String) {
+        use std::fmt::Write;
+        let _ = writeln!(
+            out,
+            "# HELP relay_connections_established_total Connections established since start, by transport."
+        );
+        let _ = writeln!(out, "# TYPE relay_connections_established_total counter");
+        let counts = self.connections_established;
+        for (transport, value) in [("tcp", counts.tcp), ("quic", counts.quic)] {
+            let _ = writeln!(
+                out,
+                "relay_connections_established_total{{transport=\"{transport}\"}} {value}"
+            );
+        }
+        let samples = [
+            (
+                "quic_pending_denied_total",
+                "QUIC handshakes refused by the pending budget.",
+                "counter",
+                self.quic_pending_denied,
+            ),
+            (
+                "quic_pending_denied_per_min",
+                "QUIC handshakes refused by the pending budget in the last full minute.",
+                "gauge",
+                self.quic_pending_denied_per_min,
+            ),
+        ];
+        for (name, help, kind, value) in samples {
+            write_sample(out, name, help, kind, value);
+        }
+    }
+}
+
+/// One unlabelled Prometheus sample `relay_{name}` with its HELP and TYPE
+/// lines.
+fn write_sample(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    kind: &str,
+    value: impl std::fmt::Display,
+) {
+    use std::fmt::Write;
+    let _ = writeln!(out, "# HELP relay_{name} {help}");
+    let _ = writeln!(out, "# TYPE relay_{name} {kind}");
+    let _ = writeln!(out, "relay_{name} {value}");
 }
 
 /// Content type of [`RelayMetrics::prometheus`].
@@ -427,6 +509,11 @@ pub(crate) async fn serve(
                 m.prev_minute_circuits_denied = m.circuits_denied;
                 m.prev_minute_circuits_accepted = m.circuits_accepted;
                 m.prev_minute_reservations_denied = m.reservations_denied;
+                m.quic_pending_denied_per_min = m
+                    .quic_pending_denied
+                    .saturating_sub(m.prev_minute_quic_pending_denied);
+                m.prev_minute_quic_pending_denied = m.quic_pending_denied;
+                m.proxy_header.roll_window();
             }
         });
     }
@@ -663,6 +750,15 @@ fn admin_routes(
                     if lock.listener_errors > 0 {
                         alerts.push("listener_errors_observed");
                     }
+                    // A QUIC handshake flood: refusals sustained across the
+                    // last full minute, not a passing burst.
+                    if lock.quic_pending_denied_per_min > QUIC_DENIED_ALERT_PER_MIN {
+                        alerts.push("quic_pending_denied_sustained");
+                    }
+                    // A proxy that stops sending headers refuses every user.
+                    if lock.proxy_header.header_refusal_alert() {
+                        alerts.push("proxy_header_refusal_majority");
+                    }
 
                     let level = if alerts.is_empty() { "ok" } else { "warn" };
                     let status_code = if alerts.is_empty() {
@@ -682,6 +778,7 @@ fn admin_routes(
                             "circuits_accepted_per_min": accept_rate,
                             "circuit_denial_share": denial_share,
                             "reservations_denied_per_min": lock.reservations_denied_per_min,
+                            "quic_pending_denied_per_min": lock.quic_pending_denied_per_min,
                             "connections_ratio": connections_ratio,
                             "max_connections": max_connections,
                         })),
@@ -831,6 +928,65 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"abcd"));
         assert!(constant_time_eq(b"", b""));
+    }
+}
+
+#[cfg(test)]
+mod quic_alert_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+
+    const TOKEN: &str = "0123456789abcdef0123";
+
+    /// `/health/alerts` for a relay whose last full minute saw `denied`
+    /// QUIC budget refusals: the status code and the alert names.
+    async fn alerts_with(denied_per_min: u64) -> (u16, Vec<String>) {
+        let metrics = RelayMetrics {
+            quic_pending_denied: denied_per_min,
+            quic_pending_denied_per_min: denied_per_min,
+            ..RelayMetrics::default()
+        };
+        let router = admin_routes(
+            Arc::new(RwLock::new(metrics)),
+            1024,
+            Some(TOKEN.to_string()),
+        );
+        let request = Request::get("/health/alerts")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        let status = response.status().as_u16();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["quic_pending_denied_per_min"], denied_per_min);
+        let alerts = json["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap().to_string())
+            .collect();
+        (status, alerts)
+    }
+
+    #[tokio::test]
+    async fn sustained_quic_budget_refusals_raise_an_alert() {
+        // More than one refusal a second over the last full minute.
+        let (status, alerts) = alerts_with(61).await;
+        assert_eq!(status, 503);
+        assert_eq!(alerts, ["quic_pending_denied_sustained"]);
+    }
+
+    #[tokio::test]
+    async fn occasional_quic_budget_refusals_do_not() {
+        for denied in [0, 1, 60] {
+            let (status, alerts) = alerts_with(denied).await;
+            assert_eq!(status, 200, "{denied} refusals");
+            assert!(alerts.is_empty(), "{denied} refusals: {alerts:?}");
+        }
     }
 }
 

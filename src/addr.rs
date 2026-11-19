@@ -15,17 +15,22 @@ pub(crate) fn extract_ip(addr: &Multiaddr) -> Option<IpAddr> {
     })
 }
 
-/// The TCP and QUIC addresses of `ip`: `/ip*/<ip>/tcp/<tcp_port>` and
-/// `/ip*/<ip>/udp/<quic_port>/quic-v1`.
-pub(crate) fn tcp_and_quic(ip: IpAddr, tcp_port: u16, quic_port: u16) -> [Multiaddr; 2] {
+/// Whether `addr` is on the QUIC transport.
+pub(crate) fn is_quic(addr: &Multiaddr) -> bool {
+    addr.iter().any(|p| matches!(p, Protocol::QuicV1))
+}
+
+/// The TCP and QUIC addresses of `ip`: `/ip*/<ip>/tcp/<tcp_port>`, then
+/// `/ip*/<ip>/udp/<quic_port>/quic-v1` unless `quic_port` is `None` (QUIC
+/// off).
+pub(crate) fn tcp_and_quic(ip: IpAddr, tcp_port: u16, quic_port: Option<u16>) -> Vec<Multiaddr> {
     let base = Multiaddr::empty().with(match ip {
         IpAddr::V4(v4) => Protocol::Ip4(v4),
         IpAddr::V6(v6) => Protocol::Ip6(v6),
     });
-    [
-        base.clone().with(Protocol::Tcp(tcp_port)),
-        base.with(Protocol::Udp(quic_port)).with(Protocol::QuicV1),
-    ]
+    let mut addrs = vec![base.clone().with(Protocol::Tcp(tcp_port))];
+    addrs.extend(quic_port.map(|port| base.with(Protocol::Udp(port)).with(Protocol::QuicV1)));
+    addrs
 }
 
 /// The key every per-client limit and record uses for `ip`: the full IPv4

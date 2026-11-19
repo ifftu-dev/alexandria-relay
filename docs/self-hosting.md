@@ -1,11 +1,11 @@
 # Self-hosting a relay
 
 Status: live
-Updated: 2026-11-13
+Updated: 2026-11-19
 
 How to run an Alexandria relay on your own machine: a VPS with systemd or
 Docker Compose, TLS in front of the HTTP listener, joining the relay mesh,
-checking reachability and scraping metrics. Endpoints, limits and the
+checking reachability, scraping metrics, and running behind a proxy. Endpoints, limits and the
 project's own Fly deployment are in [operations.md](operations.md).
 
 ## What a relay does and does not grant
@@ -27,10 +27,11 @@ is needed to join the mesh.
 
 - A Linux host (amd64 or arm64) with a public IPv4 address that delivers
   connections with their original source address: a VM or bare-metal
-  server, not a platform proxy. IPv6 is optional. Behind a proxy the per-IP
-  limits stop working ([why](operations.md#client-addresses-behind-a-proxy)).
+  server. IPv6 is optional. Behind a platform proxy, see
+  [proxied hosts](#flyio-and-other-proxied-hosts).
 - A DNS name pointing at that address, passed as `RELAY_PUBLIC_HOST`.
-- Inbound ports: `4001/tcp` (libp2p), `4001/udp` (QUIC) and either
+- Inbound ports: `4001/tcp` (libp2p), `4001/udp` (QUIC, unless
+  `RELAY_QUIC=false`) and either
   `9090/tcp` (HTTP) or `443/tcp` with the reverse proxy below.
 - 1 vCPU and 1 GiB of memory; 1 GiB of disk is plenty. The DHT record cap
   sets the memory budget ([numbers](operations.md#dht-records-and-the-store)).
@@ -213,8 +214,8 @@ when the app ships a new one.
 ## Checking reachability: `doctor`
 
 `alexandria-relay doctor` takes the same flags and environment, starts the
-relay, dials each advertised address over TCP and QUIC from a second
-in-process client, makes a reservation and lists the addresses it carries,
+relay, prints which transports are on, dials each advertised address over
+TCP (and QUIC when on) from a second in-process client, makes a reservation and lists the addresses it carries,
 checks the data directory is writable and tries the admin token against the
 HTTP listener. It exits non-zero when no advertised address answers, or when
 `RELAY_PUBLIC_HOST` is unset. It binds the relay's ports, so stop the relay
@@ -238,8 +239,33 @@ docker compose start relay
 
 The dials leave from the relay's own host. A pass shows that the
 listeners, advertised addresses and PeerId agree; a cloud firewall or
-security group can still block outside clients, so also check from another
-machine, for example `nc -vz relay.example.org 4001`.
+security group can still block outside clients. With
+`RELAY_TCP_PROXY_PROTOCOL=v2`, doctor's TCP dials pass only if they go
+through the proxy. Either way, also check from another machine with
+`probe`.
+
+## Checking from outside: `probe`
+
+`alexandria-relay probe` dials a running relay the way a client does and
+needs no relay secrets, so run it from any other machine with the binary or
+the image. It passes when the relay answers with the expected PeerId and the
+Alexandria Identify, retrying for up to `--timeout-secs` (default 120), and
+prints one PASS or FAIL line per transport; the exit code is 0 only when
+every transport passed.
+
+```sh
+alexandria-relay probe --host relay.example.org --peer-id <PeerId> --quic
+docker run --rm ghcr.io/ifftu-dev/alexandria-relay:latest \
+  probe --host relay.example.org --peer-id <PeerId>
+```
+
+TCP is always dialled; `--quic` adds QUIC on the same `--port` (default
+4001). `--host` takes a DNS name (dialled over IPv4) or an IPv4 or IPv6
+address, such as `2001:db8::1`. The expected PeerId comes from `--peer-id`,
+or from `--network-profile <file>` (the relay entry whose `dns_name` equals
+the host), or else from `--health-url http://relay.example.org:9090/health`,
+in which case the identity is the relay's own claim and the output says it
+was not pinned. `--health-url` takes plain `http://` only.
 
 ## Prometheus
 
@@ -267,5 +293,20 @@ Without the token, `/metrics` answers 404. Prometheus also defaults to port
 Platforms that put their own proxy in front of TCP (Fly.io among them) hide
 client addresses from the libp2p listener, so the relay's per-IP limits and
 libp2p's per-IP reservation and circuit limits see the proxy instead.
-QUIC on Fly is unverified. The details, and which limits still work, are in
-[client addresses behind a proxy](operations.md#client-addresses-behind-a-proxy).
+
+- **PROXY protocol.** If the proxy can prepend a PROXY protocol v2 header
+  to every TCP connection (Fly: `handlers = ["proxy_proto"]` with
+  `proxy_proto_options = { version = "v2" }` on the 4001 service), set
+  `RELAY_TCP_PROXY_PROTOCOL=v2` and the limits see real clients again. Set
+  it only when every connection to the port comes through that proxy: the
+  relay trusts the header, and refuses any connection without one. Turn
+  both sides on or off together; either one alone refuses every TCP
+  connection. Leave it `off` (the default) on a plain server.
+- **QUIC.** Set `RELAY_QUIC=false` where UDP does not reach the relay
+  reliably, and drop the UDP port. The relay then binds no UDP port and
+  advertises no QUIC address, so clients don't waste dials on it. QUIC does
+  not work on Fly; keep it on (the default) on a plain server.
+
+Check the result from outside with `probe` (without `--quic` when QUIC is
+off). The details, and which limits still work without PROXY protocol, are
+in [client addresses behind a proxy](operations.md#client-addresses-behind-a-proxy).

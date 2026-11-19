@@ -1,17 +1,16 @@
 //! Binary entry point for the Alexandria relay. See the library crate docs.
 
 use alexandria_relay::config::{generate_seed, keypair_from_seed, Command};
-use alexandria_relay::{doctor, start, Cli, RelayConfig};
-use clap::Parser;
+use alexandria_relay::{doctor, probe, start, Cli, RelayConfig};
 use zeroize::Zeroizing;
 
 fn main() {
-    let cli = Cli::parse();
-    let command = cli.command;
+    let mut cli = Cli::parse_args();
+    let command = cli.command.take();
 
-    // The doctor's summary is the output; relay logs stay at warn unless
-    // RUST_LOG asks for more.
-    let default_log = if command == Some(Command::Doctor) {
+    // The doctor's and the probe's summaries are the output; logs stay at
+    // warn unless RUST_LOG asks for more.
+    let default_log = if matches!(command, Some(Command::Doctor | Command::Probe(_))) {
         "warn"
     } else {
         "info"
@@ -37,6 +36,18 @@ fn main() {
         return;
     }
 
+    let doctor = match command {
+        // The probe starts no relay: it reads no seed or token and builds no
+        // relay configuration.
+        Some(Command::Probe(args)) => {
+            let report = runtime().block_on(probe::run(args));
+            print!("{report}");
+            std::process::exit(if report.passed() { 0 } else { 1 });
+        }
+        Some(Command::Doctor) => true,
+        None => false,
+    };
+
     let mut config = cli.into_config();
 
     // Read and clear RELAY_SEED while single-threaded (safe — no tokio runtime yet).
@@ -49,18 +60,20 @@ fn main() {
     config.keypair = seed.as_deref().map(|s| keypair_from_seed(s));
     config.admin_token = std::env::var("RELAY_ADMIN_TOKEN").ok();
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let runtime = runtime();
+    if doctor {
+        let report = runtime.block_on(doctor::run(config));
+        print!("{report}");
+        std::process::exit(if report.passed() { 0 } else { 1 });
+    }
+    runtime.block_on(run(config));
+}
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .expect("tokio runtime");
-    match command {
-        Some(Command::Doctor) => {
-            let report = runtime.block_on(doctor::run(config));
-            print!("{report}");
-            std::process::exit(if report.passed() { 0 } else { 1 });
-        }
-        None => runtime.block_on(run(config)),
-    }
+        .expect("tokio runtime")
 }
 
 /// Start the relay, then shut it down gracefully on SIGTERM or SIGINT.

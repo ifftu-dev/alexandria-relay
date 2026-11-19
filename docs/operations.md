@@ -1,7 +1,7 @@
 # Relay operations
 
 Status: live
-Updated: 2026-11-13
+Updated: 2026-11-19
 
 How to run, watch and deploy the relay. Listener and identity settings are
 in the [README](../README.md#configuration); limits are below. To run a
@@ -23,7 +23,7 @@ so a scanner can't tell that they exist.
 | `GET /health` | public | `{"status":"ok","version":…,"peer_id":…,"uptime_seconds":…,"connections":…,"profile_relays":…,"reachable_relays":…,"bootstrap_status":…}`. `connections` is the live count of connected peers |
 | `GET /username/:name` | public | Username availability from the receipt registry. Clients resolve names against it |
 | `GET /health/alerts` | bearer | `200` when healthy, `503` when any alert fires; the body lists firing alerts and rolling 60 s rates |
-| `GET /metrics` | bearer | Connections, circuits, reservations, receipt requests, DHT updates, identify events, listener errors, IP rate limits, rolling-minute denials, mesh state. JSON, or Prometheus text when `Accept` names `text/plain` ([names](#prometheus)) |
+| `GET /metrics` | bearer | Connections (also established by transport), circuits, reservations, receipt requests, DHT updates, identify events, listener errors, IP rate limits, PROXY header refusals, QUIC budget refusals, rolling-minute denials, mesh state. JSON, or Prometheus text when `Accept` names `text/plain` ([names](#prometheus)) |
 | `GET /peers` | bearer | `{peer_id, source_prefix, has_reservation}` per peer. `source_prefix` is a `/24` (IPv4) or `/48` (IPv6) network, never a full address |
 
 Mesh state, on both routes: `profile_relays` is how many other relays the
@@ -48,7 +48,12 @@ bearer token. Each JSON counter becomes `relay_<field>_total`
 `relay_connections_served_total`), each gauge `relay_<field>`
 (`relay_connections`, `relay_reachable_relays`, `relay_uptime_seconds`).
 `relay_bootstrap_status{status="…"}` is 1 for the current state and 0 for
-the others, and `relay_info{peer_id,version}` is always 1. Nothing per peer
+the others, and `relay_info{peer_id,version}` is always 1.
+`relay_connections_established_total{transport="tcp"|"quic"}` splits
+established connections by transport (JSON: `connections_established`).
+PROXY header refusals are `relay_proxy_header_{missing,invalid,timeout,overflow}_total`;
+QUIC budget refusals are `relay_quic_pending_denied_total`, with the last
+full minute's count in `relay_quic_pending_denied_per_min`. Nothing per peer
 is exported. A scrape configuration is in
 [self-hosting.md](self-hosting.md#prometheus).
 
@@ -75,6 +80,8 @@ Point an HTTP monitor (UptimeRobot, healthchecks.io) at
 | `circuit_denial_majority` | denials > accepts in the last minute, with > 20 total |
 | `reservations_denied_per_min_high` | > 10 reservation denials in the last minute |
 | `listener_errors_observed` | any listener error since start |
+| `proxy_header_refusal_majority` | with PROXY protocol on, refusals for a missing, malformed or late header are at least 10 and more than half of inbound TCP connections, in the last full minute or the one in progress. Usually the proxy stopped sending the header: see [rollback](#rollback) |
+| `quic_pending_denied_sustained` | > 60 QUIC handshakes refused by the pending budget in the last full minute |
 
 ## Limits and hardening
 
@@ -86,7 +93,12 @@ are in seconds.
 |---|---|---|---|
 | Connections in total | `--max-connections` | `RELAY_MAX_CONNECTIONS` | 1024 |
 | Connections per PeerId | `--max-connections-per-peer` | `RELAY_MAX_CONNECTIONS_PER_PEER` | 8 |
-| Incoming connections still in the handshake | `--max-pending-incoming` | `RELAY_MAX_PENDING_INCOMING` | 256 |
+| Incoming connections still in the handshake (also caps TCP sockets awaiting a PROXY header) | `--max-pending-incoming` | `RELAY_MAX_PENDING_INCOMING` | 256 |
+| Time a TCP connection has to send its PROXY header | `--proxy-header-timeout-secs` | `RELAY_PROXY_HEADER_TIMEOUT_SECS` | 5 |
+| Incoming QUIC connections still in the handshake, within the cap above | `--quic-max-pending-incoming` | `RELAY_QUIC_MAX_PENDING_INCOMING` | 64 |
+| QUIC receive window per stream, bytes | `--quic-max-stream-data` | `RELAY_QUIC_MAX_STREAM_DATA` | 262144 (256 KiB) |
+| QUIC receive window per connection, bytes | `--quic-max-connection-data` | `RELAY_QUIC_MAX_CONNECTION_DATA` | 524288 (512 KiB) |
+| QUIC handshake timeout | `--quic-handshake-timeout-secs` | `RELAY_QUIC_HANDSHAKE_TIMEOUT_SECS` | 5 |
 | Concurrent connections per IP | `--max-connections-per-ip` | `RELAY_MAX_CONNECTIONS_PER_IP` | 32 |
 | New connections per IP per window | `--max-new-connections-per-ip` | `RELAY_MAX_NEW_CONNECTIONS_PER_IP` | 32 |
 | Per-IP connection window | `--ip-rate-window-secs` | `RELAY_IP_RATE_WINDOW_SECS` | 60 |
@@ -112,6 +124,11 @@ are in seconds.
 | Time from HTTP request headers to response (then `503`) | `--http-request-timeout-secs` | `RELAY_HTTP_REQUEST_TIMEOUT_SECS` | 15 |
 | Concurrent HTTP connections (more wait in the listen backlog) | `--http-max-connections` | `RELAY_HTTP_MAX_CONNECTIONS` | 256 |
 | Health log interval | `--health-log-interval-secs` | `RELAY_HEALTH_LOG_INTERVAL_SECS` | 300 |
+
+The QUIC windows bound receive buffers at 512 MiB with 1,024 connections
+(quinn's defaults would allow about 15 GiB) and cap one relayed circuit
+over QUIC near 256 KiB per round trip. UDP sources are spoofable, so the
+QUIC budget has no per-IP part.
 
 Two bounds are part of the wire format and are not configurable: a username
 receipt request is at most 8 KiB, and its DID at most 64 characters.
@@ -182,23 +199,40 @@ proxy sits in front of the relay, that is the proxy's address, and the limit
 then either throttles every user as one client or, with a high ceiling,
 protects nothing.
 
-**libp2p listener.** Per-address limits on the libp2p port work only on a
-host that delivers connections with their original source address: a VM or
-bare-metal host with a public IP, or a load balancer in pass-through mode.
-The relay cannot read PROXY protocol on this listener. Fly's TCP and HTTP
-services do not preserve source addresses, so on Fly these limiters see the
-proxy:
+**libp2p listener.** On a host that delivers connections with their
+original source address (a VM or bare-metal host with a public IP, or a
+load balancer in pass-through mode) nothing needs setting. Behind a TCP
+proxy that sends PROXY protocol v2, set `--tcp-proxy-protocol v2`
+(`RELAY_TCP_PROXY_PROTOCOL`): every inbound TCP connection must then open
+with a v2 header, and the relay attributes it to the header's source
+address, so the per-IP connection limiter, libp2p's per-IP reservation and
+circuit limiters, Identify's observed address and `/peers` all see the
+client. A LOCAL header (platform health checks) keeps the socket address.
+Anything else is closed and counted: no header as `proxy_header_missing`;
+a version 1 (text), malformed, UNIX-family or over-1 KiB header as
+`proxy_header_invalid`; a header that does not arrive within
+`--proxy-header-timeout-secs` as `proxy_header_timeout`; a socket beyond
+the waiting cap as `proxy_header_overflow`. Outbound dials are unaffected.
+
+The relay trusts the first header on a connection, so turn `v2` on only
+when every connection comes through the proxy. On Fly the public addresses
+reach the machine only through Fly's proxy, which writes its header first;
+machines on the organisation's private network can reach the port directly
+and are trusted. The Fly relays run with `v2` (the `proxy_proto` handler in
+`fly.toml` and `fly-eu.toml`). Behind a proxy that cannot send the header,
+these limiters see the proxy instead:
 
 - the relay's per-IP connection limiter (`--max-connections-per-ip`,
   `--max-new-connections-per-ip`);
 - libp2p's built-in per-IP reservation and circuit rate limiters, which are
-  not configurable and key on the full address;
-- the username lookup limiter, unless `--trusted-proxy-header` is set.
+  not configurable and key on the full address.
 
 Per-PeerId limits and the global caps are unaffected.
 
-**HTTP listener.** Set `--trusted-proxy-header` (`RELAY_TRUSTED_PROXY_HEADER`)
-when every request reaches the listener through a proxy that writes the
+**HTTP listener.** PROXY protocol does not apply here; the username
+lookup limiter keys on the socket address unless you set
+`--trusted-proxy-header` (`RELAY_TRUSTED_PROXY_HEADER`). Set it only when
+every request reaches the listener through a proxy that writes the
 client address into a header, overwriting anything the client sent. Given
 without a value it reads `Fly-Client-IP`, which Fly's `http` handler sets;
 behind nginx or Caddy, name the header the proxy sets (for example
@@ -209,11 +243,19 @@ any client could then write a new address into the header for every request
 and never hit the lookup limit. Behind a local reverse proxy, bind the
 listener to loopback with `--metrics-bind 127.0.0.1`.
 
-**QUIC on Fly.** Fly documents that a UDP service must bind the
-`fly-global-services` address, and that a socket bound to the wildcard
-address replies from the wrong source. The relay binds `--listen-ip4`
-(default `0.0.0.0`), not that address, so QUIC reachability on Fly is
-unverified.
+**QUIC on Fly does not work, so it is off there.** A 2026-11 experiment on
+a throwaway Fly app found that QUIC from an outside client reached the
+machine on two to four connections after each restart, then no packets
+arrived (a packet capture saw none) until the next restart. Fly machines
+dialing the app's anycast address got nothing, and both production relays
+failed every attempt. The drops happen inside Fly, before the machine,
+whichever address the server binds, and Fly's documentation says QUIC is
+not supported. The Fly relays therefore run with `RELAY_QUIC=false` and no
+UDP service: no UDP listener, no QUIC address in Identify or reservations.
+Re-test before turning it back on, for example with a `staging_quic` run of
+the [staging rehearsal](#staging-rehearsal). With QUIC on (the default
+elsewhere), handshakes have their own pending budget and smaller windows
+([limits](#limits-and-hardening)).
 
 ## Deployment (Fly.io)
 
@@ -228,8 +270,7 @@ Fly services (`fly.toml`, `fly-eu.toml`):
 
 | Port | Protocol | Use |
 |---|---|---|
-| `4001` | TCP | libp2p (relay, Kademlia, Identify, username receipts) |
-| `4001` | UDP | QUIC |
+| `4001` | TCP, PROXY v2 | libp2p (relay, Kademlia, Identify, username receipts) |
 | `443` | TCP, TLS | HTTP endpoints |
 | `9090` | TCP | HTTP endpoints; Fly healthcheck on `/health` |
 
@@ -243,14 +284,112 @@ fly deploy
 fly status && fly logs
 ```
 
-Also set `RELAY_PUBLIC_HOST` to the app's hostname. `fly-eu.toml` mounts
+Also set `RELAY_PUBLIC_HOST` to the app's hostname, and keep a dedicated
+IPv4 (`fly ips allocate-v4`): raw TCP over IPv4 needs one on Fly, and the
+network profile's fallback addresses point at it. `fly-eu.toml` mounts
 `relay_data` at `/data`. `fly.toml` (Singapore) has no mount: the app started
 in `bom`, which refused volume creation, and Fly has since retired `bom`. Its
 receipt history resets on restart. Issued receipts stay valid, because they
 are signed.
 
-Routine deploys run from CI on `v*` tags or manual dispatch (see
-[CONTRIBUTING.md](../CONTRIBUTING.md#ci-and-releases)).
+Routine deploys run from CI on `v*` tags or a manual run with
+`target: production` (see
+[CONTRIBUTING.md](../CONTRIBUTING.md#ci-and-releases)). CI deploys
+Frankfurt, probes it from the runner with `probe`, and only on a pass
+deploys and probes Singapore.
+
+### Rollback
+
+The Fly config and the image must agree about the PROXY header. An image
+without PROXY support behind the `proxy_proto` handler refuses every TCP
+connection, and so does an image with `v2` on behind a config without the
+handler. CI deploys config and image together, and a rollback must too:
+never roll back the image alone (`fly deploy --image` with the current
+config, or `fly releases rollback`). Production rolls back to the previous
+release's image and that release's config, one region at a time, Frankfurt
+first:
+
+```bash
+git show <previous-tag>:<config> > rollback.toml
+fly deploy --config rollback.toml \
+  --image ghcr.io/ifftu-dev/alexandria-relay@sha256:<previous-digest>
+alexandria-relay probe --host <app>.fly.dev --peer-id <PeerId>
+rm rollback.toml
+```
+
+`<config>` is `fly-eu.toml` or `fly.toml`, and `<previous-digest>` the
+digest on the `Image:` line of the previous release's notes (or from
+`docker buildx imagetools inspect` of its version tag). If the probe
+fails, stop before the next region. Unlike CI, which copies the image into
+the app's Fly registry, this deploy has Fly pull it from GHCR directly, so
+it needs the GHCR package to stay public (it is today). If it is ever made
+private, copy the image first, as `fly-deploy.yml` does.
+
+Staging rolls back by redeploying the matching release candidate's image
+with the current `fly-staging.toml`: rerun the workflow with `target:
+staging` and the same `image` input.
+
+### Staging rehearsal
+
+Rerun this, on the release candidate (`vX.Y.Z-rc.N`) and before the release
+tag, for any release that changes transports or Fly config. The staging
+relay (`fly-staging.toml`, app `alexandria-relay-staging`) matches
+production's TCP service and `[env]`, keeps a UDP service so QUIC can be
+switched on for one check, and stays out of the mesh: no network profile,
+no announce, its own identity.
+
+Set it up:
+
+```bash
+fly apps create alexandria-relay-staging
+fly ips allocate-v4 -a alexandria-relay-staging   # dedicated; raw TCP needs it
+fly ips allocate-v6 -a alexandria-relay-staging
+alexandria-relay --generate-key                   # fresh seed; note the PeerId
+fly secrets set -a alexandria-relay-staging --stage RELAY_SEED="<seed>" \
+  RELAY_ADMIN_TOKEN="<token>" RELAY_PUBLIC_HOST=alexandria-relay-staging.fly.dev
+gh variable set STAGING_RELAY_PEER_ID --body "<PeerId>"
+```
+
+The repository's `FLY_API_TOKEN` must be allowed to deploy the new app (a
+token scoped to the production apps is not). Then **Run workflow** on the
+release candidate's tag with `target: staging` and `image` set to the
+image that candidate published, by digest: the `Image:` line of its release
+notes (for 0.4.0, the `v0.4.0-rc.2` image). Nothing is built or released:
+the job fails before touching Fly if `STAGING_RELAY_PEER_ID` is unset,
+copies that image into the app's Fly registry, deploys it with the tag's
+`fly-staging.toml` and runs the pinned TCP probe. Probes by hand use the
+same image or the candidate's binary: `probe --host
+alexandria-relay-staging.fly.dev --peer-id <PeerId>`. Each item passes
+before the release tag:
+
+1. The workflow's staging deploy and TCP probe pass.
+2. `/peers` (admin token), read while a client on a known machine is
+   connected, shows that machine's address bucket, not a Fly address.
+3. With `fly secrets set RELAY_MAX_CONNECTIONS_PER_IP=1` on the staging app
+   and a dev app build connected, a probe from the same machine fails and
+   a probe from the CI runner (rerun the job) passes. Unset it afterwards.
+4. Old image, new config: a run with `image` set to an image without PROXY
+   support (the previous release, `ghcr.io/ifftu-dev/alexandria-relay:<previous-version>`)
+   makes the probe fail.
+5. New image, old config: the release candidate deployed with a local copy
+   of `fly-staging.toml` without the `proxy_proto` handler makes the probe
+   fail and raises `proxy_header_missing` and `proxy_header_refusal_majority`.
+6. Rollback: redeploying the release candidate's image with the current
+   staging config (rerun with the same `image` input, see
+   [rollback](#rollback)) makes the probe pass again.
+7. A dev app build with the staging relay added through its extra-relays
+   setting gets a reservation, and the app's view of its own public address
+   is the machine's real address.
+8. A probe to the staging IPv6 address (`--host <IPv6 address>`) passes
+   from a machine with IPv6 (CI runners have none; Docker needs IPv6
+   networking, or use the binary).
+9. A run with `staging_quic` ticked records in the job summary how many of
+   five QUIC probes from the runner passed. Record the result either way; a
+   reliable pass reopens QUIC on Fly in a new spec.
+10. Teardown: `fly apps destroy alexandria-relay-staging` (releases its
+    addresses) and `gh variable delete STAGING_RELAY_PEER_ID`.
+
+Record the results in the release's spec or pull request.
 
 ### One machine per region
 
@@ -264,12 +403,15 @@ drops that relay's reservations; clients reconnect, usually within about 30 s.
 1. `cargo run -- --generate-key` and keep the seed and PeerId.
 2. Copy `fly-eu.toml` with a new `app` and `primary_region`, then
    `fly apps create <app>` and set its secrets as above.
-3. `fly deploy -c <config>`, then `fly ips list -a <app>` for the IPv4.
+3. `fly ips allocate-v4 -a <app>` (dedicated), `fly deploy -c <config>`,
+   then `fly ips list -a <app>` for the IPv4.
 4. Add the relay (PeerId, DNS name, port, fallback IP, registry origin) to
    `relays`, and its PeerId to `receipt_issuer_keys`, in the app's
    [`preprod.json`](https://github.com/ifftu-dev/alexandria/blob/main/src-tauri/resources/networks/preprod.json).
 5. Add its metrics URL to the observer's `RELAY_METRICS_URL`.
-6. Add a matrix entry to the `deploy` job in `.github/workflows/ci.yml`.
+6. Add a job to `.github/workflows/ci.yml` that calls `fly-deploy.yml`
+   with the new config and `needs` the previous region's job, so it joins
+   the deploy-and-probe chain.
 
 Each relay keeps its own Kademlia routing table. Peers connected to different
 relays find each other through DHT propagation.

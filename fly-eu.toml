@@ -12,8 +12,14 @@ primary_region = "fra"  # Frankfurt — Europe
 [env]
   RELAY_DATA_DIR = "/data"
   RUST_LOG = "info"
+  # Same transport settings as fly.toml, for the same reasons.
+  RELAY_TCP_PROXY_PROTOCOL = "v2"
+  RELAY_QUIC = "false"
 
-# TCP port for libp2p
+# TCP port for libp2p, behind Fly's proxy with a PROXY protocol v2 header.
+# The handler and RELAY_TCP_PROXY_PROTOCOL must agree, so this file and the
+# image deploy and roll back together (see fly.toml). No UDP service; the
+# dedicated IPv4 address stays allocated.
 [[services]]
   internal_port = 4001
   protocol = "tcp"
@@ -22,18 +28,8 @@ primary_region = "fra"  # Frankfurt — Europe
 
   [[services.ports]]
     port = 4001
-    handlers = []
-
-# UDP port for QUIC
-[[services]]
-  internal_port = 4001
-  protocol = "udp"
-  auto_stop_machines = false
-  auto_start_machines = true
-
-  [[services.ports]]
-    port = 4001
-    handlers = []
+    handlers = ["proxy_proto"]
+    proxy_proto_options = { version = "v2" }
 
 # HTTP port for health checks and metrics.
 #

@@ -1,0 +1,83 @@
+# Fly.io configuration for the staging relay, used to rehearse a release
+# candidate before either production relay changes.
+#
+# The app is created by hand for a rehearsal (one machine, a dedicated IPv4
+# and an IPv6 address) and destroyed afterwards; this file stays for the
+# next one. The CI workflow deploys it on a manual run with `target: staging`.
+#
+# Isolation: the app's secrets (RELAY_SEED, RELAY_ADMIN_TOKEN,
+# RELAY_PUBLIC_HOST) live only on this app. A fresh RELAY_SEED keeps its
+# PeerId out of every network profile, and RELAY_NETWORK_PROFILE and
+# RELAY_ANNOUNCE stay unset, so it neither dials the production relays nor
+# announces itself. Monitoring never sees it.
+app = "alexandria-relay-staging"
+primary_region = "fra"
+
+[build]
+  dockerfile = "Dockerfile"
+
+# Transport settings match production (fly.toml, fly-eu.toml). No volume: the
+# receipt store is ephemeral, as in Singapore.
+[env]
+  RUST_LOG = "info"
+  RELAY_DATA_DIR = "/data"
+  RELAY_TCP_PROXY_PROTOCOL = "v2"
+  # A `staging_quic` workflow run overrides this with RELAY_QUIC=true.
+  RELAY_QUIC = "false"
+
+# TCP port for libp2p, behind Fly's proxy with a PROXY protocol v2 header,
+# exactly as in production.
+[[services]]
+  internal_port = 4001
+  protocol = "tcp"
+  auto_stop_machines = false
+  auto_start_machines = true
+
+  [[services.ports]]
+    port = 4001
+    handlers = ["proxy_proto"]
+    proxy_proto_options = { version = "v2" }
+
+# UDP port for QUIC. Unlike production, staging keeps it, so QUIC can be
+# switched on for one check (RELAY_QUIC=true) without a config change. With
+# QUIC off nothing listens behind it.
+[[services]]
+  internal_port = 4001
+  protocol = "udp"
+  auto_stop_machines = false
+  auto_start_machines = true
+
+  [[services.ports]]
+    port = 4001
+    handlers = []
+
+# HTTP port for health checks and metrics, as in production: `/health` is
+# public, everything else needs RELAY_ADMIN_TOKEN.
+[[services]]
+  internal_port = 9090
+  protocol = "tcp"
+  auto_stop_machines = false
+  auto_start_machines = true
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+  [[services.ports]]
+    port = 9090
+    handlers = ["http"]
+
+[checks]
+  [checks.health]
+    port = 9090
+    type = "http"
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "10s"
+    method = "get"
+    path = "/health"
+
+[[vm]]
+  # Same size as production, so the rehearsal runs on the same machine.
+  memory = "1024mb"
+  cpus = 1
