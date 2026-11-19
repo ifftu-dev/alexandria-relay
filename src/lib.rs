@@ -73,6 +73,7 @@
 //! black-box tests call it on ephemeral loopback ports.
 
 mod addr;
+mod client;
 pub mod config;
 pub mod doctor;
 mod http;

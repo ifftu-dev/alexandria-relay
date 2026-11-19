@@ -25,15 +25,13 @@ use futures::StreamExt;
 use libp2p::multiaddr::Protocol;
 use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::swarm::{dummy, SwarmEvent};
-use libp2p::{noise, relay, tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder};
+use libp2p::{noise, relay, tcp, yamux, Multiaddr, PeerId, SwarmBuilder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::addr::is_quic;
+use crate::client::{client_swarm, resolve, STEP_TIMEOUT};
 use crate::config::{ProxyProtocol, ADMIN_TOKEN_MIN_LEN};
 use crate::{start, RelayConfig};
-
-/// How long one dial, reservation or HTTP request may take.
-pub(crate) const STEP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What a doctor run found. `Display` is the summary the binary prints.
 pub struct DoctorReport {
@@ -197,62 +195,6 @@ fn transport_line(quic: bool, proxy_protocol: ProxyProtocol) -> String {
 const PROXY_NOTE: &str = "Note: PROXY protocol is on, so the relay refuses TCP connections \
     without a header. The TCP dials below pass only when they go through the proxy; check \
     from another machine with `alexandria-relay probe --host <public host>`";
-
-/// `addr` with a DNS component replaced by the first address it resolves
-/// to in the matching family, the way a client without a DNS transport
-/// would dial it.
-pub(crate) async fn resolve(addr: &Multiaddr) -> Result<Multiaddr, String> {
-    let port = addr
-        .iter()
-        .find_map(|p| match p {
-            Protocol::Tcp(port) | Protocol::Udp(port) => Some(port),
-            _ => None,
-        })
-        .ok_or("no port")?;
-    let mut out = Multiaddr::empty();
-    for p in addr.iter() {
-        let (host, v4, v6) = match &p {
-            Protocol::Dns(h) => (h.to_string(), true, true),
-            Protocol::Dns4(h) => (h.to_string(), true, false),
-            Protocol::Dns6(h) => (h.to_string(), false, true),
-            _ => {
-                out.push(p);
-                continue;
-            }
-        };
-        let ip = tokio::time::timeout(STEP_TIMEOUT, tokio::net::lookup_host((host.as_str(), port)))
-            .await
-            .map_err(|_| format!("{host} did not resolve in time"))?
-            .map_err(|e| format!("{host} does not resolve: {e}"))?
-            .map(|sa| sa.ip())
-            .find(|ip| (v4 && ip.is_ipv4()) || (v6 && ip.is_ipv6()))
-            .ok_or_else(|| format!("{host} has no address of the right family"))?;
-        out.push(match ip {
-            IpAddr::V4(ip) => Protocol::Ip4(ip),
-            IpAddr::V6(ip) => Protocol::Ip6(ip),
-        });
-    }
-    Ok(out)
-}
-
-/// A swarm with TCP and QUIC and the given behaviour.
-pub(crate) fn client_swarm<B: libp2p::swarm::NetworkBehaviour>(
-    behaviour: impl FnOnce(&libp2p::identity::Keypair) -> B,
-) -> Result<Swarm<B>, String> {
-    Ok(SwarmBuilder::with_new_identity()
-        .with_tokio()
-        .with_tcp(
-            tcp::Config::default(),
-            noise::Config::new,
-            yamux::Config::default,
-        )
-        .map_err(|e| e.to_string())?
-        .with_quic()
-        .with_behaviour(|key| behaviour(key))
-        .map_err(|e| e.to_string())?
-        .with_swarm_config(|c| c.with_idle_connection_timeout(STEP_TIMEOUT))
-        .build())
-}
 
 /// Dial `peer` on `addr` from a fresh swarm. Returns the address dialled.
 async fn dial(peer: PeerId, addr: &Multiaddr) -> Result<Multiaddr, String> {

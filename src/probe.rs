@@ -25,8 +25,8 @@ use libp2p::{identify, Multiaddr, PeerId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::Instant;
 
+use crate::client::{client_swarm, resolve, STEP_TIMEOUT};
 use crate::config::DEFAULT_PORT;
-use crate::doctor::{client_swarm, resolve, STEP_TIMEOUT};
 use crate::profile::NetworkProfile;
 use crate::swarm::IDENTIFY_PROTOCOL_VERSION;
 
