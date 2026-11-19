@@ -49,17 +49,19 @@ const FIXED_LEN: usize = 16;
 pub(crate) const MAX_HEADER_LEN: usize = 1024;
 
 /// Why a connection was refused before libp2p saw it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum HeaderError {
     /// The connection did not open with the v2 signature: a direct client,
     /// a scanner, or a proxy that sends no header.
+    #[error("no PROXY v2 header")]
     Missing,
     /// It opened with a header the relay does not accept: version 1 (text),
     /// a bad version or command, the UNIX family, a transport other than
-    /// STREAM, truncated, or over
-    /// [`MAX_HEADER_LEN`].
+    /// STREAM, truncated, or over [`MAX_HEADER_LEN`].
+    #[error("malformed or unsupported PROXY header")]
     Invalid,
     /// The header did not arrive within the timeout.
+    #[error("PROXY header timed out")]
     Timeout,
 }
 
@@ -178,10 +180,11 @@ const ALERT_MIN_REFUSALS: u64 = 10;
 /// the metrics lock from `poll`) and the HTTP routes. Clones share one set.
 /// Serializes as the `proxy_header_*` fields of `/metrics`.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct ProxyCounters(Arc<Counts>);
+pub(crate) struct ProxyCounters(Arc<Shared>);
 
+/// What every clone of one [`ProxyCounters`] points at.
 #[derive(Debug, Default)]
-struct Counts {
+struct Shared {
     /// Inbound TCP sockets accepted while `v2` is on: the alert's base.
     attempts: AtomicU64,
     missing: AtomicU64,
@@ -192,12 +195,39 @@ struct Counts {
     window: Mutex<Window>,
 }
 
-/// `(attempts, refusals)` at the start of the window in progress, and over
+/// Inbound TCP attempts and the refusals among them, as totals or over a
+/// window.
+#[derive(Debug, Default, Clone, Copy)]
+struct Tally {
+    attempts: u64,
+    /// Refused for a missing, invalid or late header.
+    refused: u64,
+}
+
+impl Tally {
+    /// The counts between `start` and `self`. Saturating: the counters are
+    /// read one by one without stopping writers, so a total never goes
+    /// backwards but a sum read early could trail one read later.
+    fn since(self, start: Tally) -> Tally {
+        Tally {
+            attempts: self.attempts.saturating_sub(start.attempts),
+            refused: self.refused.saturating_sub(start.refused),
+        }
+    }
+
+    /// Refusals are more than half of attempts and at least
+    /// [`ALERT_MIN_REFUSALS`].
+    fn refusals_dominate(self) -> bool {
+        self.refused >= ALERT_MIN_REFUSALS && self.refused.saturating_mul(2) > self.attempts
+    }
+}
+
+/// The totals at the start of the window in progress, and the counts over
 /// the last complete one.
 #[derive(Debug, Default)]
 struct Window {
-    start: (u64, u64),
-    last: (u64, u64),
+    start: Tally,
+    last: Tally,
 }
 
 impl ProxyCounters {
@@ -209,6 +239,17 @@ impl ProxyCounters {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// An inbound TCP socket was accepted.
+    fn accepted(&self) {
+        Self::bump(&self.0.attempts);
+    }
+
+    /// An accepted socket was closed because the waiting cap was full.
+    fn overflowed(&self) {
+        Self::bump(&self.0.overflow);
+    }
+
+    /// An accepted socket was refused for its header.
     fn refused(&self, error: HeaderError) {
         Self::bump(match error {
             HeaderError::Missing => &self.0.missing,
@@ -217,11 +258,13 @@ impl ProxyCounters {
         });
     }
 
-    /// `(attempts, refused for a missing, invalid or late header)` so far.
-    fn totals(&self) -> (u64, u64) {
+    /// The totals so far.
+    fn totals(&self) -> Tally {
         let c = &self.0;
-        let refused = Self::load(&c.missing) + Self::load(&c.invalid) + Self::load(&c.timeout);
-        (Self::load(&c.attempts), refused)
+        Tally {
+            attempts: Self::load(&c.attempts),
+            refused: Self::load(&c.missing) + Self::load(&c.invalid) + Self::load(&c.timeout),
+        }
     }
 
     /// Close the window in progress and open the next. The HTTP server's
@@ -229,7 +272,7 @@ impl ProxyCounters {
     pub(crate) fn roll_window(&self) {
         if let Ok(mut w) = self.0.window.lock() {
             let now = self.totals();
-            w.last = since(w.start, now);
+            w.last = now.since(w.start);
             w.start = now;
         }
     }
@@ -244,10 +287,8 @@ impl ProxyCounters {
         };
         // Read under the lock, so no roll lands between the read and the
         // window it is measured against.
-        let current = since(w.start, self.totals());
-        [w.last, current]
-            .iter()
-            .any(|&(attempts, refused)| refused >= ALERT_MIN_REFUSALS && refused * 2 > attempts)
+        let current = self.totals().since(w.start);
+        w.last.refusals_dominate() || current.refusals_dominate()
     }
 
     /// `(name, help, value)` for each counter, in `/metrics` naming.
@@ -276,13 +317,6 @@ impl ProxyCounters {
             ),
         ]
     }
-}
-
-/// The counts between `start` and `now`. Saturating: the counters are
-/// read one by one without stopping writers, so a total can never go
-/// backwards but a sum read early could trail one read later.
-fn since(start: (u64, u64), now: (u64, u64)) -> (u64, u64) {
-    (now.0.saturating_sub(start.0), now.1.saturating_sub(start.1))
 }
 
 impl Serialize for ProxyCounters {
@@ -404,12 +438,12 @@ impl Transport for ProxyTcp {
                     local_addr,
                     send_back_addr,
                 }) => {
-                    ProxyCounters::bump(&this.counters.0.attempts);
+                    this.counters.accepted();
                     let Ok(mut stream) = upgrade.into_inner() else {
                         continue;
                     };
                     if this.waiting.len() >= max_waiting {
-                        ProxyCounters::bump(&this.counters.0.overflow);
+                        this.counters.overflowed();
                         log::debug!("PROXY header: waiting cap reached, closing {send_back_addr}");
                         continue; // dropping the stream closes it
                     }
@@ -459,7 +493,7 @@ impl Transport for ProxyTcp {
                     });
                 }
                 Err(error) => {
-                    log::debug!("PROXY header: refused an inbound connection ({error:?})");
+                    log::debug!("PROXY header: refused an inbound connection ({error})");
                     this.counters.refused(error);
                 }
             }
@@ -613,7 +647,7 @@ mod tests {
             let (counters, stop) = (counters.clone(), stop.clone());
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
-                    ProxyCounters::bump(&counters.0.attempts);
+                    counters.accepted();
                     counters.refused(HeaderError::Missing);
                     counters.roll_window();
                 }
