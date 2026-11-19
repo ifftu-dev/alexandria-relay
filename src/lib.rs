@@ -31,6 +31,10 @@
 //!
 //! - Connection limits (per-peer, per-IP, and total) prevent resource exhaustion
 //! - IP-level rate limiting prevents PeerId rotation attacks
+//! - Optional PROXY protocol v2 on inbound TCP keeps per-IP limits on the
+//!   real client address behind a proxy (Fly.io)
+//! - QUIC can be switched off; when on, pending handshakes have their own
+//!   budget and flow-control windows are small
 //! - Relay circuit limits (bandwidth, duration, reservations) prevent abuse
 //! - Kademlia memory store size is capped
 //! - Idle connection timeout prevents connection leaks

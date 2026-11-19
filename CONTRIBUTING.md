@@ -82,7 +82,7 @@ Pushing a `v*` tag runs every job above except Docker Build, then:
 | --- | --- |
 | Container image, `linux/amd64` and `linux/arm64` | `ghcr.io/ifftu-dev/alexandria-relay`, tagged with the version (`v1.2.3` → `1.2.3`), `latest` and `sha-<commit>` |
 | Static Linux binaries `alexandria-relay-linux-amd64` and `-arm64`, plus `SHA256SUMS` | The GitHub release created from the tag |
-| Deploy of that image to `fly.toml` (Singapore) and `fly-eu.toml` (Frankfurt) | Fly.io |
+| Deploy of that image to `fly-eu.toml` (Frankfurt), then `fly.toml` (Singapore), each probed after its deploy | Fly.io |
 
 Each architecture builds natively on its own runner. The binary attached to
 the release is the one inside the image (`docker buildx build --target binary`
@@ -91,15 +91,23 @@ anything is published. The image runs as uid/gid `10001` with
 `RELAY_DATA_DIR=/data`.
 
 A tag with a pre-release suffix (`v1.2.3-rc.1`) publishes the image without
-`latest`, marks the release as a pre-release and does not deploy. Use one to
-dry-run a release. A manual run (**Run workflow**) publishes only the
-`sha-<commit>` image, keeps the binaries as workflow artifacts, creates no
-release, and deploys unless `deploy` is unticked.
+`latest`, marks the release as a pre-release and does not deploy; it runs
+`probe --help` from the published image instead. Use one to dry-run a
+release. A manual run (**Run workflow**) publishes only the `sha-<commit>`
+image and keeps the binaries as workflow artifacts (on a branch; run on a
+tag it also uploads them to that tag's release). Its `target` picks what it
+deploys: `staging` (the default, `fly-staging.toml`, with an optional
+`staging_quic` check), `production` (both regions) or `none`.
 
-The deploy copies the published image into each app's Fly registry and
-deploys it, so both regions run the same bytes and nothing builds on Fly. It
-scales each region to one machine and makes sure the `relay_data` volume
-exists. It needs the `FLY_API_TOKEN` repository secret.
+Each deploy (`.github/workflows/fly-deploy.yml`) copies the published image
+into the app's Fly registry and deploys it with that commit's Fly config,
+so the regions run the same bytes and nothing builds on Fly. It scales the
+app to one machine and, in Frankfurt, makes sure the `relay_data` volume
+exists. Then it runs `probe` from the published image, with no secrets, at
+`<app>.fly.dev` over TCP, pinning the PeerId from the app repository's
+network profile (staging: the `STAGING_RELAY_PEER_ID` repository variable).
+A failed Frankfurt deploy or probe leaves Singapore untouched. It needs the
+`FLY_API_TOKEN` repository secret.
 
 ```sh
 git tag vX.Y.Z && git push --tags
