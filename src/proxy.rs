@@ -214,9 +214,9 @@ impl ProxyCounters {
     /// Close the window in progress and open the next. The HTTP server's
     /// rolling-minute sampler calls this once a minute.
     pub(crate) fn roll_window(&self) {
-        let now = self.totals();
         if let Ok(mut w) = self.0.window.lock() {
-            w.last = (now.0 - w.start.0, now.1 - w.start.1);
+            let now = self.totals();
+            w.last = since(w.start, now);
             w.start = now;
         }
     }
@@ -226,11 +226,12 @@ impl ProxyCounters {
     /// TCP attempts and at least [`ALERT_MIN_REFUSALS`]. Counting the
     /// window in progress pages as soon as a proxy stops sending headers.
     pub(crate) fn header_refusal_alert(&self) -> bool {
-        let now = self.totals();
         let Ok(w) = self.0.window.lock() else {
             return false;
         };
-        let current = (now.0 - w.start.0, now.1 - w.start.1);
+        // Read under the lock, so no roll lands between the read and the
+        // window it is measured against.
+        let current = since(w.start, self.totals());
         [w.last, current]
             .iter()
             .any(|&(attempts, refused)| refused >= ALERT_MIN_REFUSALS && refused * 2 > attempts)
@@ -262,6 +263,13 @@ impl ProxyCounters {
             ),
         ]
     }
+}
+
+/// The counts between `start` and `now`. Saturating: the counters are
+/// read one by one without stopping writers, so a total can never go
+/// backwards but a sum read early could trail one read later.
+fn since(start: (u64, u64), now: (u64, u64)) -> (u64, u64) {
+    (now.0.saturating_sub(start.0), now.1.saturating_sub(start.1))
 }
 
 impl Serialize for ProxyCounters {
@@ -579,5 +587,36 @@ mod tests {
         assert_eq!(parse(&header(1, 0x11, &body)), Err(HeaderError::Invalid));
         body.truncate(MAX_HEADER_LEN - 16);
         assert!(parse(&header(1, 0x11, &body)).is_ok(), "exactly the cap");
+    }
+
+    #[test]
+    fn the_alert_survives_a_window_rolling_while_it_reads() {
+        // The sampler rolls the window while connections keep arriving and
+        // `/health` asks for the alert: the alert must never compute a
+        // window that starts after the totals it read.
+        let counters = ProxyCounters::default();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (counters, stop) = (counters.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    ProxyCounters::bump(&counters.0.attempts);
+                    counters.refused(HeaderError::Missing);
+                    counters.roll_window();
+                }
+            })
+        };
+        let reader = {
+            let counters = counters.clone();
+            std::thread::spawn(move || {
+                for _ in 0..200_000 {
+                    counters.header_refusal_alert();
+                }
+            })
+        };
+        let read = reader.join();
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        assert!(read.is_ok(), "the alert panicked");
     }
 }
