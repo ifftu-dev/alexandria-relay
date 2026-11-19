@@ -305,19 +305,29 @@ without PROXY support behind the `proxy_proto` handler refuses every TCP
 connection, and so does an image with `v2` on behind a config without the
 handler. CI deploys config and image together, and a rollback must too:
 never roll back the image alone (`fly deploy --image` with the current
-config, or `fly releases rollback`). One region at a time, Frankfurt first:
+config, or `fly releases rollback`). Production rolls back to the previous
+release's image and that release's config, one region at a time, Frankfurt
+first:
 
 ```bash
 git show <previous-tag>:<config> > rollback.toml
 fly deploy --config rollback.toml \
-  --image ghcr.io/ifftu-dev/alexandria-relay:<previous-version>
+  --image ghcr.io/ifftu-dev/alexandria-relay@sha256:<previous-digest>
 alexandria-relay probe --host <app>.fly.dev --peer-id <PeerId>
 rm rollback.toml
 ```
 
-`<config>` is `fly-eu.toml`, `fly.toml` or `fly-staging.toml`, and
-`<previous-version>` the previous tag without its `v`. If the probe fails,
-stop before the next region.
+`<config>` is `fly-eu.toml` or `fly.toml`, and `<previous-digest>` the
+digest on the `Image:` line of the previous release's notes (or from
+`docker buildx imagetools inspect` of its version tag). If the probe
+fails, stop before the next region. Unlike CI, which copies the image into
+the app's Fly registry, this deploy has Fly pull it from GHCR directly, so
+it needs the GHCR package to stay public (it is today). If it is ever made
+private, copy the image first, as `fly-deploy.yml` does.
+
+Staging rolls back by redeploying the matching release candidate's image
+with the current `fly-staging.toml`: rerun the workflow with `target:
+staging` and the same `image` input.
 
 ### Staging rehearsal
 
@@ -342,11 +352,15 @@ gh variable set STAGING_RELAY_PEER_ID --body "<PeerId>"
 
 The repository's `FLY_API_TOKEN` must be allowed to deploy the new app (a
 token scoped to the production apps is not). Then **Run workflow** on the
-release candidate's tag with `target: staging`: the job builds that commit,
-fails before touching Fly if `STAGING_RELAY_PEER_ID` is unset, deploys and
-runs the pinned TCP probe. Probes by hand use the release candidate's image
-or binary: `probe --host alexandria-relay-staging.fly.dev --peer-id
-<PeerId>`. Each item passes before the release tag:
+release candidate's tag with `target: staging` and `image` set to the
+image that candidate published, by digest: the `Image:` line of its release
+notes (for 0.4.0, the `v0.4.0-rc.2` image). Nothing is built or released:
+the job fails before touching Fly if `STAGING_RELAY_PEER_ID` is unset,
+copies that image into the app's Fly registry, deploys it with the tag's
+`fly-staging.toml` and runs the pinned TCP probe. Probes by hand use the
+same image or the candidate's binary: `probe --host
+alexandria-relay-staging.fly.dev --peer-id <PeerId>`. Each item passes
+before the release tag:
 
 1. The workflow's staging deploy and TCP probe pass.
 2. `/peers` (admin token), read while a client on a known machine is
@@ -354,13 +368,15 @@ or binary: `probe --host alexandria-relay-staging.fly.dev --peer-id
 3. With `fly secrets set RELAY_MAX_CONNECTIONS_PER_IP=1` on the staging app
    and a dev app build connected, a probe from the same machine fails and
    a probe from the CI runner (rerun the job) passes. Unset it afterwards.
-4. Old image, new config: an image without PROXY support deployed with
-   `fly-staging.toml` makes the probe fail.
+4. Old image, new config: a run with `image` set to an image without PROXY
+   support (the previous release, `ghcr.io/ifftu-dev/alexandria-relay:<previous-version>`)
+   makes the probe fail.
 5. New image, old config: the release candidate deployed with a local copy
    of `fly-staging.toml` without the `proxy_proto` handler makes the probe
    fail and raises `proxy_header_missing` and `proxy_header_refusal_majority`.
-6. Rollback: redeploying the matching image and config, following
-   [rollback](#rollback) word for word, makes the probe pass again.
+6. Rollback: redeploying the release candidate's image with the current
+   staging config (rerun with the same `image` input, see
+   [rollback](#rollback)) makes the probe pass again.
 7. A dev app build with the staging relay added through its extra-relays
    setting gets a reservation, and the app's view of its own public address
    is the machine's real address.
