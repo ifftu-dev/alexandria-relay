@@ -31,10 +31,14 @@ use libp2p::core::transport::{DialOpts, ListenerId, Transport, TransportError, T
 use libp2p::multiaddr::Protocol;
 use libp2p::{tcp, Multiaddr};
 use serde::ser::{Serialize, SerializeStruct, Serializer};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// The v2 signature every header opens with.
 const SIGNATURE: [u8; 12] = *b"\r\n\r\n\0\r\nQUIT\n";
+
+/// How a version 1 (text) header opens. The relay refuses those as invalid
+/// rather than missing, so a proxy set to the wrong version shows as such.
+const V1_PREFIX: &[u8] = b"PROXY ";
 
 /// Signature, version and command, family and protocol, and the length.
 const FIXED_LEN: usize = 16;
@@ -51,7 +55,8 @@ pub(crate) enum HeaderError {
     /// a scanner, or a proxy that sends no header.
     Missing,
     /// It opened with a header the relay does not accept: version 1 (text),
-    /// a bad version or command, the UNIX family, truncated, or over
+    /// a bad version or command, the UNIX family, a transport other than
+    /// STREAM, truncated, or over
     /// [`MAX_HEADER_LEN`].
     Invalid,
     /// The header did not arrive within the timeout.
@@ -59,9 +64,10 @@ pub(crate) enum HeaderError {
 }
 
 /// The client address in `buf`, a complete v2 header and nothing after it:
-/// `Some` for a PROXY command with an IPv4 or IPv6 source, `None` (use the
-/// socket's address) for the LOCAL command or the UNSPEC family. TLVs after
-/// the addresses are skipped.
+/// `Some` for a PROXY command with an IPv4 or IPv6 source over STREAM (TCP),
+/// `None` (use the socket's address) for the LOCAL command or the UNSPEC
+/// family. Any other family or transport protocol (DGRAM, or UNSPEC with an
+/// IP family) is refused. TLVs after the addresses are skipped.
 pub(crate) fn parse(buf: &[u8]) -> Result<Option<SocketAddr>, HeaderError> {
     let total = header_len(buf)?;
     let header = buf.get(..total).ok_or(HeaderError::Invalid)?;
@@ -69,9 +75,10 @@ pub(crate) fn parse(buf: &[u8]) -> Result<Option<SocketAddr>, HeaderError> {
     if header[12] & 0x0f == 0 {
         return Ok(None); // LOCAL: the proxy's own connection, e.g. a health check
     }
-    match header[13] >> 4 {
-        0 => Ok(None),
-        1 => {
+    const STREAM: u8 = 1;
+    match (header[13] >> 4, header[13] & 0x0f) {
+        (0, 0 | STREAM) => Ok(None),
+        (1, STREAM) => {
             let b = body.get(..12).ok_or(HeaderError::Invalid)?;
             let ip = Ipv4Addr::new(b[0], b[1], b[2], b[3]);
             Ok(Some(SocketAddr::from((
@@ -79,13 +86,13 @@ pub(crate) fn parse(buf: &[u8]) -> Result<Option<SocketAddr>, HeaderError> {
                 u16::from_be_bytes([b[8], b[9]]),
             ))))
         }
-        2 => {
+        (2, STREAM) => {
             let b = body.get(..36).ok_or(HeaderError::Invalid)?;
             let octets: [u8; 16] = b[..16].try_into().map_err(|_| HeaderError::Invalid)?;
             let port = u16::from_be_bytes([b[32], b[33]]);
             Ok(Some(SocketAddr::from((Ipv6Addr::from(octets), port))))
         }
-        _ => Err(HeaderError::Invalid), // UNIX, or no family at all
+        _ => Err(HeaderError::Invalid), // UNIX, DGRAM, or no protocol for an IP
     }
 }
 
@@ -95,7 +102,7 @@ pub(crate) fn parse(buf: &[u8]) -> Result<Option<SocketAddr>, HeaderError> {
 fn header_len(prefix: &[u8]) -> Result<usize, HeaderError> {
     let overlap = prefix.len().min(SIGNATURE.len());
     if prefix.is_empty() || prefix[..overlap] != SIGNATURE[..overlap] {
-        return Err(if prefix.starts_with(b"PROXY ") {
+        return Err(if prefix.starts_with(V1_PREFIX) {
             HeaderError::Invalid // version 1, the text form
         } else {
             HeaderError::Missing
@@ -115,17 +122,25 @@ fn header_len(prefix: &[u8]) -> Result<usize, HeaderError> {
     Ok(total)
 }
 
+/// Whether `prefix`, the bytes read so far, could still open a header of
+/// either version, so the reader should wait for more before classifying.
+fn may_open_a_header(prefix: &[u8]) -> bool {
+    let sig = prefix.len().min(SIGNATURE.len());
+    prefix[..sig] == SIGNATURE[..sig]
+        || (prefix.len() < V1_PREFIX.len() && V1_PREFIX.starts_with(prefix))
+}
+
 /// Read the header off a freshly accepted socket, exactly and no further:
 /// what follows belongs to multistream-select. Returns the address the
 /// connection is attributed to, the header's source or `socket_remote`.
-async fn read_header(
-    stream: &mut tcp::tokio::TcpStream,
+async fn read_header<S: AsyncRead + Unpin>(
+    stream: &mut S,
     socket_remote: Multiaddr,
 ) -> Result<Multiaddr, HeaderError> {
     let mut buf = vec![0u8; FIXED_LEN];
     let mut got = 0;
     while got < FIXED_LEN {
-        let n = stream.0.read(&mut buf[got..]).await.unwrap_or(0);
+        let n = stream.read(&mut buf[got..]).await.unwrap_or(0);
         if n == 0 {
             // Closed (or reset) early: classify what did arrive.
             return Err(header_len(&buf[..got])
@@ -133,8 +148,7 @@ async fn read_header(
                 .unwrap_or(HeaderError::Invalid));
         }
         got += n;
-        let overlap = got.min(SIGNATURE.len());
-        if buf[..overlap] != SIGNATURE[..overlap] {
+        if !may_open_a_header(&buf[..got]) {
             return Err(header_len(&buf[..got])
                 .err()
                 .unwrap_or(HeaderError::Missing));
@@ -143,7 +157,6 @@ async fn read_header(
     let total = header_len(&buf)?;
     buf.resize(total, 0);
     stream
-        .0
         .read_exact(&mut buf[FIXED_LEN..])
         .await
         .map_err(|_| HeaderError::Invalid)?;
@@ -404,7 +417,7 @@ impl Transport for ProxyTcp {
                         async move {
                             let result = tokio::time::timeout(
                                 timeout,
-                                read_header(&mut stream, send_back_addr),
+                                read_header(&mut stream.0, send_back_addr),
                             )
                             .await
                             .unwrap_or(Err(HeaderError::Timeout));
@@ -618,5 +631,87 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         writer.join().unwrap();
         assert!(read.is_ok(), "the alert panicked");
+    }
+
+    /// Hands out one chunk per read, then end of stream, the way a socket
+    /// delivers what a peer wrote in separate segments.
+    struct Chunks(std::collections::VecDeque<Vec<u8>>);
+
+    impl tokio::io::AsyncRead for Chunks {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if let Some(mut chunk) = self.0.pop_front() {
+                let n = chunk.len().min(buf.remaining());
+                buf.put_slice(&chunk[..n]);
+                if n < chunk.len() {
+                    self.0.push_front(chunk.split_off(n));
+                }
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn read_chunks(chunks: &[&[u8]]) -> Result<Multiaddr, HeaderError> {
+        let mut stream = Chunks(chunks.iter().map(|c| c.to_vec()).collect());
+        let socket: Multiaddr = "/ip4/10.0.0.1/tcp/5000".parse().unwrap();
+        futures::executor::block_on(read_header(&mut stream, socket))
+    }
+
+    #[test]
+    fn a_v1_header_split_across_reads_is_invalid() {
+        for split in 1..6 {
+            let line = b"PROXY TCP4 192.0.2.7 10.0.0.1 40000 4001\r\n";
+            let (a, b) = line.split_at(split);
+            assert_eq!(read_chunks(&[a, b]), Err(HeaderError::Invalid), "{split}");
+        }
+    }
+
+    #[test]
+    fn a_v2_header_split_across_reads_is_read() {
+        let h = header(1, 0x11, &inet_body());
+        let (a, rest) = h.split_at(3);
+        let (b, c) = rest.split_at(15);
+        assert_eq!(
+            read_chunks(&[a, b, c]).unwrap().to_string(),
+            "/ip4/192.0.2.7/tcp/40000"
+        );
+    }
+
+    #[test]
+    fn a_connection_that_is_not_proxied_is_a_missing_header() {
+        assert_eq!(
+            read_chunks(&[b"\x13/multistream/1.0.0\n"]),
+            Err(HeaderError::Missing)
+        );
+        assert_eq!(read_chunks(&[b"PR", b"OTO"]), Err(HeaderError::Missing));
+        assert_eq!(read_chunks(&[]), Err(HeaderError::Missing));
+    }
+
+    #[test]
+    fn inet_families_must_carry_a_stream_protocol() {
+        // 0x10 / 0x20: INET / INET6 with an UNSPEC protocol; 0x12 / 0x22:
+        // with DGRAM. Only STREAM (0x_1) is TCP.
+        let v6_body = [0u8; 36];
+        for (fam, body) in [
+            (0x10, &inet_body()[..]),
+            (0x12, &inet_body()[..]),
+            (0x20, &v6_body[..]),
+            (0x22, &v6_body[..]),
+        ] {
+            assert_eq!(
+                parse(&header(1, fam, body)),
+                Err(HeaderError::Invalid),
+                "{fam:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_unspec_family_refuses_dgram() {
+        assert_eq!(parse(&header(1, 0x02, &[])), Err(HeaderError::Invalid));
+        assert_eq!(parse(&header(1, 0x01, &[])), Ok(None));
     }
 }
