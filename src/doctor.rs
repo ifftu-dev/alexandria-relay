@@ -28,6 +28,7 @@ use libp2p::swarm::{dummy, SwarmEvent};
 use libp2p::{noise, relay, tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::addr::is_quic;
 use crate::config::{ProxyProtocol, ADMIN_TOKEN_MIN_LEN};
 use crate::{start, RelayConfig};
 
@@ -91,7 +92,7 @@ pub async fn run(config: RelayConfig) -> DoctorReport {
     let advertised: Vec<Multiaddr> = handle
         .external_addrs()
         .iter()
-        .filter(|a| quic || !a.iter().any(|p| matches!(p, Protocol::QuicV1)))
+        .filter(|a| quic || !is_quic(a))
         .cloned()
         .collect();
     if public_host.is_none() {

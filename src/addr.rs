@@ -15,6 +15,11 @@ pub(crate) fn extract_ip(addr: &Multiaddr) -> Option<IpAddr> {
     })
 }
 
+/// Whether `addr` is on the QUIC transport.
+pub(crate) fn is_quic(addr: &Multiaddr) -> bool {
+    addr.iter().any(|p| matches!(p, Protocol::QuicV1))
+}
+
 /// The TCP and QUIC addresses of `ip`: `/ip*/<ip>/tcp/<tcp_port>`, then
 /// `/ip*/<ip>/udp/<quic_port>/quic-v1` unless `quic_port` is `None` (QUIC
 /// off).

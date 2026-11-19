@@ -20,7 +20,7 @@ use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{identify, kad, relay, Multiaddr, PeerId, StreamProtocol, SwarmBuilder};
 use tokio::sync::{mpsc, watch, RwLock};
 
-use crate::addr::{client_bucket, extract_ip, is_globally_routable, tcp_and_quic};
+use crate::addr::{client_bucket, extract_ip, is_globally_routable, is_quic, tcp_and_quic};
 use crate::config::{Limits, RelayConfig, USERNAME_REQUEST_MAX_BYTES};
 use crate::http::RelayMetrics;
 use crate::mesh::{self, Mesh, Resolved};
@@ -311,8 +311,7 @@ fn dns_external_addrs(host: &str, tcp_port: u16, quic_port: Option<u16>) -> Vec<
 /// transport.
 fn first_port(addrs: &[Multiaddr], quic: bool) -> Option<u16> {
     addrs.iter().find_map(|a| {
-        let is_quic = a.iter().any(|p| matches!(p, Protocol::QuicV1));
-        if is_quic != quic {
+        if is_quic(a) != quic {
             return None;
         }
         a.iter().find_map(|p| match p {
@@ -682,7 +681,7 @@ impl EventLoop {
             let mut m = self.metrics.write().await;
             m.connections = connections;
             m.total_connections_served = self.total_connections_served;
-            if remote_addr.iter().any(|p| matches!(p, Protocol::QuicV1)) {
+            if is_quic(remote_addr) {
                 m.connections_established.quic += 1;
             } else {
                 m.connections_established.tcp += 1;

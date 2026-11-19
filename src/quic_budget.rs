@@ -13,13 +13,14 @@ use std::task::{Context, Poll};
 
 use libp2p::core::transport::PortUse;
 use libp2p::core::Endpoint;
-use libp2p::multiaddr::Protocol;
 use libp2p::swarm::behaviour::{ConnectionEstablished, ListenFailure};
 use libp2p::swarm::{
     dummy, ConnectionDenied, ConnectionId, FromSwarm, NetworkBehaviour, THandler, THandlerInEvent,
     THandlerOutEvent, ToSwarm,
 };
 use libp2p::{Multiaddr, PeerId};
+
+use crate::addr::is_quic;
 
 /// Why a QUIC handshake was refused before it started.
 #[derive(Debug, thiserror::Error)]
@@ -46,10 +47,6 @@ impl QuicPendingBudget {
             pending: HashSet::new(),
         }
     }
-}
-
-fn is_quic(addr: &Multiaddr) -> bool {
-    addr.iter().any(|p| matches!(p, Protocol::QuicV1))
 }
 
 impl NetworkBehaviour for QuicPendingBudget {

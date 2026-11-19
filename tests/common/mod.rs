@@ -212,8 +212,7 @@ pub async fn http_get_with(
 /// The port of the first listen address that uses `protocol`'s transport.
 pub fn port_of(addrs: &[Multiaddr], quic: bool) -> Option<u16> {
     addrs.iter().find_map(|a| {
-        let is_quic = a.iter().any(|p| matches!(p, Protocol::QuicV1));
-        if is_quic != quic {
+        if is_quic(a) != quic {
             return None;
         }
         a.iter().find_map(|p| match p {
