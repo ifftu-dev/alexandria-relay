@@ -75,6 +75,7 @@ mod http;
 mod mesh;
 pub mod probe;
 pub mod profile;
+mod proxy;
 mod rate;
 mod store;
 mod swarm;

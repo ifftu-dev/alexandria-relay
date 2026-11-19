@@ -118,9 +118,10 @@ pub(crate) async fn start_swarm(
         .as_deref()
         .is_some_and(|host| !dns_external_addrs(host, config.tcp_port, None).is_empty());
 
+    let proxy_counters = metrics.read().await.proxy_header.clone();
     let mut swarm = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
-        .with_other_transport(|key| crate::transport::build(key, config))
+        .with_other_transport(|key| crate::transport::build(key, config, proxy_counters))
         .map_err(|e| format!("transport: {e}"))?
         .with_behaviour(|key| build_behaviour(key, &limits, hide_listen_addrs))
         .map_err(|e| format!("swarm behaviour: {e}"))?
@@ -258,6 +259,13 @@ pub(crate) async fn start_swarm(
         l.max_circuits,
     );
     log::debug!("All limits: {l:?}");
+    if config.tcp_proxy_protocol == crate::config::ProxyProtocol::V2 {
+        log::info!(
+            "PROXY protocol v2 required on inbound TCP (header timeout {:?}); \
+             connections without a header are refused",
+            config.proxy_header_timeout
+        );
+    }
     if let Some(mesh) = &event_loop.mesh {
         log::info!(
             "Mesh — joining through the network profile: {} other relay(s) to dial, \

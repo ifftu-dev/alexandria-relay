@@ -21,6 +21,7 @@ use crate::config::{Limits, ADMIN_TOKEN_MIN_LEN};
 #[cfg(test)]
 use crate::config::{DEFAULT_LOOKUP_LIMIT, DEFAULT_LOOKUP_MAX_TRACKED};
 use crate::mesh::BootstrapStatus;
+use crate::proxy::ProxyCounters;
 use crate::rate::RateWindows;
 use crate::store::{StoreError, StoreHandle};
 
@@ -82,6 +83,10 @@ pub(crate) struct RelayMetrics {
     /// observer (ad-hoc dialers come and go).
     #[serde(skip)]
     pub(crate) peers_with_reservation: HashSet<PeerId>,
+    /// PROXY protocol header refusals, shared with the TCP transport and
+    /// read live. Serialized as its `proxy_header_*` counters.
+    #[serde(flatten)]
+    pub(crate) proxy_header: ProxyCounters,
     /// When the relay started; `uptime_seconds` is computed from it on read.
     #[serde(skip)]
     pub(crate) started: Option<Instant>,
@@ -206,6 +211,11 @@ impl RelayMetrics {
             let _ = writeln!(out, "# HELP relay_{name} {help}");
             let _ = writeln!(out, "# TYPE relay_{name} {kind}");
             let _ = writeln!(out, "relay_{name} {value}");
+        }
+        for (name, help, value) in self.proxy_header.counters() {
+            let _ = writeln!(out, "# HELP relay_{name}_total {help}");
+            let _ = writeln!(out, "# TYPE relay_{name}_total counter");
+            let _ = writeln!(out, "relay_{name}_total {value}");
         }
         let _ = writeln!(
             out,
@@ -427,6 +437,7 @@ pub(crate) async fn serve(
                 m.prev_minute_circuits_denied = m.circuits_denied;
                 m.prev_minute_circuits_accepted = m.circuits_accepted;
                 m.prev_minute_reservations_denied = m.reservations_denied;
+                m.proxy_header.roll_window();
             }
         });
     }
@@ -662,6 +673,10 @@ fn admin_routes(
                     }
                     if lock.listener_errors > 0 {
                         alerts.push("listener_errors_observed");
+                    }
+                    // A proxy that stops sending headers refuses every user.
+                    if lock.proxy_header.header_refusal_alert() {
+                        alerts.push("proxy_header_refusal_majority");
                     }
 
                     let level = if alerts.is_empty() { "ok" } else { "warn" };
