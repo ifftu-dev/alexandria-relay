@@ -120,6 +120,12 @@ pub const DEFAULT_HTTP_REQUEST_TIMEOUT_SECS: u64 = 15;
 /// memory or file descriptors without bound.
 pub const DEFAULT_HTTP_MAX_CONNECTIONS: usize = 256;
 
+/// How long an inbound TCP connection has to send its PROXY protocol header,
+/// in seconds, when `--tcp-proxy-protocol v2` is on. Fly's proxy writes the
+/// header as soon as it connects, so this only fires for sockets that did
+/// not come through the proxy.
+pub const DEFAULT_PROXY_HEADER_TIMEOUT_SECS: u64 = 5;
+
 /// The header the Fly proxy writes the client address into. The value
 /// `--trusted-proxy-header` takes when given without one.
 pub const FLY_CLIENT_IP_HEADER: &str = "fly-client-ip";
@@ -298,6 +304,18 @@ impl Default for QuicLimits {
     }
 }
 
+/// Whether inbound TCP connections open with a PROXY protocol header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum ProxyProtocol {
+    /// No header is read; a connection that sends one fails multistream.
+    #[default]
+    Off,
+    /// Every inbound TCP connection must open with a valid PROXY protocol
+    /// v2 header, whose source address the connection is attributed to;
+    /// any other connection is closed. Version 1 (text) is refused.
+    V2,
+}
+
 /// The single input to [`crate::start`].
 ///
 /// Not `Debug`: it carries the identity keypair and the admin token.
@@ -318,6 +336,14 @@ pub struct RelayConfig {
     /// Run QUIC alongside TCP. Off: no QUIC transport, no UDP listener and
     /// no QUIC external addresses, so Identify and reservations carry none.
     pub quic: bool,
+    /// Read a PROXY protocol header off every inbound TCP connection (see
+    /// [`ProxyProtocol`]). Turn it on only when every connection reaches the
+    /// relay through a proxy that sends one: the relay trusts the header.
+    pub tcp_proxy_protocol: ProxyProtocol,
+    /// How long an inbound TCP connection has to send its PROXY header.
+    /// Connections waiting for one are capped at
+    /// `limits.max_pending_incoming`.
+    pub proxy_header_timeout: Duration,
     /// Address the HTTP health, metrics and lookup listener binds.
     pub metrics_bind: IpAddr,
     /// HTTP listen port. `0` binds an ephemeral port.
@@ -354,6 +380,8 @@ impl Default for RelayConfig {
             tcp_port: DEFAULT_PORT,
             quic_port: DEFAULT_PORT,
             quic: true,
+            tcp_proxy_protocol: ProxyProtocol::Off,
+            proxy_header_timeout: Duration::from_secs(DEFAULT_PROXY_HEADER_TIMEOUT_SECS),
             metrics_bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             metrics_port: DEFAULT_METRICS_PORT,
             public_host: None,
@@ -422,6 +450,27 @@ pub struct Cli {
     /// does not reach the relay reliably (Fly.io)
     #[arg(long, global = true, env = "RELAY_QUIC", default_value_t = true, action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), value_name = "BOOL")]
     pub quic: bool,
+
+    /// Read a PROXY protocol header off every inbound TCP connection: `off`
+    /// or `v2`. With `v2`, each connection must open with a v2 header, whose
+    /// source address every per-IP limit, Identify and /peers then use, and
+    /// any other connection is closed. Turn it on only when every
+    /// connection comes through a proxy that sends the header (Fly.io with
+    /// `proxy_proto` v2): the relay trusts it
+    #[arg(
+        long,
+        global = true,
+        env = "RELAY_TCP_PROXY_PROTOCOL",
+        value_enum,
+        default_value = "off",
+        value_name = "MODE"
+    )]
+    pub tcp_proxy_protocol: ProxyProtocol,
+
+    /// Time an inbound TCP connection has to send its PROXY header, in
+    /// seconds
+    #[arg(long, global = true, env = "RELAY_PROXY_HEADER_TIMEOUT_SECS", default_value_t = DEFAULT_PROXY_HEADER_TIMEOUT_SECS, value_parser = clap::value_parser!(u64).range(1..))]
+    pub proxy_header_timeout_secs: u64,
 
     /// IPv4 address the libp2p TCP and QUIC listeners bind
     #[arg(long, global = true, env = "RELAY_LISTEN_IP4", default_value_t = Ipv4Addr::UNSPECIFIED)]
@@ -674,6 +723,8 @@ impl Cli {
             tcp_port: self.port,
             quic_port: self.quic_port,
             quic: self.quic,
+            tcp_proxy_protocol: self.tcp_proxy_protocol,
+            proxy_header_timeout: Duration::from_secs(self.proxy_header_timeout_secs),
             metrics_bind: self.metrics_bind,
             metrics_port: self.metrics_port,
             public_host: self.public_host,
@@ -883,6 +934,41 @@ mod tests {
     }
 
     #[test]
+    fn proxy_protocol_is_off_unless_set_to_v2() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("alexandria-relay").chain(args.iter().copied()))
+                .map(|cli| cli.into_config())
+        };
+        let config = parse(&[]).expect("no flags parse");
+        assert_eq!(config.tcp_proxy_protocol, ProxyProtocol::Off);
+        assert_eq!(config.proxy_header_timeout, Duration::from_secs(5));
+        let library = RelayConfig::default();
+        assert_eq!(library.tcp_proxy_protocol, ProxyProtocol::Off);
+        assert_eq!(library.proxy_header_timeout, Duration::from_secs(5));
+
+        let config = parse(&[
+            "--tcp-proxy-protocol",
+            "v2",
+            "--proxy-header-timeout-secs",
+            "2",
+        ])
+        .expect("flags parse");
+        assert_eq!(config.tcp_proxy_protocol, ProxyProtocol::V2);
+        assert_eq!(config.proxy_header_timeout, Duration::from_secs(2));
+        assert_eq!(
+            parse(&["doctor", "--tcp-proxy-protocol", "v2"])
+                .expect("doctor takes it")
+                .tcp_proxy_protocol,
+            ProxyProtocol::V2
+        );
+        assert!(
+            parse(&["--tcp-proxy-protocol", "v1"]).is_err(),
+            "v1 is refused"
+        );
+        assert!(parse(&["--proxy-header-timeout-secs", "0"]).is_err());
+    }
+
+    #[test]
     fn probes_own_quic_flag_is_independent_of_the_relays() {
         let probe_quic = |args: &[&str]| match Cli::try_parse_from(
             ["alexandria-relay", "probe", "--host", "relay.example.org"]
@@ -966,6 +1052,8 @@ mod tests {
             "RELAY_HEALTH_LOG_INTERVAL_SECS",
             "RELAY_METRICS_BIND",
             "RELAY_QUIC",
+            "RELAY_TCP_PROXY_PROTOCOL",
+            "RELAY_PROXY_HEADER_TIMEOUT_SECS",
             "RELAY_TRUSTED_PROXY_HEADER",
             "RELAY_HTTP_HEADER_READ_TIMEOUT_SECS",
             "RELAY_HTTP_REQUEST_TIMEOUT_SECS",

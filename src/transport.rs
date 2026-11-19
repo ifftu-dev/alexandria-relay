@@ -15,7 +15,8 @@ use libp2p::core::Transport;
 use libp2p::identity::Keypair;
 use libp2p::{noise, quic, yamux, PeerId};
 
-use crate::config::RelayConfig;
+use crate::config::{ProxyProtocol, RelayConfig};
+use crate::proxy::{Inbound, ProxyCounters, ProxyTcp};
 
 /// The transport the relay's swarm runs on.
 pub(crate) type RelayTransport = Boxed<(PeerId, StreamMuxerBox)>;
@@ -24,9 +25,14 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// The relay's transport for `config`: TCP always, QUIC when `config.quic`
 /// is on. With QUIC off, listening on or dialling a QUIC address is refused
-/// as unsupported.
-pub(crate) fn build(key: &Keypair, config: &RelayConfig) -> Result<RelayTransport, BoxError> {
-    let tcp = tcp(key)?;
+/// as unsupported. With PROXY protocol on, TCP counts its header refusals
+/// in `proxy_counters`.
+pub(crate) fn build(
+    key: &Keypair,
+    config: &RelayConfig,
+    proxy_counters: ProxyCounters,
+) -> Result<RelayTransport, BoxError> {
+    let tcp = tcp(key, config, proxy_counters)?;
     if !config.quic {
         return Ok(tcp);
     }
@@ -39,16 +45,29 @@ pub(crate) fn build(key: &Keypair, config: &RelayConfig) -> Result<RelayTranspor
 }
 
 /// TCP, upgraded with noise and yamux, as the builder's `with_tcp` would
-/// build it.
-fn tcp(key: &Keypair) -> Result<RelayTransport, BoxError> {
-    Ok(
-        libp2p::tcp::tokio::Transport::new(libp2p::tcp::Config::default())
-            .upgrade(Version::V1Lazy)
-            .authenticate(noise::Config::new(key)?)
-            .multiplex(yamux::Config::default())
-            .map(|(peer, muxer), _| (peer, StreamMuxerBox::new(muxer)))
-            .boxed(),
-    )
+/// build it, behind the PROXY protocol wrapper (a pass-through when
+/// `config.tcp_proxy_protocol` is off).
+fn tcp(
+    key: &Keypair,
+    config: &RelayConfig,
+    proxy_counters: ProxyCounters,
+) -> Result<RelayTransport, BoxError> {
+    let inbound = match config.tcp_proxy_protocol {
+        ProxyProtocol::Off => Inbound::PassThrough,
+        ProxyProtocol::V2 => Inbound::ReadV2 {
+            timeout: config.proxy_header_timeout,
+            // Sockets awaiting a header get the same ceiling as connections
+            // still in the libp2p handshake.
+            max_waiting: config.limits.max_pending_incoming as usize,
+        },
+    };
+    let inner = libp2p::tcp::tokio::Transport::new(libp2p::tcp::Config::default());
+    Ok(ProxyTcp::new(inner, inbound, proxy_counters)
+        .upgrade(Version::V1Lazy)
+        .authenticate(noise::Config::new(key)?)
+        .multiplex(yamux::Config::default())
+        .map(|(peer, muxer), _| (peer, StreamMuxerBox::new(muxer)))
+        .boxed())
 }
 
 /// The QUIC configuration: the handshake timeout and the per-stream and

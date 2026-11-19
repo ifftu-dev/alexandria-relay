@@ -11,7 +11,10 @@
 //!
 //! The dials leave from the same host, so a pass shows that the listeners,
 //! the advertised addresses and the PeerId line up. It does not prove that a
-//! firewall in front of the host lets outside clients in.
+//! firewall in front of the host lets outside clients in. With PROXY
+//! protocol on, the relay refuses TCP connections that carry no header, so
+//! the TCP dials pass only when they go through the proxy; the summary says
+//! so and points at `probe`, which checks from another machine.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -25,7 +28,7 @@ use libp2p::swarm::{dummy, SwarmEvent};
 use libp2p::{noise, relay, tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::config::ADMIN_TOKEN_MIN_LEN;
+use crate::config::{ProxyProtocol, ADMIN_TOKEN_MIN_LEN};
 use crate::{start, RelayConfig};
 
 /// How long one dial, reservation or HTTP request may take.
@@ -63,6 +66,7 @@ pub async fn run(config: RelayConfig) -> DoctorReport {
     let data_dir = config.data_dir.clone();
     let admin_token = config.admin_token.clone();
     let quic = config.quic;
+    let proxy_protocol = config.tcp_proxy_protocol;
 
     let handle = match start(config).await {
         Ok(handle) => handle,
@@ -76,7 +80,10 @@ pub async fn run(config: RelayConfig) -> DoctorReport {
     };
     let peer_id = handle.peer_id();
     lines.push(format!("PeerId: {peer_id}"));
-    lines.push(transport_line(quic));
+    lines.push(transport_line(quic, proxy_protocol));
+    if proxy_protocol == ProxyProtocol::V2 {
+        lines.push(PROXY_NOTE.to_string());
+    }
 
     // ── Advertised addresses ─────────────────────────────────────────
     let mut reachable_tcp = None;
@@ -176,10 +183,19 @@ pub async fn run(config: RelayConfig) -> DoctorReport {
 }
 
 /// The transports the relay runs, as one summary line.
-fn transport_line(quic: bool) -> String {
+fn transport_line(quic: bool, proxy_protocol: ProxyProtocol) -> String {
     let quic = if quic { "on" } else { "off" };
-    format!("Transports: TCP (PROXY protocol off), QUIC {quic}")
+    let proxy = match proxy_protocol {
+        ProxyProtocol::Off => "off",
+        ProxyProtocol::V2 => "v2",
+    };
+    format!("Transports: TCP (PROXY protocol {proxy}), QUIC {quic}")
 }
+
+/// Printed under the transport line when PROXY protocol is on.
+const PROXY_NOTE: &str = "Note: PROXY protocol is on, so the relay refuses TCP connections \
+    without a header. The TCP dials below pass only when they go through the proxy; check \
+    from another machine with `alexandria-relay probe --host <public host>`";
 
 /// `addr` with a DNS component replaced by the first address it resolves
 /// to in the matching family, the way a client without a DNS transport

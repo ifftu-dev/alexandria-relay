@@ -8,7 +8,7 @@
 
 #![allow(dead_code)] // each test binary uses a different subset
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -130,6 +130,13 @@ impl TestRelay {
             .expect("a QUIC listen address")
             .clone()
             .with(Protocol::P2p(handle.peer_id()))
+    }
+
+    /// The relay's loopback TCP listener as a socket address, for raw
+    /// sockets that speak no libp2p.
+    pub fn tcp_socket_addr(&self) -> SocketAddr {
+        let port = port_of(self.handle().listen_addrs(), false).expect("a TCP listen port");
+        SocketAddr::from((Ipv4Addr::LOCALHOST, port))
     }
 
     /// `GET path` on the relay's HTTP listener, with an optional bearer
@@ -373,6 +380,29 @@ impl TestClient {
             .expect("reservation timed out")
     }
 
+    /// Dial the relay at `relay_addr` (with its `/p2p` suffix) and wait
+    /// until the connection is established. The connection stays open while
+    /// the client lives, unless the relay closes it.
+    pub async fn connect(&mut self, relay_addr: &Multiaddr) -> Result<(), String> {
+        self.swarm
+            .dial(relay_addr.clone())
+            .map_err(|e| e.to_string())?;
+        let outcome = async {
+            loop {
+                match self.swarm.select_next_some().await {
+                    SwarmEvent::ConnectionEstablished { .. } => return Ok(()),
+                    SwarmEvent::OutgoingConnectionError { error, .. } => {
+                        return Err(error.to_string())
+                    }
+                    _ => {}
+                }
+            }
+        };
+        tokio::time::timeout(STEP_TIMEOUT, outcome)
+            .await
+            .unwrap_or_else(|_| Err("no answer in time".to_string()))
+    }
+
     /// Send a username-receipt request for `claim` to the relay at
     /// `relay_addr` (with its `/p2p` suffix) and return its response.
     pub async fn request_receipt(
@@ -453,5 +483,96 @@ pub fn signed_claim(seed: u8, username: &str, claimed_at: i64) -> UsernameClaim 
         receipt: None,
         anchor: None,
         release: None,
+    }
+}
+
+// ── PROXY protocol shim ──────────────────────────────────────────────
+
+/// The PROXY protocol v2 signature.
+const PROXY_V2_SIGNATURE: [u8; 12] = *b"\r\n\r\n\0\r\nQUIT\n";
+
+/// A v2 header with the PROXY command for a TCP stream from `src` to a
+/// placeholder destination, written out from the protocol specification
+/// rather than borrowed from the relay.
+pub fn proxy_v2_header(src: SocketAddr) -> Vec<u8> {
+    let mut body = Vec::new();
+    let family = match src {
+        SocketAddr::V4(v4) => {
+            body.extend_from_slice(&v4.ip().octets());
+            body.extend_from_slice(&[10, 0, 0, 1]);
+            0x11
+        }
+        SocketAddr::V6(v6) => {
+            body.extend_from_slice(&v6.ip().octets());
+            body.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
+            0x21
+        }
+    };
+    body.extend_from_slice(&src.port().to_be_bytes());
+    body.extend_from_slice(&4001u16.to_be_bytes());
+    proxy_v2_raw(0x21, family, &body)
+}
+
+/// A v2 header with the LOCAL command, as a proxy's health check sends.
+pub fn proxy_v2_local_header() -> Vec<u8> {
+    proxy_v2_raw(0x20, 0x00, &[])
+}
+
+/// A v2 header from its version/command byte, family/protocol byte and
+/// body.
+pub fn proxy_v2_raw(version_command: u8, family: u8, body: &[u8]) -> Vec<u8> {
+    let mut header = PROXY_V2_SIGNATURE.to_vec();
+    header.push(version_command);
+    header.push(family);
+    header.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    header.extend_from_slice(body);
+    header
+}
+
+/// A loopback TCP forwarder standing in for the proxy: it accepts, connects
+/// to the relay, writes a chosen header and then pipes bytes both ways.
+pub struct ProxyShim {
+    port: u16,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ProxyShim {
+    /// Forward to `relay`'s TCP listener, opening each connection with
+    /// `header`.
+    pub async fn start(relay: &TestRelay, header: Vec<u8>) -> Self {
+        let target = relay.tcp_socket_addr();
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind shim");
+        let port = listener.local_addr().expect("shim address").port();
+        let task = tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                let header = header.clone();
+                tokio::spawn(async move {
+                    let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await else {
+                        return;
+                    };
+                    if outbound.write_all(&header).await.is_ok() {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                });
+            }
+        });
+        ProxyShim { port, task }
+    }
+
+    /// The shim's address with the relay's `/p2p` suffix: what a client
+    /// behind the proxy dials.
+    pub fn addr(&self, relay: &TestRelay) -> Multiaddr {
+        Multiaddr::empty()
+            .with(Protocol::Ip4(Ipv4Addr::LOCALHOST))
+            .with(Protocol::Tcp(self.port))
+            .with(Protocol::P2p(relay.handle().peer_id()))
+    }
+}
+
+impl Drop for ProxyShim {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }

@@ -31,6 +31,8 @@ fn doctor(data_dir: &TempDir, extra: &[&str], admin_token: Option<&str>) -> Outp
         .env_remove("RELAY_SEED")
         .env_remove("RELAY_PUBLIC_HOST")
         .env_remove("RELAY_QUIC")
+        .env_remove("RELAY_TCP_PROXY_PROTOCOL")
+        .env_remove("RELAY_PROXY_HEADER_TIMEOUT_SECS")
         .env("RUST_LOG", "warn");
     match admin_token {
         Some(token) => cmd.env("RELAY_ADMIN_TOKEN", token),
@@ -124,4 +126,66 @@ fn doctor_with_quic_off_says_so_and_dials_tcp_only() {
     );
     assert!(summary.contains("ok    /dns4/localhost/tcp/"), "{summary}");
     assert!(!summary.contains("/udp/"), "no QUIC dial: {summary}");
+}
+
+#[test]
+fn doctor_with_proxy_protocol_on_says_its_dials_need_the_proxy() {
+    let dir = TempDir::new();
+    let output = doctor(
+        &dir,
+        &[
+            "--public-host",
+            "localhost",
+            "--quic",
+            "false",
+            "--tcp-proxy-protocol",
+            "v2",
+            "--proxy-header-timeout-secs",
+            "1",
+        ],
+        None,
+    );
+    let summary = stdout(&output);
+    assert!(
+        summary.contains("Transports: TCP (PROXY protocol v2), QUIC off"),
+        "{summary}"
+    );
+    // Its own dials send no header, so they are refused; the note says why
+    // and points at `probe`.
+    assert!(
+        summary.contains("pass only when they go through the proxy"),
+        "{summary}"
+    );
+    assert!(summary.contains("alexandria-relay probe"), "{summary}");
+    assert!(summary.contains("FAIL  /dns4/localhost/tcp/"), "{summary}");
+    assert!(!output.status.success(), "{summary}");
+}
+
+#[test]
+fn doctor_with_both_transports_and_proxy_protocol_on_lists_both() {
+    let dir = TempDir::new();
+    let output = doctor(
+        &dir,
+        &[
+            "--public-host",
+            "localhost",
+            "--tcp-proxy-protocol",
+            "v2",
+            "--proxy-header-timeout-secs",
+            "1",
+        ],
+        None,
+    );
+    let summary = stdout(&output);
+    assert!(
+        summary.contains("Transports: TCP (PROXY protocol v2), QUIC on"),
+        "{summary}"
+    );
+    // QUIC carries no header, so its dial still answers.
+    assert!(summary.contains("ok    /dns4/localhost/udp/"), "{summary}");
+    assert!(summary.contains("FAIL  /dns4/localhost/tcp/"), "{summary}");
+    assert!(
+        summary.contains("pass only when they go through the proxy"),
+        "{summary}"
+    );
 }
