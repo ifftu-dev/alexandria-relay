@@ -1,6 +1,6 @@
 # CI deploy chain, Fly configs, staging
 
-Triage: ready-for-agent
+Triage: done
 Updated: 2026-11-19
 Repos: alexandria-relay
 Part of: alexandria-relay/docs/relay-transports-spec.md
@@ -19,3 +19,23 @@ parts of "Staging rehearsal". User stories 34–40, 43–45, 49.
 3. `fly.toml`, `fly-eu.toml` changes; new `fly-staging.toml`.
 4. The workflow cannot run here; validate YAML syntax (actionlint if
    available) and keep existing jobs' behaviour for tags unchanged.
+
+## Notes
+
+2026-11-19: Done. The deploy, probe and staging steps live once in a
+reusable workflow, `.github/workflows/fly-deploy.yml`, which `ci.yml` calls
+as `deploy-frankfurt`, then `deploy-singapore` (needs Frankfurt), and
+`staging`. The probe host is `<app>.fly.dev` from the Fly config's `app`
+line; production pins the PeerId with the profile fetched from the app
+repository's default branch (raw `HEAD` URL), staging with
+`vars.STAGING_RELAY_PEER_ID`, checked before anything changes on Fly. The
+image is pulled after the registry login and the probe step runs it with
+`--pull never` and no secrets in its environment. Choices the spec left open:
+`probe --help` runs in its own job on pre-release tags and on manual
+`target: none` runs, where nothing deploys; a `staging_quic` run deploys with
+`flyctl deploy --env RELAY_QUIC=true` and records how many of five 30 s QUIC
+probes passed in the job summary, without failing; staging runs in `fra` on
+production's machine size. Validated with actionlint (with shellcheck) and
+`flyctl config validate --strict` on all three Fly configs; the profile fetch
+and the probe command were run locally against the Frankfurt relay and
+passed.

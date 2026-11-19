@@ -9,6 +9,11 @@ primary_region = "sin"  # Singapore — the nearest Fly region to India
 [env]
   RUST_LOG = "info"
   RELAY_DATA_DIR = "/data"
+  # Fly's proxy opens every TCP connection with a PROXY v2 header (the
+  # 4001/tcp service below); the relay reads the client address from it.
+  RELAY_TCP_PROXY_PROTOCOL = "v2"
+  # QUIC does not work through Fly: no UDP listener, no QUIC addresses.
+  RELAY_QUIC = "false"
 
 # NOTE: no [mounts]. The app started in bom (Mumbai), which refused volume
 # creation; Fly has since retired bom and the machine now runs in sin. This
@@ -16,7 +21,15 @@ primary_region = "sin"  # Singapore — the nearest Fly region to India
 # persistent region.
 # Issued receipts stay valid regardless (signature-based) — only the
 # local refusal history resets on restart.
-# TCP port for libp2p
+
+# TCP port for libp2p, behind Fly's proxy with a PROXY protocol v2 header.
+# The `proxy_proto` handler and RELAY_TCP_PROXY_PROTOCOL must agree: either
+# one alone refuses every TCP connection. This file and the image deploy
+# together; a rollback redeploys the previous image with the previous
+# commit's copy of this file, never the image alone.
+#
+# No UDP service: QUIC is off (RELAY_QUIC). The app's dedicated IPv4 address
+# stays allocated; the network profile's fallback addresses point at it.
 [[services]]
   internal_port = 4001
   protocol = "tcp"
@@ -25,18 +38,8 @@ primary_region = "sin"  # Singapore — the nearest Fly region to India
 
   [[services.ports]]
     port = 4001
-    handlers = []
-
-# UDP port for QUIC
-[[services]]
-  internal_port = 4001
-  protocol = "udp"
-  auto_stop_machines = false
-  auto_start_machines = true
-
-  [[services.ports]]
-    port = 4001
-    handlers = []
+    handlers = ["proxy_proto"]
+    proxy_proto_options = { version = "v2" }
 
 # HTTP port for health checks and metrics.
 #
