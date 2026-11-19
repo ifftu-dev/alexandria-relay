@@ -94,10 +94,12 @@ A tag with a pre-release suffix (`v1.2.3-rc.1`) publishes the image without
 `latest`, marks the release as a pre-release and does not deploy; it runs
 `probe --help` from the published image instead. Use one to dry-run a
 release. A manual run (**Run workflow**) publishes only the `sha-<commit>`
-image and keeps the binaries as workflow artifacts (on a branch; run on a
-tag it also uploads them to that tag's release). Its `target` picks what it
-deploys: `staging` (the default, `fly-staging.toml`, with an optional
-`staging_quic` check), `production` (both regions) or `none`.
+image and keeps the binaries as workflow artifacts; only a tag push uploads
+to a release. Its `target` picks what it deploys: `staging` (the default,
+`fly-staging.toml`, with an optional `staging_quic` check), `production`
+(both regions) or `none`. With `target: staging`, an `image` input (this
+repository's image by digest or tag) skips the build and deploys that
+published image instead.
 
 Each deploy (`.github/workflows/fly-deploy.yml`) copies the published image
 into the app's Fly registry and deploys it with that commit's Fly config,
