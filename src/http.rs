@@ -232,14 +232,10 @@ impl RelayMetrics {
             .map(|c| (c, "counter"))
             .chain(gauges.iter().map(|g| (g, "gauge")));
         for ((name, help, value), kind) in kinds {
-            let _ = writeln!(out, "# HELP relay_{name} {help}");
-            let _ = writeln!(out, "# TYPE relay_{name} {kind}");
-            let _ = writeln!(out, "relay_{name} {value}");
+            write_sample(&mut out, name, help, kind, *value);
         }
         for (name, help, value) in self.proxy_header.counters() {
-            let _ = writeln!(out, "# HELP relay_{name}_total {help}");
-            let _ = writeln!(out, "# TYPE relay_{name}_total counter");
-            let _ = writeln!(out, "relay_{name}_total {value}");
+            write_sample(&mut out, &format!("{name}_total"), help, "counter", value);
         }
         let _ = writeln!(
             out,
@@ -295,11 +291,24 @@ impl RelayMetrics {
             ),
         ];
         for (name, help, kind, value) in samples {
-            let _ = writeln!(out, "# HELP relay_{name} {help}");
-            let _ = writeln!(out, "# TYPE relay_{name} {kind}");
-            let _ = writeln!(out, "relay_{name} {value}");
+            write_sample(out, name, help, kind, value);
         }
     }
+}
+
+/// One unlabelled Prometheus sample `relay_{name}` with its HELP and TYPE
+/// lines.
+fn write_sample(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    kind: &str,
+    value: impl std::fmt::Display,
+) {
+    use std::fmt::Write;
+    let _ = writeln!(out, "# HELP relay_{name} {help}");
+    let _ = writeln!(out, "# TYPE relay_{name} {kind}");
+    let _ = writeln!(out, "relay_{name} {value}");
 }
 
 /// Content type of [`RelayMetrics::prometheus`].
