@@ -1,9 +1,12 @@
 # Relay transports on Fly: real client addresses, honest QUIC
 
-Status: draft
+Status: active
 Updated: 2026-11-19
 Triage: ready-for-agent
 Repos: alexandria-relay
+
+Work is split into numbered sub-tickets under `docs/relay-transports/`; each
+carries `Part of:` pointing here.
 
 Follows the [relay hardening spec](relay-hardening-spec.md), whose findings
 on proxy addresses and QUIC on Fly were stated as probable. A 2026-11
