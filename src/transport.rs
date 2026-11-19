@@ -51,7 +51,57 @@ fn tcp(key: &Keypair) -> Result<RelayTransport, BoxError> {
     )
 }
 
-/// The QUIC configuration: libp2p's defaults for now.
-fn quic_config(key: &Keypair, _config: &RelayConfig) -> quic::Config {
-    quic::Config::new(key)
+/// The QUIC configuration: the handshake timeout and the per-stream and
+/// per-connection receive windows from [`crate::config::QuicLimits`]; idle
+/// timeout, keep-alive, path MTU discovery and stream limits stay at
+/// libp2p's defaults. The pending-handshake budget is not a transport
+/// setting: [`crate::quic_budget`] enforces it in the swarm.
+fn quic_config(key: &Keypair, config: &RelayConfig) -> quic::Config {
+    let limits = &config.limits.quic;
+    let mut quic = quic::Config::new(key);
+    quic.handshake_timeout = limits.handshake_timeout;
+    quic.max_stream_data = limits.max_stream_data;
+    quic.max_connection_data = limits.max_connection_data;
+    quic
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::config::QuicLimits;
+
+    #[test]
+    fn the_quic_config_takes_its_windows_and_timeout_from_the_settings() {
+        let key = Keypair::generate_ed25519();
+        let mut config = RelayConfig::default();
+        config.limits.quic = QuicLimits {
+            max_pending_incoming: 64,
+            max_stream_data: 1_000,
+            max_connection_data: 2_000,
+            handshake_timeout: Duration::from_secs(7),
+        };
+        let quic = quic_config(&key, &config);
+        assert_eq!(quic.max_stream_data, 1_000);
+        assert_eq!(quic.max_connection_data, 2_000);
+        assert_eq!(quic.handshake_timeout, Duration::from_secs(7));
+    }
+
+    #[test]
+    fn the_default_quic_windows_are_far_below_quinns() {
+        let key = Keypair::generate_ed25519();
+        let quic = quic_config(&key, &RelayConfig::default());
+        assert_eq!(quic.max_stream_data, 262_144);
+        assert_eq!(quic.max_connection_data, 524_288);
+        assert_eq!(quic.handshake_timeout, Duration::from_secs(5));
+        // Everything else stays at libp2p's defaults.
+        let libp2p = quic::Config::new(&key);
+        assert_eq!(quic.max_idle_timeout, libp2p.max_idle_timeout);
+        assert_eq!(quic.keep_alive_interval, libp2p.keep_alive_interval);
+        assert_eq!(
+            quic.max_concurrent_stream_limit,
+            libp2p.max_concurrent_stream_limit
+        );
+    }
 }

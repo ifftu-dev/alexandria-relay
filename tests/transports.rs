@@ -1,9 +1,10 @@
 //! Which transports the relay runs and which addresses it hands out, as a
-//! client sees them: listen addresses, Identify, reservations.
+//! client sees them: listen addresses, Identify, reservations, and the
+//! per-transport counters an operator reads.
 
 mod common;
 
-use common::{identify_relay, is_quic, TestClient, TestRelay};
+use common::{http_get_with, identify_relay, is_quic, TestClient, TestRelay, ADMIN_TOKEN};
 use libp2p::multiaddr::Protocol;
 
 /// A loopback UDP port that is free right now.
@@ -110,5 +111,68 @@ async fn with_quic_on_the_relay_listens_and_advertises_quic() {
         "{:?}",
         info.listen_addrs
     );
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_reserves_over_quic_with_the_smaller_windows_and_is_counted_under_quic() {
+    let relay = TestRelay::start_with(|c| {
+        c.admin_token = Some(ADMIN_TOKEN.to_string());
+        c.public_host = Some("localhost".to_string());
+        c.limits.quic.max_stream_data = 64 * 1024;
+        c.limits.quic.max_connection_data = 128 * 1024;
+    })
+    .await;
+
+    let relayed = TestClient::with_quic()
+        .reserve(&relay.quic_addr())
+        .await
+        .expect("reservation over QUIC");
+    assert!(!relayed.is_empty());
+
+    let (status, body) = relay.get("/metrics", Some(ADMIN_TOKEN)).await;
+    assert_eq!(status, 200, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("JSON metrics");
+    assert_eq!(json["connections_established"]["quic"], 1, "{body}");
+    assert_eq!(json["connections_established"]["tcp"], 0, "{body}");
+    assert_eq!(json["quic_pending_denied"], 0, "{body}");
+
+    let accept = [("Accept", "text/plain")];
+    let (status, _, body) = http_get_with(
+        relay.handle().http_addr(),
+        "/metrics",
+        Some(ADMIN_TOKEN),
+        &accept,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        body.contains("relay_connections_established_total{transport=\"quic\"} 1"),
+        "{body}"
+    );
+    assert!(
+        body.contains("relay_connections_established_total{transport=\"tcp\"} 0"),
+        "{body}"
+    );
+    assert!(body.contains("relay_quic_pending_denied_total 0"), "{body}");
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tcp_connection_is_counted_under_tcp() {
+    let relay = TestRelay::start_with(|c| {
+        c.admin_token = Some(ADMIN_TOKEN.to_string());
+        c.public_host = Some("localhost".to_string());
+    })
+    .await;
+    TestClient::new()
+        .reserve(&relay.tcp_addr())
+        .await
+        .expect("reservation over TCP");
+    let (status, body) = relay.get("/metrics", Some(ADMIN_TOKEN)).await;
+    assert_eq!(status, 200, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("JSON metrics");
+    assert_eq!(json["connections_established"]["tcp"], 1, "{body}");
+    assert_eq!(json["connections_established"]["quic"], 0, "{body}");
     relay.stop().await;
 }

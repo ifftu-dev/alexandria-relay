@@ -25,6 +25,7 @@ use crate::config::{Limits, RelayConfig, USERNAME_REQUEST_MAX_BYTES};
 use crate::http::RelayMetrics;
 use crate::mesh::{self, Mesh, Resolved};
 use crate::profile::NetworkProfile;
+use crate::quic_budget::{QuicBudgetExceeded, QuicPendingBudget};
 use crate::rate::RateWindows;
 use crate::store::{MirroredRecord, StoreHandle, MIRROR_PRUNE_INTERVAL};
 use crate::username_reg::{self, ReceiptRequest, ReceiptResponse};
@@ -68,13 +69,18 @@ type RelaySwarm = libp2p::Swarm<RelayBehaviour>;
 
 // ── Network Behaviour ────────────────────────────────────────────────
 
-/// Composed behaviour: relay server + Kademlia + identify + username-reg receipts.
+/// Composed behaviour: connection gating (the QUIC pending budget and the
+/// shared connection limits) + relay server + Kademlia + identify +
+/// username-reg receipts.
 ///
 /// Intentionally minimal — the relay does NOT run GossipSub, AutoNAT,
 /// or DCUtR. It only needs enough to bootstrap peers into the DHT
 /// and relay traffic for NATted peers.
 #[derive(NetworkBehaviour)]
 pub(crate) struct RelayBehaviour {
+    /// QUIC's own pending-handshake budget. First, so a QUIC handshake it
+    /// refuses never takes one of the pending slots shared with TCP.
+    quic_budget: QuicPendingBudget,
     connection_limits: libp2p_connection_limits::Behaviour,
     relay: relay::Behaviour,
     kademlia: kad::Behaviour<MemoryStore>,
@@ -637,6 +643,12 @@ impl EventLoop {
             } => {
                 log::warn!("Listener {listener_id:?} closed: {reason:?}");
             }
+            SwarmEvent::IncomingConnectionError {
+                error: libp2p::swarm::ListenError::Denied { cause },
+                ..
+            } if cause.downcast_ref::<QuicBudgetExceeded>().is_some() => {
+                self.metrics.write().await.quic_pending_denied += 1;
+            }
             _ => {}
         }
     }
@@ -661,6 +673,11 @@ impl EventLoop {
             let mut m = self.metrics.write().await;
             m.connections = connections;
             m.total_connections_served = self.total_connections_served;
+            if remote_addr.iter().any(|p| matches!(p, Protocol::QuicV1)) {
+                m.connections_established.quic += 1;
+            } else {
+                m.connections_established.tcp += 1;
+            }
             if let Some(ip) = bucket {
                 m.peer_source_ips.insert(pid, ip);
             }
@@ -1093,6 +1110,7 @@ fn build_behaviour(
     );
 
     Ok(RelayBehaviour {
+        quic_budget: QuicPendingBudget::new(limits.quic.max_pending_incoming),
         connection_limits,
         relay,
         kademlia,

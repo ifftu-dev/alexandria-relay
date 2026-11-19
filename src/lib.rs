@@ -75,6 +75,7 @@ mod http;
 mod mesh;
 pub mod probe;
 pub mod profile;
+mod quic_budget;
 mod rate;
 mod store;
 mod swarm;

@@ -47,6 +47,28 @@ pub const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 32;
 /// holds handshake state with no ceiling at all.
 pub const DEFAULT_MAX_PENDING_INCOMING: u32 = 256;
 
+/// Maximum incoming QUIC connections still in the handshake, a budget of
+/// their own below [`DEFAULT_MAX_PENDING_INCOMING`].
+///
+/// QUIC runs over UDP, whose source addresses are spoofable, so a QUIC
+/// handshake flood is cheap. Its own budget keeps it from using up the
+/// pending slots TCP needs.
+pub const DEFAULT_QUIC_MAX_PENDING_INCOMING: u32 = 64;
+
+/// QUIC receive window per stream, in bytes (quinn's default is 10 MB).
+///
+/// A relayed circuit is one stream, so this caps a circuit's QUIC throughput
+/// near 256 KiB per round trip, which is plenty for relayed traffic.
+pub const DEFAULT_QUIC_MAX_STREAM_DATA: u32 = 256 * 1024;
+
+/// QUIC receive window per connection, in bytes (quinn's default is 15 MB).
+/// At [`DEFAULT_MAX_CONNECTIONS`] that bounds receive buffers at 512 MiB.
+pub const DEFAULT_QUIC_MAX_CONNECTION_DATA: u32 = 512 * 1024;
+
+/// How long a QUIC handshake may take, in seconds (libp2p's default).
+/// Shorter values hurt lossy mobile links.
+pub const DEFAULT_QUIC_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
+
 /// Maximum new connections from a single IP per rate window.
 pub const DEFAULT_MAX_NEW_CONNECTIONS_PER_IP: usize = 32;
 
@@ -188,6 +210,8 @@ pub struct Limits {
     pub max_new_connections_per_ip: usize,
     pub ip_rate_window: Duration,
     pub idle_timeout: Duration,
+    /// QUIC's own handshake budget, timeout and flow-control windows.
+    pub quic: QuicLimits,
     pub kad_query_timeout: Duration,
     pub kad_replication_factor: NonZeroUsize,
     pub kad_max_records: usize,
@@ -221,6 +245,7 @@ impl Default for Limits {
             max_new_connections_per_ip: DEFAULT_MAX_NEW_CONNECTIONS_PER_IP,
             ip_rate_window: Duration::from_secs(DEFAULT_IP_RATE_WINDOW_SECS),
             idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
+            quic: QuicLimits::default(),
             kad_query_timeout: Duration::from_secs(DEFAULT_KAD_QUERY_TIMEOUT_SECS),
             kad_replication_factor: NonZeroUsize::new(DEFAULT_KAD_REPLICATION_FACTOR)
                 .expect("non-zero default"),
@@ -243,6 +268,32 @@ impl Default for Limits {
             http_request_timeout: Duration::from_secs(DEFAULT_HTTP_REQUEST_TIMEOUT_SECS),
             http_max_connections: DEFAULT_HTTP_MAX_CONNECTIONS,
             health_log_interval: Duration::from_secs(DEFAULT_HEALTH_LOG_INTERVAL_SECS),
+        }
+    }
+}
+
+/// The limits that apply to QUIC alone. They have no effect with QUIC off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuicLimits {
+    /// Incoming QUIC connections that may be in the handshake at once;
+    /// further ones are refused until a slot frees. Counted apart from, and
+    /// also within, [`Limits::max_pending_incoming`].
+    pub max_pending_incoming: u32,
+    /// Receive window per stream, in bytes.
+    pub max_stream_data: u32,
+    /// Receive window per connection, in bytes.
+    pub max_connection_data: u32,
+    /// How long a QUIC handshake may take.
+    pub handshake_timeout: Duration,
+}
+
+impl Default for QuicLimits {
+    fn default() -> Self {
+        QuicLimits {
+            max_pending_incoming: DEFAULT_QUIC_MAX_PENDING_INCOMING,
+            max_stream_data: DEFAULT_QUIC_MAX_STREAM_DATA,
+            max_connection_data: DEFAULT_QUIC_MAX_CONNECTION_DATA,
+            handshake_timeout: Duration::from_secs(DEFAULT_QUIC_HANDSHAKE_TIMEOUT_SECS),
         }
     }
 }
@@ -478,6 +529,23 @@ pub struct Cli {
     #[arg(long, global = true, env = "RELAY_MAX_IDENTIFY_ADDRS", default_value_t = DEFAULT_MAX_IDENTIFY_ADDRS, help_heading = "Connection limits")]
     pub max_identify_addrs: usize,
 
+    /// Maximum incoming QUIC connections still in the handshake, a budget
+    /// of their own within --max-pending-incoming
+    #[arg(long, global = true, env = "RELAY_QUIC_MAX_PENDING_INCOMING", default_value_t = DEFAULT_QUIC_MAX_PENDING_INCOMING, value_parser = clap::value_parser!(u32).range(1..), help_heading = "QUIC limits")]
+    pub quic_max_pending_incoming: u32,
+
+    /// QUIC receive window per stream, in bytes
+    #[arg(long, global = true, env = "RELAY_QUIC_MAX_STREAM_DATA", default_value_t = DEFAULT_QUIC_MAX_STREAM_DATA, value_parser = clap::value_parser!(u32).range(1..), help_heading = "QUIC limits")]
+    pub quic_max_stream_data: u32,
+
+    /// QUIC receive window per connection, in bytes
+    #[arg(long, global = true, env = "RELAY_QUIC_MAX_CONNECTION_DATA", default_value_t = DEFAULT_QUIC_MAX_CONNECTION_DATA, value_parser = clap::value_parser!(u32).range(1..), help_heading = "QUIC limits")]
+    pub quic_max_connection_data: u32,
+
+    /// How long a QUIC handshake may take, in seconds
+    #[arg(long, global = true, env = "RELAY_QUIC_HANDSHAKE_TIMEOUT_SECS", default_value_t = DEFAULT_QUIC_HANDSHAKE_TIMEOUT_SECS, value_parser = clap::value_parser!(u64).range(1..), help_heading = "QUIC limits")]
+    pub quic_handshake_timeout_secs: u64,
+
     /// Kademlia query timeout, in seconds
     #[arg(long, global = true, env = "RELAY_KAD_QUERY_TIMEOUT_SECS", default_value_t = DEFAULT_KAD_QUERY_TIMEOUT_SECS, value_parser = clap::value_parser!(u64).range(1..), help_heading = "DHT limits")]
     pub kad_query_timeout_secs: u64,
@@ -622,6 +690,12 @@ impl Cli {
                 max_new_connections_per_ip: self.max_new_connections_per_ip,
                 ip_rate_window: Duration::from_secs(self.ip_rate_window_secs),
                 idle_timeout: Duration::from_secs(self.idle_timeout_secs),
+                quic: QuicLimits {
+                    max_pending_incoming: self.quic_max_pending_incoming,
+                    max_stream_data: self.quic_max_stream_data,
+                    max_connection_data: self.quic_max_connection_data,
+                    handshake_timeout: Duration::from_secs(self.quic_handshake_timeout_secs),
+                },
                 kad_query_timeout: Duration::from_secs(self.kad_query_timeout_secs),
                 kad_replication_factor: self.kad_replication_factor,
                 kad_max_records: self.kad_max_records,
@@ -704,6 +778,12 @@ mod tests {
                 max_new_connections_per_ip: 32,
                 ip_rate_window: secs(60),
                 idle_timeout: secs(600),
+                quic: QuicLimits {
+                    max_pending_incoming: 64,
+                    max_stream_data: 262_144,
+                    max_connection_data: 524_288,
+                    handshake_timeout: secs(5),
+                },
                 kad_query_timeout: secs(60),
                 kad_replication_factor: NonZeroUsize::new(20).unwrap(),
                 kad_max_records: 16_384,
@@ -817,6 +897,50 @@ mod tests {
         };
         assert!(!probe_quic(&[]), "probe skips QUIC unless asked");
         assert!(probe_quic(&["--quic"]));
+    }
+
+    #[test]
+    fn quic_protections_have_their_own_defaults_and_flags() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("alexandria-relay").chain(args.iter().copied()))
+                .map(|cli| cli.into_config().limits.quic)
+        };
+        let expected = QuicLimits {
+            max_pending_incoming: 64,
+            max_stream_data: 256 * 1024,
+            max_connection_data: 512 * 1024,
+            handshake_timeout: Duration::from_secs(5),
+        };
+        assert_eq!(parse(&[]).expect("no flags parse"), expected);
+        assert_eq!(Limits::default().quic, expected, "the library agrees");
+        assert_eq!(
+            parse(&[
+                "--quic-max-pending-incoming",
+                "8",
+                "--quic-max-stream-data",
+                "65536",
+                "--quic-max-connection-data",
+                "131072",
+                "--quic-handshake-timeout-secs",
+                "10",
+            ])
+            .expect("flags parse"),
+            QuicLimits {
+                max_pending_incoming: 8,
+                max_stream_data: 65_536,
+                max_connection_data: 131_072,
+                handshake_timeout: Duration::from_secs(10),
+            }
+        );
+        // Zero would refuse every QUIC handshake or stall every stream.
+        for flag in [
+            "--quic-max-pending-incoming",
+            "--quic-max-stream-data",
+            "--quic-max-connection-data",
+            "--quic-handshake-timeout-secs",
+        ] {
+            assert!(parse(&[flag, "0"]).is_err(), "{flag} 0 is refused");
+        }
     }
 
     #[test]

@@ -120,6 +120,18 @@ impl TestRelay {
             .with(Protocol::P2p(handle.peer_id()))
     }
 
+    /// The relay's loopback QUIC address, with its `/p2p` suffix.
+    pub fn quic_addr(&self) -> Multiaddr {
+        let handle = self.handle();
+        handle
+            .listen_addrs()
+            .iter()
+            .find(|a| is_quic(a))
+            .expect("a QUIC listen address")
+            .clone()
+            .with(Protocol::P2p(handle.peer_id()))
+    }
+
     /// `GET path` on the relay's HTTP listener, with an optional bearer
     /// token. Returns the status code and body.
     pub async fn get(&self, path: &str, bearer: Option<&str>) -> (u16, String) {
@@ -256,6 +268,21 @@ pub struct ClientBehaviour {
     username_reg: request_response::cbor::Behaviour<ReceiptRequest, ReceiptResponse>,
 }
 
+impl ClientBehaviour {
+    fn new(relay_client: relay::client::Behaviour) -> Self {
+        ClientBehaviour {
+            relay_client,
+            username_reg: request_response::cbor::Behaviour::new(
+                [(
+                    StreamProtocol::new(username_reg::PROTOCOL),
+                    ProtocolSupport::Outbound,
+                )],
+                request_response::Config::default(),
+            ),
+        }
+    }
+}
+
 /// A second libp2p swarm in the same process, acting as an app node.
 pub struct TestClient {
     swarm: Swarm<ClientBehaviour>,
@@ -273,16 +300,27 @@ impl TestClient {
             .expect("client TCP transport")
             .with_relay_client(noise::Config::new, yamux::Config::default)
             .expect("client relay transport")
-            .with_behaviour(|_, relay_client| ClientBehaviour {
-                relay_client,
-                username_reg: request_response::cbor::Behaviour::new(
-                    [(
-                        StreamProtocol::new(username_reg::PROTOCOL),
-                        ProtocolSupport::Outbound,
-                    )],
-                    request_response::Config::default(),
-                ),
-            })
+            .with_behaviour(|_, relay_client| ClientBehaviour::new(relay_client))
+            .expect("client behaviour")
+            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+            .build();
+        TestClient { swarm }
+    }
+
+    /// A client that also speaks QUIC, for dialling the relay's QUIC address.
+    pub fn with_quic() -> Self {
+        let swarm = SwarmBuilder::with_new_identity()
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                noise::Config::new,
+                yamux::Config::default,
+            )
+            .expect("client TCP transport")
+            .with_quic()
+            .with_relay_client(noise::Config::new, yamux::Config::default)
+            .expect("client relay transport")
+            .with_behaviour(|_, relay_client| ClientBehaviour::new(relay_client))
             .expect("client behaviour")
             .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
             .build();
