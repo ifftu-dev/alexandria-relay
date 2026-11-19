@@ -184,11 +184,7 @@ pub async fn run(config: RelayConfig) -> DoctorReport {
 /// The transports the relay runs, as one summary line.
 fn transport_line(quic: bool, proxy_protocol: ProxyProtocol) -> String {
     let quic = if quic { "on" } else { "off" };
-    let proxy = match proxy_protocol {
-        ProxyProtocol::Off => "off",
-        ProxyProtocol::V2 => "v2",
-    };
-    format!("Transports: TCP (PROXY protocol {proxy}), QUIC {quic}")
+    format!("Transports: TCP (PROXY protocol {proxy_protocol}), QUIC {quic}")
 }
 
 /// Printed under the transport line when PROXY protocol is on.

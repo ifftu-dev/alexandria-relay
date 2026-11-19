@@ -316,6 +316,16 @@ pub enum ProxyProtocol {
     V2,
 }
 
+/// The flag's value: `off` or `v2`.
+impl std::fmt::Display for ProxyProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ProxyProtocol::Off => "off",
+            ProxyProtocol::V2 => "v2",
+        })
+    }
+}
+
 /// The single input to [`crate::start`].
 ///
 /// Not `Debug`: it carries the identity keypair and the admin token.
@@ -916,6 +926,15 @@ mod tests {
         assert_eq!(config.metrics_bind, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(config.limits.max_circuits_per_peer, 256);
         assert_eq!(config.limits.receipt_window, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn proxy_protocol_displays_as_its_flag_value() {
+        use clap::ValueEnum;
+        for mode in [ProxyProtocol::Off, ProxyProtocol::V2] {
+            let flag = mode.to_possible_value().unwrap();
+            assert_eq!(mode.to_string(), flag.get_name());
+        }
     }
 
     #[test]
