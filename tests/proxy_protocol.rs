@@ -29,15 +29,29 @@ fn behind_proxy(c: &mut RelayConfig) {
     c.tcp_proxy_protocol = ProxyProtocol::V2;
 }
 
-/// The `/peers` entries as `(source_prefix)` strings.
-async fn peer_prefixes(relay: &TestRelay) -> Vec<String> {
-    let (status, body) = relay.get("/peers", Some(ADMIN_TOKEN)).await;
-    assert_eq!(status, 200, "{body}");
-    let entries: Vec<serde_json::Value> = serde_json::from_str(&body).expect("JSON peers");
-    entries
-        .iter()
-        .map(|e| e["source_prefix"].as_str().expect("prefix").to_string())
-        .collect()
+/// Wait until the `/peers` entries' `source_prefix`es, sorted, are
+/// `expected`. A client's connect returns once its side is up, which can be
+/// before the relay's event loop has recorded the connection.
+async fn wait_for_prefixes(relay: &TestRelay, expected: &[&str]) {
+    let deadline = Instant::now() + STEP_TIMEOUT;
+    loop {
+        let (status, body) = relay.get("/peers", Some(ADMIN_TOKEN)).await;
+        assert_eq!(status, 200, "{body}");
+        let entries: Vec<serde_json::Value> = serde_json::from_str(&body).expect("JSON peers");
+        let mut prefixes: Vec<String> = entries
+            .iter()
+            .map(|e| e["source_prefix"].as_str().expect("prefix").to_string())
+            .collect();
+        prefixes.sort();
+        if prefixes == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "/peers prefixes are {prefixes:?}, expected {expected:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -50,10 +64,7 @@ async fn a_client_behind_the_proxy_is_attributed_to_the_header_source() {
         .reserve(&shim.addr(&relay))
         .await
         .expect("reservation through the proxy");
-    assert_eq!(
-        peer_prefixes(&relay).await,
-        vec!["192.0.2.0/24".to_string()]
-    );
+    wait_for_prefixes(&relay, &["192.0.2.0/24"]).await;
 
     let info = identify_relay(&shim.addr(&relay)).await;
     let expected: Multiaddr = "/ip4/192.0.2.7/tcp/40000".parse().unwrap();
@@ -72,10 +83,7 @@ async fn an_ipv6_source_is_attributed_to_its_64() {
 
     let mut holder = TestClient::new();
     holder.connect(&shim.addr(&relay)).await.expect("connect");
-    assert_eq!(
-        peer_prefixes(&relay).await,
-        vec!["2001:db8:1::/48".to_string()]
-    );
+    wait_for_prefixes(&relay, &["2001:db8:1::/48"]).await;
     relay.stop().await;
 }
 
@@ -100,9 +108,7 @@ async fn the_per_ip_cap_counts_the_header_address() {
         .connect(&b.addr(&relay))
         .await
         .expect("second source");
-    let mut prefixes = peer_prefixes(&relay).await;
-    prefixes.sort();
-    assert_eq!(prefixes, ["192.0.2.0/24", "198.51.100.0/24"]);
+    wait_for_prefixes(&relay, &["192.0.2.0/24", "198.51.100.0/24"]).await;
     assert_eq!(metric(&relay, "ip_rate_limited").await, 0);
 
     // A second client from the first source goes over the cap of one,
@@ -177,10 +183,7 @@ async fn a_local_header_is_attributed_to_the_socket_address() {
         .connect(&shim.addr(&relay))
         .await
         .expect("LOCAL accepted");
-    assert_eq!(
-        peer_prefixes(&relay).await,
-        vec!["127.0.0.0/24".to_string()]
-    );
+    wait_for_prefixes(&relay, &["127.0.0.0/24"]).await;
     relay.stop().await;
 }
 
