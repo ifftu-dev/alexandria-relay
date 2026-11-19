@@ -33,8 +33,8 @@ use crate::swarm::IDENTIFY_PROTOCOL_VERSION;
 /// Pause between attempts on one transport.
 const RETRY_PAUSE: Duration = Duration::from_secs(1);
 
-/// `probe` flags. `--port` and `--network-profile` shadow the relay's global
-/// flags of the same name; [`crate::Cli::parse_args`] keeps the relay's
+/// `probe` flags. `--port`, `--network-profile` and `--quic` shadow the
+/// relay's global flags of the same name; [`crate::Cli::parse_args`] keeps the relay's
 /// variables out of them.
 #[derive(clap::Args, Debug, Clone, PartialEq, Eq)]
 #[command(next_help_heading = "Probe")]
@@ -76,7 +76,8 @@ pub struct ProbeArgs {
 impl ProbeArgs {
     /// Undo what clap copied in from the relay's global flags of the same
     /// name: a value whose source is an environment variable came from
-    /// `RELAY_PORT` or `RELAY_NETWORK_PROFILE`, since these flags read none.
+    /// `RELAY_PORT`, `RELAY_NETWORK_PROFILE` or `RELAY_QUIC`, since these
+    /// flags read none.
     pub(crate) fn drop_inherited_env(&mut self, matches: &clap::ArgMatches) {
         use clap::parser::ValueSource::EnvVariable;
         if matches.value_source("port") == Some(EnvVariable) {
@@ -84,6 +85,9 @@ impl ProbeArgs {
         }
         if matches.value_source("network_profile") == Some(EnvVariable) {
             self.network_profile = None;
+        }
+        if matches.value_source("quic") == Some(EnvVariable) {
+            self.quic = false;
         }
     }
 }

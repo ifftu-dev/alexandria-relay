@@ -57,7 +57,7 @@ pub(crate) fn dial_addrs(resolved: &[IpAddr], fallback: &[IpAddr], port: u16) ->
         resolved
     };
     ips.iter()
-        .flat_map(|ip| tcp_and_quic(*ip, port, port))
+        .flat_map(|ip| tcp_and_quic(*ip, port, Some(port)))
         .collect()
 }
 

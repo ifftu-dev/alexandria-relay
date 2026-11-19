@@ -2,8 +2,9 @@
 //! configuration and check, from a second in-process swarm, what a client
 //! would see.
 //!
-//! Each advertised external address is dialled over its own transport (TCP
-//! or QUIC), a circuit reservation is made to list the address set
+//! The summary opens with the transports the relay runs. Each advertised
+//! external address is dialled over its own transport (TCP, or QUIC when it
+//! is on), a circuit reservation is made to list the address set
 //! reservations carry, the data directory is probed for writes and the admin
 //! token is tried against the local HTTP listener. The run passes when at
 //! least one advertised address answers.
@@ -61,6 +62,7 @@ pub async fn run(config: RelayConfig) -> DoctorReport {
     let public_host = config.public_host.clone();
     let data_dir = config.data_dir.clone();
     let admin_token = config.admin_token.clone();
+    let quic = config.quic;
 
     let handle = match start(config).await {
         Ok(handle) => handle,
@@ -74,11 +76,17 @@ pub async fn run(config: RelayConfig) -> DoctorReport {
     };
     let peer_id = handle.peer_id();
     lines.push(format!("PeerId: {peer_id}"));
+    lines.push(transport_line(quic));
 
     // ── Advertised addresses ─────────────────────────────────────────
     let mut reachable_tcp = None;
     let mut reachable = 0usize;
-    let advertised = handle.external_addrs().to_vec();
+    let advertised: Vec<Multiaddr> = handle
+        .external_addrs()
+        .iter()
+        .filter(|a| quic || !a.iter().any(|p| matches!(p, Protocol::QuicV1)))
+        .cloned()
+        .collect();
     if public_host.is_none() {
         lines.push(
             "FAIL  no external host: set --public-host (RELAY_PUBLIC_HOST). Without it the \
@@ -165,6 +173,12 @@ pub async fn run(config: RelayConfig) -> DoctorReport {
         "Result: NOT reachable on any advertised address".to_string()
     });
     DoctorReport { lines, passed }
+}
+
+/// The transports the relay runs, as one summary line.
+fn transport_line(quic: bool) -> String {
+    let quic = if quic { "on" } else { "off" };
+    format!("Transports: TCP (PROXY protocol off), QUIC {quic}")
 }
 
 /// `addr` with a DNS component replaced by the first address it resolves

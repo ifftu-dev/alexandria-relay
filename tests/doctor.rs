@@ -30,6 +30,7 @@ fn doctor(data_dir: &TempDir, extra: &[&str], admin_token: Option<&str>) -> Outp
         .args(extra)
         .env_remove("RELAY_SEED")
         .env_remove("RELAY_PUBLIC_HOST")
+        .env_remove("RELAY_QUIC")
         .env("RUST_LOG", "warn");
     match admin_token {
         Some(token) => cmd.env("RELAY_ADMIN_TOKEN", token),
@@ -59,6 +60,10 @@ fn doctor_passes_when_every_advertised_address_answers() {
     assert!(summary.contains("ok    /dns4/localhost/tcp/"), "{summary}");
     assert!(summary.contains("ok    /dns4/localhost/udp/"), "{summary}");
     assert!(summary.contains("Result: reachable"), "{summary}");
+    assert!(
+        summary.contains("Transports: TCP (PROXY protocol off), QUIC on"),
+        "{summary}"
+    );
     // A reservation was made and its address set listed.
     assert!(summary.contains("/p2p-circuit"), "{summary}");
     assert!(summary.contains("writable"), "{summary}");
@@ -101,4 +106,22 @@ fn doctor_fails_when_no_advertised_address_answers() {
     let summary = stdout(&output);
     assert!(!output.status.success(), "{summary}");
     assert!(summary.contains("FAIL"), "{summary}");
+}
+
+#[test]
+fn doctor_with_quic_off_says_so_and_dials_tcp_only() {
+    let dir = TempDir::new();
+    let output = doctor(
+        &dir,
+        &["--public-host", "localhost", "--quic", "false"],
+        None,
+    );
+    let summary = stdout(&output);
+    assert!(output.status.success(), "{summary}");
+    assert!(
+        summary.contains("Transports: TCP (PROXY protocol off), QUIC off"),
+        "{summary}"
+    );
+    assert!(summary.contains("ok    /dns4/localhost/tcp/"), "{summary}");
+    assert!(!summary.contains("/udp/"), "no QUIC dial: {summary}");
 }

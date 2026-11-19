@@ -264,6 +264,9 @@ pub struct RelayConfig {
     pub tcp_port: u16,
     /// QUIC (UDP) listen port. `0` binds an ephemeral port.
     pub quic_port: u16,
+    /// Run QUIC alongside TCP. Off: no QUIC transport, no UDP listener and
+    /// no QUIC external addresses, so Identify and reservations carry none.
+    pub quic: bool,
     /// Address the HTTP health, metrics and lookup listener binds.
     pub metrics_bind: IpAddr,
     /// HTTP listen port. `0` binds an ephemeral port.
@@ -299,6 +302,7 @@ impl Default for RelayConfig {
             listen_ip6: Some(Ipv6Addr::UNSPECIFIED),
             tcp_port: DEFAULT_PORT,
             quic_port: DEFAULT_PORT,
+            quic: true,
             metrics_bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             metrics_port: DEFAULT_METRICS_PORT,
             public_host: None,
@@ -361,6 +365,12 @@ pub struct Cli {
     /// QUIC (UDP) listen port (0 = ephemeral)
     #[arg(long, global = true, env = "RELAY_QUIC_PORT", default_value_t = DEFAULT_PORT)]
     pub quic_port: u16,
+
+    /// Run QUIC (UDP) alongside TCP: `true` or `false`. Off, the relay binds
+    /// no UDP port and advertises no QUIC address. Turn it off where UDP
+    /// does not reach the relay reliably (Fly.io)
+    #[arg(long, global = true, env = "RELAY_QUIC", default_value_t = true, action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), value_name = "BOOL")]
+    pub quic: bool,
 
     /// IPv4 address the libp2p TCP and QUIC listeners bind
     #[arg(long, global = true, env = "RELAY_LISTEN_IP4", default_value_t = Ipv4Addr::UNSPECIFIED)]
@@ -553,7 +563,7 @@ pub struct Cli {
 #[derive(clap::Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// Start the relay with this configuration, dial each advertised
-    /// address over TCP and QUIC from a second swarm, make a reservation,
+    /// address over its transport (TCP, or QUIC when on) from a second swarm, make a reservation,
     /// check the data directory and admin token, then exit: 0 when at least
     /// one advertised address answers. Binds the configured ports, so stop
     /// a running relay first
@@ -568,8 +578,8 @@ pub enum Command {
 
 impl Cli {
     /// Parse the process arguments as [`Parser::parse`] does, except that
-    /// `probe`'s `--port` and `--network-profile` take nothing from
-    /// `RELAY_PORT` or `RELAY_NETWORK_PROFILE`. Clap hands a global flag's
+    /// `probe`'s `--port`, `--network-profile` and `--quic` take nothing from
+    /// `RELAY_PORT`, `RELAY_NETWORK_PROFILE` or `RELAY_QUIC`. Clap hands a global flag's
     /// environment value to a subcommand flag of the same name, and those
     /// variables describe the local relay, not the one being probed.
     pub fn parse_args() -> Self {
@@ -595,6 +605,7 @@ impl Cli {
             listen_ip6: self.listen_ip6.0,
             tcp_port: self.port,
             quic_port: self.quic_port,
+            quic: self.quic,
             metrics_bind: self.metrics_bind,
             metrics_port: self.metrics_port,
             public_host: self.public_host,
@@ -777,6 +788,38 @@ mod tests {
     }
 
     #[test]
+    fn quic_is_on_unless_switched_off() {
+        let quic = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("alexandria-relay").chain(args.iter().copied()))
+                .map(|cli| cli.into_config().quic)
+        };
+        assert_eq!(quic(&[]).ok(), Some(true), "QUIC is on by default");
+        assert!(RelayConfig::default().quic, "the library default agrees");
+        assert_eq!(quic(&["--quic", "false"]).ok(), Some(false));
+        assert_eq!(quic(&["--quic", "off"]).ok(), Some(false));
+        assert_eq!(quic(&["--quic", "true"]).ok(), Some(true));
+        assert_eq!(quic(&["doctor", "--quic", "false"]).ok(), Some(false));
+        assert!(quic(&["--quic", "maybe"]).is_err());
+    }
+
+    #[test]
+    fn probes_own_quic_flag_is_independent_of_the_relays() {
+        let probe_quic = |args: &[&str]| match Cli::try_parse_from(
+            ["alexandria-relay", "probe", "--host", "relay.example.org"]
+                .into_iter()
+                .chain(args.iter().copied()),
+        )
+        .expect("flags parse")
+        .command
+        {
+            Some(Command::Probe(p)) => p.quic,
+            other => panic!("not a probe: {other:?}"),
+        };
+        assert!(!probe_quic(&[]), "probe skips QUIC unless asked");
+        assert!(probe_quic(&["--quic"]));
+    }
+
+    #[test]
     fn a_zero_duration_is_refused() {
         // A zero interval panics the health timer; refuse it at parse time.
         assert!(
@@ -798,6 +841,7 @@ mod tests {
             "RELAY_LOOKUP_MAX_TRACKED",
             "RELAY_HEALTH_LOG_INTERVAL_SECS",
             "RELAY_METRICS_BIND",
+            "RELAY_QUIC",
             "RELAY_TRUSTED_PROXY_HEADER",
             "RELAY_HTTP_HEADER_READ_TIMEOUT_SECS",
             "RELAY_HTTP_REQUEST_TIMEOUT_SECS",

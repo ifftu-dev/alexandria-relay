@@ -19,7 +19,9 @@ use futures::StreamExt;
 use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{noise, relay, tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder};
+use libp2p::{
+    identify, noise, relay, tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// How long any single wire interaction may take before a test fails.
@@ -201,6 +203,47 @@ pub fn port_of(addrs: &[Multiaddr], quic: bool) -> Option<u16> {
             _ => None,
         })
     })
+}
+
+/// True when `addr` is a QUIC address.
+pub fn is_quic(addr: &Multiaddr) -> bool {
+    addr.iter().any(|p| matches!(p, Protocol::QuicV1))
+}
+
+/// Connect to the relay at `relay_addr` (with its `/p2p` suffix) from a
+/// fresh TCP swarm and return the Identify info the relay sends.
+pub async fn identify_relay(relay_addr: &Multiaddr) -> identify::Info {
+    let mut swarm = SwarmBuilder::with_new_identity()
+        .with_tokio()
+        .with_tcp(
+            tcp::Config::default(),
+            noise::Config::new,
+            yamux::Config::default,
+        )
+        .expect("client TCP transport")
+        .with_behaviour(|key| {
+            identify::Behaviour::new(identify::Config::new(
+                "/alexandria/id/1.0".to_string(),
+                key.public(),
+            ))
+        })
+        .expect("client behaviour")
+        .build();
+    swarm.dial(relay_addr.clone()).expect("dial relay");
+    let outcome = async {
+        loop {
+            match swarm.select_next_some().await {
+                SwarmEvent::Behaviour(identify::Event::Received { info, .. }) => return info,
+                SwarmEvent::OutgoingConnectionError { error, .. } => {
+                    panic!("dial relay: {error}")
+                }
+                _ => {}
+            }
+        }
+    };
+    tokio::time::timeout(STEP_TIMEOUT, outcome)
+        .await
+        .expect("Identify timed out")
 }
 
 // ── libp2p client ────────────────────────────────────────────────────

@@ -25,6 +25,7 @@ async fn probe_with_env(args: &[&str], env: &[(&str, &str)]) -> Output {
         .env_remove("RELAY_SEED")
         .env_remove("RELAY_PORT")
         .env_remove("RELAY_NETWORK_PROFILE")
+        .env_remove("RELAY_QUIC")
         .envs(env.iter().copied())
         .env("RUST_LOG", "warn")
         .output()
@@ -340,6 +341,40 @@ async fn probe_ignores_the_relays_own_port_and_profile_variables() {
         stdout(&output).contains("/ip4/127.0.0.1/tcp/4001/"),
         "{text}"
     );
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_takes_its_quic_choice_from_its_own_flag_not_relay_quic() {
+    // `RELAY_QUIC` switches the local relay's QUIC; the probe's `--quic`
+    // alone decides whether the probed relay is dialled over QUIC.
+    let port = port_free_for_tcp_and_udp();
+    let relay = TestRelay::start_with(|c| {
+        c.tcp_port = port;
+        c.quic_port = port;
+    })
+    .await;
+    let peer_id = relay.handle().peer_id().to_string();
+    let port = port.to_string();
+    let args = [
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &port,
+        "--peer-id",
+        &peer_id,
+    ];
+
+    let output = probe_with_env(&args, &[("RELAY_QUIC", "true")]).await;
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(!stdout(&output).contains("quic"), "{text}");
+
+    let with_quic: Vec<&str> = args.iter().copied().chain(["--quic"]).collect();
+    let output = probe_with_env(&with_quic, &[("RELAY_QUIC", "false")]).await;
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(stdout(&output).contains("PASS  quic"), "{text}");
     relay.stop().await;
 }
 

@@ -17,7 +17,7 @@ use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{identify, kad, noise, relay, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder};
+use libp2p::{identify, kad, relay, Multiaddr, PeerId, StreamProtocol, SwarmBuilder};
 use tokio::sync::{mpsc, watch, RwLock};
 
 use crate::addr::{client_bucket, extract_ip, is_globally_routable, tcp_and_quic};
@@ -96,8 +96,8 @@ pub(crate) struct Started {
 }
 
 /// Build the swarm, warm-load the DHT mirror, bind the listeners and register
-/// external addresses. Returns once the IPv4 TCP and QUIC listeners have
-/// reported their bound addresses (so port zero resolves to the real port).
+/// external addresses. Returns once the IPv4 TCP listener (and QUIC, when on)
+/// has reported its bound address (so port zero resolves to the real port).
 /// With a `profile`, the event loop dials the profile's other relays as soon
 /// as it runs.
 pub(crate) async fn start_swarm(
@@ -110,17 +110,19 @@ pub(crate) async fn start_swarm(
 ) -> Result<Started, StartError> {
     let local_peer_id = keypair.public().to_peer_id();
     let limits = config.limits.clone();
+    // Identify's choice is fixed when the behaviour is built, before the
+    // external addresses are registered. A public host always registers its
+    // dns4 forms (they need no lookup), so it alone decides.
+    let hide_listen_addrs = config
+        .public_host
+        .as_deref()
+        .is_some_and(|host| !dns_external_addrs(host, config.tcp_port, None).is_empty());
 
     let mut swarm = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
-        .with_tcp(
-            libp2p::tcp::Config::default(),
-            noise::Config::new,
-            yamux::Config::default,
-        )
-        .map_err(|e| format!("TCP transport: {e}"))?
-        .with_quic()
-        .with_behaviour(|key| build_behaviour(key, &limits))
+        .with_other_transport(|key| crate::transport::build(key, config))
+        .map_err(|e| format!("transport: {e}"))?
+        .with_behaviour(|key| build_behaviour(key, &limits, hide_listen_addrs))
         .map_err(|e| format!("swarm behaviour: {e}"))?
         .with_swarm_config(|c| {
             c.with_idle_connection_timeout(limits.idle_timeout)
@@ -151,20 +153,26 @@ pub(crate) async fn start_swarm(
     let tcp4 = swarm
         .listen_on(ip4.clone().with(Protocol::Tcp(config.tcp_port)))
         .map_err(|e| format!("TCP listen: {e}"))?;
-    let quic4 = swarm
-        .listen_on(
-            ip4.with(Protocol::Udp(config.quic_port))
-                .with(Protocol::QuicV1),
-        )
-        .map_err(|e| format!("QUIC listen: {e}"))?;
+    let mut ipv4_listeners = vec![tcp4];
+    if config.quic {
+        let quic4 = swarm
+            .listen_on(
+                ip4.with(Protocol::Udp(config.quic_port))
+                    .with(Protocol::QuicV1),
+            )
+            .map_err(|e| format!("QUIC listen: {e}"))?;
+        ipv4_listeners.push(quic4);
+    }
     // IPv6 is best-effort: a host without it still runs on IPv4.
     if let Some(ip6) = config.listen_ip6 {
         let ip6 = Multiaddr::empty().with(Protocol::Ip6(ip6));
         let _ = swarm.listen_on(ip6.clone().with(Protocol::Tcp(config.tcp_port)));
-        let _ = swarm.listen_on(
-            ip6.with(Protocol::Udp(config.quic_port))
-                .with(Protocol::QuicV1),
-        );
+        if config.quic {
+            let _ = swarm.listen_on(
+                ip6.with(Protocol::Udp(config.quic_port))
+                    .with(Protocol::QuicV1),
+            );
+        }
     }
 
     let (resolved_tx, resolved_rx) = mpsc::unbounded_channel();
@@ -186,7 +194,7 @@ pub(crate) async fn start_swarm(
         pending_receipts: FuturesUnordered::new(),
         health_baseline: HealthCounts::default(),
     };
-    let listen_addrs = event_loop.await_listeners(&[tcp4, quic4]).await?;
+    let listen_addrs = event_loop.await_listeners(&ipv4_listeners).await?;
 
     // Register external addresses so reservation responses include
     // dialable multiaddrs. libp2p-relay sends its external addresses to
@@ -196,19 +204,17 @@ pub(crate) async fn start_swarm(
     // The ports are the bound ones, which equal the configured ports
     // unless those were zero.
     let tcp_port = first_port(&listen_addrs, false).unwrap_or(config.tcp_port);
-    let quic_port = first_port(&listen_addrs, true).unwrap_or(config.quic_port);
+    // `None` with QUIC off: no QUIC address is advertised in any form.
+    let quic_port = config
+        .quic
+        .then(|| first_port(&listen_addrs, true).unwrap_or(config.quic_port));
     let mut external_registered: Vec<Multiaddr> = Vec::new();
     if let Some(host) = &config.public_host {
         // DNS forms. These survive re-provisioning since DNS tracks the
         // current IP.
-        for tmpl in [
-            format!("/dns4/{host}/tcp/{tcp_port}"),
-            format!("/dns4/{host}/udp/{quic_port}/quic-v1"),
-        ] {
-            if let Ok(addr) = tmpl.parse::<Multiaddr>() {
-                external_registered.push(addr.clone());
-                event_loop.swarm.add_external_address(addr);
-            }
+        for addr in dns_external_addrs(host, tcp_port, quic_port) {
+            external_registered.push(addr.clone());
+            event_loop.swarm.add_external_address(addr);
         }
 
         // IP literal forms for clients whose DNS is blocked. Resolve at
@@ -240,7 +246,8 @@ pub(crate) async fn start_swarm(
     }
 
     let l = &config.limits;
-    log::info!("Relay starting — TCP:{tcp_port} QUIC/UDP:{quic_port} Metrics HTTP:{http_port}");
+    let quic_line = quic_port.map_or("off".to_string(), |p| p.to_string());
+    log::info!("Relay starting — TCP:{tcp_port} QUIC/UDP:{quic_line} Metrics HTTP:{http_port}");
     log::info!(
         "Limits — max_conn:{} max_conn/peer:{} max_conn/ip:{} \
          relay_reservations:{} relay_circuits:{}",
@@ -275,6 +282,14 @@ pub(crate) async fn start_swarm(
         listen_addrs,
         external_addrs: external_registered,
     })
+}
+
+/// The `dns4` forms of `host`: TCP at `tcp_port`, plus QUIC when it has a
+/// port. A host that does not form a valid multiaddr gives none.
+fn dns_external_addrs(host: &str, tcp_port: u16, quic_port: Option<u16>) -> Vec<Multiaddr> {
+    let mut forms = vec![format!("/dns4/{host}/tcp/{tcp_port}")];
+    forms.extend(quic_port.map(|port| format!("/dns4/{host}/udp/{port}/quic-v1")));
+    forms.iter().filter_map(|f| f.parse().ok()).collect()
 }
 
 /// The port of the first address on the TCP (`quic == false`) or QUIC
@@ -999,9 +1014,13 @@ fn username_reg_codec() -> UsernameRegCodec {
     UsernameRegCodec::default().set_request_size_maximum(USERNAME_REQUEST_MAX_BYTES)
 }
 
+/// The relay's behaviour. `hide_listen_addrs` keeps the listen addresses
+/// out of Identify, which then reports only the external addresses; set it
+/// only when at least one external address will be registered.
 fn build_behaviour(
     key: &libp2p::identity::Keypair,
     limits: &Limits,
+    hide_listen_addrs: bool,
 ) -> Result<RelayBehaviour, Box<dyn std::error::Error + Send + Sync>> {
     let local_peer_id = key.public().to_peer_id();
 
@@ -1064,9 +1083,12 @@ fn build_behaviour(
     );
 
     // ── Identify ─────────────────────────────────────────────────────
+    // Behind a proxy or NAT the listen addresses are private ones no client
+    // can reach; once external addresses exist, those are what clients get.
     let identify = identify::Behaviour::new(
         identify::Config::new(IDENTIFY_PROTOCOL_VERSION.to_string(), key.public())
             .with_push_listen_addr_updates(true)
+            .with_hide_listen_addrs(hide_listen_addrs)
             .with_agent_version(format!("alexandria-relay/{}", env!("CARGO_PKG_VERSION"))),
     );
 
@@ -1088,7 +1110,7 @@ mod tests {
     fn filtered_provider_announcements_are_retained_for_discovery() {
         use libp2p::kad::store::RecordStore;
         let identity = libp2p::identity::Keypair::generate_ed25519();
-        let mut behaviour = build_behaviour(&identity, &Limits::default()).unwrap();
+        let mut behaviour = build_behaviour(&identity, &Limits::default(), false).unwrap();
         let provider = PeerId::random();
         let key = kad::RecordKey::new(&b"alexandria-discovery-test");
         let address = "/ip4/203.0.113.1/tcp/4001".parse().unwrap();

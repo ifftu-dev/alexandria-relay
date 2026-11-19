@@ -78,6 +78,7 @@ pub mod profile;
 mod rate;
 mod store;
 mod swarm;
+mod transport;
 pub mod username_reg;
 
 use std::net::SocketAddr;
