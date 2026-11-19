@@ -1,6 +1,6 @@
 [package]
 name = "alexandria-relay"
-version = "0.1.0"
+version = "0.4.0"
 description = "Alexandria P2P relay + bootstrap node"
 edition = "2021"
 rust-version = "1.89.0"
