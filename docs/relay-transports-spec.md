@@ -1,8 +1,8 @@
 # Relay transports on Fly: real client addresses, honest QUIC
 
-Status: active
+Status: implemented
 Updated: 2026-11-19
-Triage: ready-for-agent
+Triage: done
 Repos: alexandria-relay
 
 Work is split into numbered sub-tickets under `docs/relay-transports/`; each
@@ -522,3 +522,15 @@ passes.
   libp2p listener as out of scope because the TCP transport does not support
   it. This spec supersedes that line: the parsing sits in a wrapper outside
   the TCP transport.
+
+## Notes
+
+- 2026-11-19: Implemented. All six tickets are done; deviations are recorded
+  in each ticket's notes. A two-axis code review (standards and spec) found
+  an alert-window underflow, QUIC addresses still added for mesh peers with
+  QUIC off, two PROXY header classification gaps, and a staging job that
+  could only rebuild rather than deploy the existing release-candidate
+  image; all were fixed in the same series. The manual trigger now takes an
+  `image` input for staging, and releases upload assets only on tag pushes.
+  159 tests pass. Not yet done: the `v0.4.0-rc.2` tag, the staging
+  rehearsal checklist (whose results belong here) and the `v0.4.0` deploy.
