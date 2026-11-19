@@ -183,7 +183,8 @@ pub(crate) async fn start_swarm(
     }
 
     let (resolved_tx, resolved_rx) = mpsc::unbounded_channel();
-    let mesh = profile.map(|p| Mesh::new(&p, local_peer_id, config.announce, resolved_tx));
+    let mesh =
+        profile.map(|p| Mesh::new(&p, local_peer_id, config.announce, config.quic, resolved_tx));
 
     let mut event_loop = EventLoop {
         swarm,

@@ -46,18 +46,24 @@ pub fn relay_discovery_key(protocol_namespace: &str) -> kad::RecordKey {
     kad::RecordKey::new(&hash)
 }
 
-/// The addresses to dial a profile relay on: TCP and QUIC at `port` on every
-/// address its DNS name resolved to, or on its fallback IPs when the name
-/// resolved to nothing. The fallback IPs exist for when DNS fails; a name
-/// that resolves is dialled as it resolves.
-pub(crate) fn dial_addrs(resolved: &[IpAddr], fallback: &[IpAddr], port: u16) -> Vec<Multiaddr> {
+/// The addresses to dial a profile relay on: TCP at `port`, and QUIC at
+/// `quic_port` unless it is `None` (QUIC off here), on every address its DNS
+/// name resolved to, or on its fallback IPs when the name resolved to
+/// nothing. The fallback IPs exist for when DNS fails; a name that resolves
+/// is dialled as it resolves.
+pub(crate) fn dial_addrs(
+    resolved: &[IpAddr],
+    fallback: &[IpAddr],
+    port: u16,
+    quic_port: Option<u16>,
+) -> Vec<Multiaddr> {
     let ips = if resolved.is_empty() {
         fallback
     } else {
         resolved
     };
     ips.iter()
-        .flat_map(|ip| tcp_and_quic(*ip, port, Some(port)))
+        .flat_map(|ip| tcp_and_quic(*ip, port, quic_port))
         .collect()
 }
 
@@ -118,16 +124,21 @@ pub(crate) struct Mesh {
     /// Set when `--announce` was given.
     announce_key: Option<kad::RecordKey>,
     status: BootstrapStatus,
+    /// Whether this relay runs QUIC. Without it, peer relays get no QUIC
+    /// addresses, so none reach Kademlia or the clients it answers.
+    quic: bool,
     resolved_tx: mpsc::UnboundedSender<Resolved>,
 }
 
 impl Mesh {
     /// The mesh `profile` describes for the relay `local`, with every other
-    /// relay due a dial now. Lookups report on `resolved_tx`.
+    /// relay due a dial now. Peer relays get QUIC addresses only when
+    /// `quic`. Lookups report on `resolved_tx`.
     pub(crate) fn new(
         profile: &NetworkProfile,
         local: PeerId,
         announce: bool,
+        quic: bool,
         resolved_tx: mpsc::UnboundedSender<Resolved>,
     ) -> Self {
         let now = Instant::now();
@@ -152,6 +163,7 @@ impl Mesh {
             relays,
             announce_key: announce.then(|| relay_discovery_key(&profile.protocol_namespace)),
             status: BootstrapStatus::Pending,
+            quic,
             resolved_tx,
         }
     }
@@ -220,6 +232,7 @@ impl Mesh {
             relay.entry.port,
             relay.entry.fallback_ips.clone(),
         );
+        let quic_port = self.quic.then_some(port);
         let tx = self.resolved_tx.clone();
         tokio::spawn(async move {
             let resolved: Vec<IpAddr> = match tokio::time::timeout(
@@ -247,7 +260,7 @@ impl Mesh {
                 }
             };
             // The event loop may have stopped; nothing to do then.
-            let _ = tx.send((peer, dial_addrs(&resolved, &fallback, port)));
+            let _ = tx.send((peer, dial_addrs(&resolved, &fallback, port, quic_port)));
         });
     }
 
@@ -339,7 +352,7 @@ mod tests {
     fn a_resolved_name_is_dialled_on_tcp_and_quic_and_fallbacks_wait() {
         let resolved: Vec<IpAddr> = vec!["127.0.0.1".parse().unwrap(), "::1".parse().unwrap()];
         let fallback: Vec<IpAddr> = vec!["198.51.99.1".parse().unwrap()];
-        let addrs: Vec<String> = dial_addrs(&resolved, &fallback, 4001)
+        let addrs: Vec<String> = dial_addrs(&resolved, &fallback, 4001, Some(4001))
             .iter()
             .map(|a| a.to_string())
             .collect();
@@ -357,7 +370,7 @@ mod tests {
     #[test]
     fn an_unresolvable_name_falls_back_to_the_profile_ips() {
         let fallback: Vec<IpAddr> = vec!["198.51.99.1".parse().unwrap()];
-        let addrs: Vec<String> = dial_addrs(&[], &fallback, 4001)
+        let addrs: Vec<String> = dial_addrs(&[], &fallback, 4001, Some(4001))
             .iter()
             .map(|a| a.to_string())
             .collect();
@@ -368,5 +381,32 @@ mod tests {
                 "/ip4/198.51.99.1/udp/4001/quic-v1"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn with_quic_off_peer_relays_get_no_quic_address() {
+        let local = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        let other = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        let profile = NetworkProfile {
+            network_id: "testnet".into(),
+            protocol_namespace: "/alexandria/testnet".into(),
+            relays: vec![ProfileRelay {
+                peer_id: other,
+                dns_name: "relay.invalid".into(),
+                port: 4001,
+                fallback_ips: vec!["198.51.99.1".parse().unwrap()],
+            }],
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut mesh = Mesh::new(&profile, local, false, false, tx);
+        mesh.start_due_lookups();
+        let (peer, addrs) = rx.recv().await.unwrap();
+        assert_eq!(peer, other);
+        let addrs: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
+        assert_eq!(addrs, ["/ip4/198.51.99.1/tcp/4001"]);
     }
 }
