@@ -550,7 +550,7 @@ pub struct Cli {
 }
 
 /// Subcommands. Without one, the binary runs the relay.
-#[derive(clap::Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(clap::Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// Start the relay with this configuration, dial each advertised
     /// address over TCP and QUIC from a second swarm, make a reservation,
@@ -558,9 +558,33 @@ pub enum Command {
     /// one advertised address answers. Binds the configured ports, so stop
     /// a running relay first
     Doctor,
+    /// Dial a running relay from this machine over TCP (and QUIC with
+    /// --quic), check that it answers with the expected PeerId and the
+    /// Alexandria Identify, then exit: 0 when every transport passed. Starts
+    /// no relay and needs no relay secrets; the relay flags under Options
+    /// are ignored
+    Probe(crate::probe::ProbeArgs),
 }
 
 impl Cli {
+    /// Parse the process arguments as [`Parser::parse`] does, except that
+    /// `probe`'s `--port` and `--network-profile` take nothing from
+    /// `RELAY_PORT` or `RELAY_NETWORK_PROFILE`. Clap hands a global flag's
+    /// environment value to a subcommand flag of the same name, and those
+    /// variables describe the local relay, not the one being probed.
+    pub fn parse_args() -> Self {
+        use clap::{CommandFactory, FromArgMatches};
+        let matches = Self::command().get_matches();
+        let mut cli = Self::from_arg_matches(&matches)
+            .unwrap_or_else(|e| e.format(&mut Self::command()).exit());
+        if let (Some(Command::Probe(args)), Some(("probe", sub))) =
+            (&mut cli.command, matches.subcommand())
+        {
+            args.drop_inherited_env(sub);
+        }
+        cli
+    }
+
     /// The relay configuration these flags describe. The secrets
     /// (`keypair`, `admin_token`) are environment-only and left `None`; the
     /// binary fills them in.

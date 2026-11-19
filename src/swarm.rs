@@ -30,6 +30,10 @@ use crate::store::{MirroredRecord, StoreHandle, MIRROR_PRUNE_INTERVAL};
 use crate::username_reg::{self, ReceiptRequest, ReceiptResponse};
 use crate::StartError;
 
+/// The protocol version the relay's Identify reports. `probe` checks for it,
+/// so a pass means an Alexandria relay answered.
+pub(crate) const IDENTIFY_PROTOCOL_VERSION: &str = "/alexandria/id/1.0";
+
 /// How long startup waits for the IPv4 listeners to report their addresses.
 const LISTEN_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -1061,7 +1065,7 @@ fn build_behaviour(
 
     // ── Identify ─────────────────────────────────────────────────────
     let identify = identify::Behaviour::new(
-        identify::Config::new("/alexandria/id/1.0".to_string(), key.public())
+        identify::Config::new(IDENTIFY_PROTOCOL_VERSION.to_string(), key.public())
             .with_push_listen_addr_updates(true)
             .with_agent_version(format!("alexandria-relay/{}", env!("CARGO_PKG_VERSION"))),
     );

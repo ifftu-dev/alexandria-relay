@@ -28,7 +28,7 @@ use crate::config::ADMIN_TOKEN_MIN_LEN;
 use crate::{start, RelayConfig};
 
 /// How long one dial, reservation or HTTP request may take.
-const STEP_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const STEP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What a doctor run found. `Display` is the summary the binary prints.
 pub struct DoctorReport {
@@ -170,7 +170,7 @@ pub async fn run(config: RelayConfig) -> DoctorReport {
 /// `addr` with a DNS component replaced by the first address it resolves
 /// to in the matching family, the way a client without a DNS transport
 /// would dial it.
-async fn resolve(addr: &Multiaddr) -> Result<Multiaddr, String> {
+pub(crate) async fn resolve(addr: &Multiaddr) -> Result<Multiaddr, String> {
     let port = addr
         .iter()
         .find_map(|p| match p {
@@ -205,7 +205,7 @@ async fn resolve(addr: &Multiaddr) -> Result<Multiaddr, String> {
 }
 
 /// A swarm with TCP and QUIC and the given behaviour.
-fn client_swarm<B: libp2p::swarm::NetworkBehaviour>(
+pub(crate) fn client_swarm<B: libp2p::swarm::NetworkBehaviour>(
     behaviour: impl FnOnce(&libp2p::identity::Keypair) -> B,
 ) -> Result<Swarm<B>, String> {
     Ok(SwarmBuilder::with_new_identity()

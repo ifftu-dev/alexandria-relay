@@ -55,6 +55,10 @@
 //!
 //! # Check that the advertised addresses answer, then exit (0 = reachable)
 //! alexandria-relay doctor --public-host relay.example.org
+//!
+//! # From another machine, dial a running relay as a client would and check
+//! # its PeerId and Identify (0 = every transport passed)
+//! alexandria-relay probe --host relay.example.org --network-profile preprod.json
 //! ```
 
 //!
@@ -69,6 +73,7 @@ pub mod config;
 pub mod doctor;
 mod http;
 mod mesh;
+pub mod probe;
 pub mod profile;
 mod rate;
 mod store;
