@@ -19,6 +19,14 @@ on:
         description: "Staging only: deploy with QUIC on and record a QUIC probe"
         type: boolean
         default: false
+      # Rehearses a release candidate on the exact bytes it published: no
+      # image is built, tagged or released, and staging runs this one.
+      image:
+        description: >-
+          Staging only: deploy this published image instead of building one
+          (ghcr.io/<owner>/<repo>@sha256:<digest>, or :<tag>)
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -28,6 +36,33 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # Checks a manual run's inputs before anything builds or deploys. On
+  # other events it has nothing to check and passes, so the jobs that need
+  # it run as before.
+  dispatch:
+    name: Check the run's inputs
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.check.outputs.image }}
+    steps:
+      - id: check
+        if: github.event_name == 'workflow_dispatch' && inputs.image != ''
+        env:
+          TARGET: ${{ inputs.target }}
+          IMAGE: ${{ inputs.image }}
+        run: |
+          if [ "$TARGET" != staging ]; then
+            echo "::error::The image input deploys to staging only; target is '$TARGET'"
+            exit 1
+          fi
+          repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+          repo_re="${repo//./\\.}"
+          if ! [[ "$IMAGE" =~ ^${repo_re}(@sha256:[0-9a-f]{64}|:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})$ ]]; then
+            echo "::error::'$IMAGE' is not $repo@sha256:<digest> or $repo:<tag>"
+            exit 1
+          fi
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
   check:
     name: Check
     runs-on: ubuntu-latest
@@ -119,15 +154,16 @@ jobs:
           cache-to: type=gha,scope=linux-amd64,mode=max
       - run: scripts/smoke-image.sh alexandria-relay:ci
 
-  # Publishing runs on `v*` tags and manual runs, after every check passes.
+  # Publishing runs on `v*` tags and manual runs without an `image` input,
+  # after every check passes.
   # Each architecture builds natively on its own runner, pushes its image by
   # digest and exports the same static binary; `manifest` joins the two
   # images under one set of tags. Image: ghcr.io/<owner>/<repo>.
   image:
     name: Publish ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
-    needs: [check, clippy, fmt, test, audit, deny]
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    needs: [dispatch, check, clippy, fmt, test, audit, deny]
+    if: (github.event_name == 'workflow_dispatch' && inputs.image == '') || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
     permissions:
       contents: read
       packages: write
@@ -254,11 +290,12 @@ jobs:
           docker buildx imagetools inspect "$IMAGE@$digest"
           echo "ref=$IMAGE@$digest" >> "$GITHUB_OUTPUT"
 
+  # Tag pushes only: a manual run on a tag never uploads release assets.
   release:
     name: GitHub release
     runs-on: ubuntu-latest
     needs: [manifest]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
     steps:
@@ -332,14 +369,19 @@ jobs:
       FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
   # The staging relay (fly-staging.toml), for rehearsing a release candidate
-  # before production. Manual runs only, `target: staging` (the default). The
-  # app is created by hand for a rehearsal; the probe pins the PeerId from
-  # the STAGING_RELAY_PEER_ID repository variable and the job fails, before
-  # deploying, when it is unset.
+  # before production. Manual runs only, `target: staging` (the default).
+  # It deploys the `image` input when given (nothing is built), otherwise
+  # the image `manifest` published. The app is created by hand for a
+  # rehearsal; the probe pins the PeerId from the STAGING_RELAY_PEER_ID
+  # repository variable and the job fails, before deploying, when it is
+  # unset.
   staging:
     name: Deploy staging
-    needs: [manifest]
-    if: github.event_name == 'workflow_dispatch' && inputs.target == 'staging'
+    needs: [dispatch, manifest]
+    if: >-
+      !cancelled() && github.event_name == 'workflow_dispatch' && inputs.target == 'staging'
+      && needs.dispatch.result == 'success'
+      && (needs.manifest.result == 'success' || (inputs.image != '' && needs.manifest.result == 'skipped'))
     permissions:
       contents: read
       packages: read
@@ -351,7 +393,7 @@ jobs:
       config: fly-staging.toml
       fly_region: fra
       volume: false
-      image: ${{ needs.manifest.outputs.ref }}
+      image: ${{ needs.dispatch.outputs.image || needs.manifest.outputs.ref }}
       pin: peer-id
       peer_id: ${{ vars.STAGING_RELAY_PEER_ID }}
       quic: ${{ inputs.staging_quic }}
