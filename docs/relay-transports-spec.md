@@ -1,7 +1,7 @@
 # Relay transports on Fly: real client addresses, honest QUIC
 
 Status: implemented
-Updated: 2026-11-19
+Updated: 2026-11-21
 Triage: done
 Repos: alexandria-relay
 
@@ -534,3 +534,25 @@ passes.
   `image` input for staging, and releases upload assets only on tag pushes.
   159 tests pass. Not yet done: the `v0.4.0-rc.2` tag, the staging
   rehearsal checklist (whose results belong here) and the `v0.4.0` deploy.
+- 2026-11-20: Staging rehearsal on the `v0.4.0-rc.2` image. Passed: 1, 2
+  (`/peers` showed the connected machine's own /24, not a Fly address), 4,
+  5 (`proxy_header_missing` counted and `/health/alerts` answered 503 with
+  `proxy_header_refusal_majority`), 6 and 8 (IPv6 probe from a machine
+  with IPv6). Item 9: four of five QUIC probes passed from the runner and
+  four of five from a residential connection, so QUIC stays off on Fly.
+  Items 3 and 7 are deferred: the app builds every extra relay as a `/dns4`
+  address and its swarm has no DNS transport, so a dev build never dials
+  the staging relay. Item 2 already shows the source address the per-IP
+  limiter and Identify read; rerun 3 and 7 once the app can dial an extra
+  relay. The rehearsal also found that the repository's Fly token had been
+  revoked (replaced by an organisation token) and that a second staging run
+  from the same ref deployed Fly's cached image for the reused
+  `sha-<commit>` tag, which voided the first item 4 run; item 4 was redone
+  by deploying the old image by digest, and the Fly tag now names the
+  source image's digest. Two limits remain: the CI probe runs from the
+  deployed image, so it cannot probe images older than 0.4.0, and the
+  staging relay is kept up for the deferred items.
+- 2026-11-21: `v0.4.0` released and deployed: Frankfurt, then Singapore,
+  each probed over TCP by CI, and both probed again from a residential
+  connection against the network profile's PeerIds. Both run PROXY v2 with
+  QUIC off.
