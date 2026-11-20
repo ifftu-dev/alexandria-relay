@@ -126,7 +126,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       # Copy the published image into the app's Fly registry, so the deploy
-      # does not depend on the GitHub package being public.
+      # does not depend on the GitHub package being public. The Fly tag names
+      # the source image's digest, never the commit: a manual staging run
+      # deploys any image from the same ref, and Fly reuses a cached image
+      # for a tag it has seen, so a reused tag could deploy the wrong image.
       - name: Copy the image to the Fly registry
         id: fly-image
         env:
@@ -134,7 +137,12 @@ jobs:
           APP: ${{ steps.target.outputs.app }}
           SOURCE: ${{ inputs.image }}
         run: |
-          target="registry.fly.io/$APP:sha-$GITHUB_SHA"
+          digest=$(docker buildx imagetools inspect "$SOURCE" --format '{{.Manifest.Digest}}')
+          if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not resolve the digest of $SOURCE (got '$digest')"
+            exit 1
+          fi
+          target="registry.fly.io/$APP:img-${digest#sha256:}"
           flyctl auth docker
           docker buildx imagetools create --tag "$target" "$SOURCE"
           echo "image=$target" >> "$GITHUB_OUTPUT"
