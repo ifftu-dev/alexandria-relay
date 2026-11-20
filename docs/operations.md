@@ -1,7 +1,7 @@
 # Relay operations
 
 Status: live
-Updated: 2026-11-19
+Updated: 2026-11-21
 
 How to run, watch and deploy the relay. Listener and identity settings are
 in the [README](../README.md#configuration); limits are below. To run a
@@ -336,7 +336,9 @@ tag, for any release that changes transports or Fly config. The staging
 relay (`fly-staging.toml`, app `alexandria-relay-staging`) matches
 production's TCP service and `[env]`, keeps a UDP service so QUIC can be
 switched on for one check, and stays out of the mesh: no network profile,
-no announce, its own identity.
+no announce, its own identity. A client connected to both staging and the
+production relays still passes staging's address on through Kademlia, so
+production relays may dial it; that ends with the teardown.
 
 Set it up:
 
@@ -366,8 +368,13 @@ before the release tag:
 2. `/peers` (admin token), read while a client on a known machine is
    connected, shows that machine's address bucket, not a Fly address.
 3. With `fly secrets set RELAY_MAX_CONNECTIONS_PER_IP=1` on the staging app
-   and a dev app build connected, a probe from the same machine fails and
-   a probe from the CI runner (rerun the job) passes. Unset it afterwards.
+   and a dev app build connected over IPv4 only (its extra relay given as
+   the staging IPv4 address), a probe from the same machine over IPv4
+   fails and raises `ip_rate_limited`, while a probe from a second address
+   passes: the same machine over IPv6 (another bucket) or the CI runner.
+   Rerunning the job restarts the relay and drops the held connection, so
+   probe from the second address while the client is still connected.
+   Unset it afterwards.
 4. Old image, new config: a run with `image` set to an image without PROXY
    support (the previous release, `ghcr.io/ifftu-dev/alexandria-relay:<previous-version>`)
    makes the probe fail.
