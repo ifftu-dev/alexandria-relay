@@ -556,3 +556,17 @@ passes.
   each probed over TCP by CI, and both probed again from a residential
   connection against the network profile's PeerIds. Both run PROXY v2 with
   QUIC off.
+- 2026-11-21: Rehearsal items 3 and 7 passed against the app fix (app
+  `docs/extra-relay-addresses-spec.md`), using a node test that starts the
+  real app node with the staging relay as its only extra relay. Item 7: it
+  connected by DNS name, got a reservation, and Identify reported the
+  machine's real IPv4 and IPv6 addresses. Item 3, with the per-IP limit at
+  1: while the node held the machine's IPv4 slot, an IPv4 probe from the
+  same machine was refused (`ip_rate_limited` rose by one per attempt), an
+  IPv6 probe from it passed, and the node kept its reservation; a CI rerun
+  also passed. A rerun restarts the relay and drops the held connection,
+  so the operations checklist now probes from the second address while the
+  client is connected. Staging also turned out to be reachable from the
+  production relays once a client had connected to both, through Kademlia.
+  Item 10 done: the staging app is destroyed and `STAGING_RELAY_PEER_ID`
+  deleted.
